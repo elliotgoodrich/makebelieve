@@ -1,0 +1,68 @@
+name: CI
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [
+          {name: Clang, cpp: clang++},
+          {name: GCC, cpp: g++},
+        ]
+        build_type: [Debug, Release]
+    name: ${{ matrix.compiler.name }} (${{ matrix.build_type }})
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config
+    - name: Configure CMake
+      run: >
+        cmake -B build
+        -DCMAKE_CXX_COMPILER=${{ matrix.compiler.cpp }}
+        -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+    - name: Build
+      run: cmake --build build
+    - name: Test
+      run: ctest --test-dir build --output-on-failure
+    # fuse_experiment_smoke mounts the real daemon over FUSE and self-skips
+    # (rather than failing) if /dev/fuse isn't usable on this runner; see
+    # experiments/FUSE/smoke_test.sh.
+
+  # No Windows/MSVC job yet: there's no ProjFS-based experiment to build
+  # there. Add one alongside experiments/ProjFS/ once it exists.
+
+  clang-tidy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config
+    - name: Configure CMake
+      run: >
+        cmake -B build
+        -DCMAKE_CXX_COMPILER=clang++
+        -DENABLE_CLANG_TIDY=ON
+    - name: Build (runs clang-tidy)
+      run: cmake --build build
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - name: Run clang-format
+      run: >
+        git ls-files -z 'experiments/*.cpp' 'experiments/*.hpp'
+        | xargs -0 clang-format --dry-run --Werror
