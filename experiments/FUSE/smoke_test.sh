@@ -23,8 +23,8 @@ FUSE_BIN="$1"
 INOTIFY_WAIT_BIN="$2"
 
 if [[ ! -e /dev/fuse ]]; then
-  echo "SKIP: /dev/fuse not accessible in this environment"
-  exit 0
+  echo "FAIL: /dev/fuse not accessible in this environment" >&2
+  exit 1
 fi
 
 MNT="$(mktemp -d)"
