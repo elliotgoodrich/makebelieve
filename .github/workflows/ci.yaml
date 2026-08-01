@@ -33,9 +33,6 @@ jobs:
       run: cmake --build build
     - name: Test
       run: ctest --test-dir build --output-on-failure
-    # fuse_experiment_smoke mounts the real daemon over FUSE and self-skips
-    # (rather than failing) if /dev/fuse isn't usable on this runner; see
-    # experiments/FUSE/smoke_test.sh.
 
   # No Windows/MSVC job yet: there's no ProjFS-based experiment to build
   # there. Add one alongside experiments/ProjFS/ once it exists.
