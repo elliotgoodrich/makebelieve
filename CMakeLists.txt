@@ -51,3 +51,4 @@ endfunction()
 # exercising one OS filesystem/tracing mechanism (FUSE, ProjFS, ETW, ...);
 # add new ones here as they're written.
 add_subdirectory(experiments/FUSE)
+add_subdirectory(experiments/ProjFS)

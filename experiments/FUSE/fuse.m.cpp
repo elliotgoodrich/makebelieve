@@ -10,8 +10,7 @@
  *
  * Usage:
  * @code
- *   mkdir /tmp/fuse-mnt
- *   fuse_experiment /tmp/fuse-mnt
+ *   fuse_experiment /tmp/fuse-mnt   # creates /tmp/fuse-mnt itself
  *   inotifywait -m /tmp/fuse-mnt/time.txt &
  *   cat /tmp/fuse-mnt/time.txt   # first read kicks off the heartbeat
  *   fusermount3 -u /tmp/fuse-mnt
@@ -21,6 +20,7 @@
 #include <fuse.h>
 #include <fuse_lowlevel.h>
 
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 
 #include <fcntl.h>
@@ -214,7 +214,7 @@ struct FUSE {
       return -ENOENT;
     }
     for (const char* name : {".", "..", "time.txt"}) {
-      filler(buf, name, nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
+      filler(buf, name, nullptr, 0, fuse_fill_dir_flags{});
     }
     return 0;
   }
@@ -391,30 +391,68 @@ constexpr fuse_operations k_ops = {
     .access = FUSE::access,
 };
 
+/**
+ * Finds the mountpoint argument in argv - the first non-option argument,
+ * exactly the rule fuse_parse_cmdline() itself uses, so both "<mnt> -f"
+ * and "-f <mnt>" are recognized - without requiring it to already exist.
+ * fuse_parse_cmdline() can't be used for this: it resolves the mountpoint
+ * via realpath() and fails outright if the path doesn't exist yet, which
+ * is exactly the case here (main() below needs to learn the mountpoint
+ * *before* creating it). Operates on a throwaway copy of the args so the
+ * real parse inside fuse_main(argc, argv, ...) still sees the original.
+ * @return The mountpoint argument, or an empty string if argv had none.
+ */
+std::string find_mountpoint(int argc, char** argv) {
+  std::string mountpoint;
+  fuse_args args = FUSE_ARGS_INIT(argc, argv);
+  fuse_opt_parse(&args, &mountpoint, nullptr,
+                 [](void* data, const char* arg, int key, fuse_args*) -> int {
+                   if (key == FUSE_OPT_KEY_NONOPT) {
+                     auto& out = *static_cast<std::string*>(data);
+                     if (out.empty()) {
+                       out = arg;
+                     }
+                   }
+                   return 1;
+                 });
+  fuse_opt_free_args(&args);
+  return mountpoint;
+}
+
 }  // namespace
 
 /**
- * Parses just enough of argv to learn the mountpoint, then hands off to
- * fuse_main() for the real command-line handling and event loop.
+ * Learns the mountpoint from argv, then hands off to fuse_main() for the
+ * real command-line handling and event loop.
  */
 int main(int argc, char* argv[]) {
-  // Parse a throwaway copy of the command line first, purely to learn the
-  // mountpoint before it gets passed to fuse_main() below - the mountpoint
-  // can land anywhere among argv (e.g. "<mnt> -f" and "-f <mnt>" are both
-  // valid), so this can't just be argv[argc - 1]. fuse_parse_cmdline()
-  // reallocates its own copy of the arg list rather than touching the
-  // caller's argc/argv, so the second, real parse inside
-  // fuse_main(argc, argv, ...) still sees the original.
-  fuse_args peek_args = FUSE_ARGS_INIT(argc, argv);
-  fuse_cmdline_opts opts{};
-  if (fuse_parse_cmdline(&peek_args, &opts) != 0 ||
-      opts.mountpoint == nullptr) {
+  const std::string mountpoint = find_mountpoint(argc, argv);
+  if (mountpoint.empty()) {
     std::fprintf(stderr, "usage: %s [options] <mountpoint>\n", argv[0]);
     return 1;
   }
-  g_mount_file = std::string(opts.mountpoint) + std::string(k_time_path);
-  std::free(opts.mountpoint);
-  fuse_opt_free_args(&peek_args);
+  g_mount_file = mountpoint + std::string(k_time_path);
 
-  return fuse_main(argc, argv, &k_ops, nullptr);
+  // This experiment owns its mountpoint's whole lifetime: create it fresh
+  // here rather than requiring the caller to have already `mkdir`'d it, and
+  // fail outright if it already exists rather than silently reusing
+  // whatever's there (e.g. a leftover from a previous crashed run, or an
+  // unrelated directory the caller didn't mean to mount over).
+  if (::mkdir(mountpoint.c_str(), 0755) != 0) {
+    std::fprintf(stderr, "mkdir(%s): %s\n", mountpoint.c_str(),
+                 std::strerror(errno));
+    return 1;
+  }
+
+  const int rc = fuse_main(argc, argv, &k_ops, nullptr);
+
+  // Only reached after a clean unmount (fuse_main() blocks until then), so
+  // the mountpoint is safe to remove - best effort, since a failure here
+  // doesn't change whether the filesystem itself did its job.
+  if (::rmdir(mountpoint.c_str()) != 0) {
+    std::fprintf(stderr, "rmdir(%s): %s\n", mountpoint.c_str(),
+                 std::strerror(errno));
+  }
+
+  return rc;
 }

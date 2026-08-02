@@ -11,31 +11,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        compiler: [
-          {name: Clang, cpp: clang++},
-          {name: GCC, cpp: g++},
-        ]
-        build_type: [Debug, Release]
-    name: ${{ matrix.compiler.name }} (${{ matrix.build_type }})
-    runs-on: ubuntu-latest
+        include:
+          - {os: ubuntu-latest,  compiler: Clang, cpp: clang++, build_type: Debug}
+          - {os: ubuntu-latest,  compiler: Clang, cpp: clang++, build_type: Release}
+          - {os: ubuntu-latest,  compiler: GCC,   cpp: g++,     build_type: Debug}
+          - {os: ubuntu-latest,  compiler: GCC,   cpp: g++,     build_type: Release}
+          - {os: windows-latest, compiler: MSVC,                build_type: Debug}
+          - {os: windows-latest, compiler: MSVC,                build_type: Release}
+    name: ${{ matrix.compiler }} (${{ matrix.build_type }})
+    runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v7
       with:
         persist-credentials: false
     - name: Install dependencies
+      if: runner.os == 'Linux'
       run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config
+    - name: Enable ProjFS
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart
     - name: Configure CMake
       run: >
         cmake -B build
-        -DCMAKE_CXX_COMPILER=${{ matrix.compiler.cpp }}
-        -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+        ${{ runner.os == 'Linux' && format('-DCMAKE_CXX_COMPILER={0} -DCMAKE_BUILD_TYPE={1}', matrix.cpp, matrix.build_type) || '' }}
     - name: Build
-      run: cmake --build build
+      run: cmake --build build --config ${{ matrix.build_type }}
     - name: Test
-      run: ctest --test-dir build --output-on-failure
-
-  # No Windows/MSVC job yet: there's no ProjFS-based experiment to build
-  # there. Add one alongside experiments/ProjFS/ once it exists.
+      run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
 
   clang-tidy:
     runs-on: ubuntu-latest
