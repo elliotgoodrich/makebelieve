@@ -21,6 +21,5 @@ add_test(NAME fuse_experiment_smoke
   COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/smoke_test.sh"
     "$<TARGET_FILE:fuse_experiment>" "$<TARGET_FILE:inotify_wait>"
 )
-set_tests_properties(fuse_experiment_smoke PROPERTIES
-  TIMEOUT 30
-)
+set_tests_properties(fuse_experiment_smoke PROPERTIES TIMEOUT 30)
+

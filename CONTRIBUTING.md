@@ -71,8 +71,8 @@ ctest --test-dir build --output-on-failure
 against the actual kernel FUSE path - not the source directly - that
 `time.txt`'s content changes between reads, that a read is followed by a
 real `inotify` `IN_MODIFY` event, and that writes from anyone but the
-daemon itself are rejected. It self-skips (rather than failing) if
-`/dev/fuse` isn't usable, e.g. on a sandboxed CI runner.
+daemon itself are rejected. It fails if `/dev/fuse` isn't usable, e.g. on a
+sandboxed CI runner.
 
 ## Trying the FUSE experiment
 

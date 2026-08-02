@@ -27,7 +27,10 @@ if [[ ! -e /dev/fuse ]]; then
   exit 1
 fi
 
-MNT="$(mktemp -d)"
+# -u: a unique path that doesn't exist yet, not an already-created
+# directory - fuse_experiment now creates (and fails if it can't create)
+# its own mountpoint, matching how it must always be freshly created.
+MNT="$(mktemp -u -d)"
 LOG="$(mktemp)"
 DAEMON_PID=""
 WATCH_PID=""
@@ -42,6 +45,9 @@ cleanup() {
     wait "$DAEMON_PID" 2>/dev/null || true
   fi
   rm -f "$LOG"
+  # fuse_experiment removes $MNT itself after a clean unmount; this is
+  # just a safety net for paths where the daemon was killed instead
+  # (e.g. an earlier `fail`), so $MNT may already be gone.
   rmdir "$MNT" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -147,3 +153,12 @@ if echo -n x > "$MNT/time.txt" 2>/dev/null; then
   fail "external write to time.txt unexpectedly succeeded"
 fi
 echo "OK: external write rejected"
+
+# --- 6. a clean unmount removes the mountpoint directory itself ---
+fusermount3 -u "$MNT"
+wait "$DAEMON_PID"
+DAEMON_PID=""  # already reaped; cleanup() shouldn't try to unmount/wait again
+if [[ -e "$MNT" ]]; then
+  fail "mountpoint still exists after a clean unmount"
+fi
+echo "OK: mountpoint removed after a clean unmount"
