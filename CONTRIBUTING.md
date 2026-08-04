@@ -46,8 +46,7 @@ to round-trip through the same fragile path.
 
 No Windows experiment has been written yet. When `experiments/ProjFS` or
 `experiments/ETW` show up, this section should grow the equivalent Windows
-10 SDK / optional-feature setup notes that were tracked in heinzel's
-CONTRIBUTING.md.
+10 SDK / optional-feature setup notes.
 
 ## Building
 
