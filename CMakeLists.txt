@@ -48,8 +48,10 @@ function(makebelieve_apply_clang_tidy target)
 endfunction()
 
 # Each subdirectory under experiments/ is a standalone example application
-# exercising one OS filesystem/tracing mechanism (FUSE, ProjFS, ETW, ...);
-# add new ones here as they're written.
+# exercising one OS filesystem/tracing mechanism (FUSE, ProjFS, ETW,
+# Detours, ...); add new ones here as they're written.
 add_subdirectory(experiments/FUSE)
 add_subdirectory(experiments/FUSE_tracing)
 add_subdirectory(experiments/ProjFS)
+add_subdirectory(experiments/ETW_tracing)
+add_subdirectory(experiments/detours_tracing)
