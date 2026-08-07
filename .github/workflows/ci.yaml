@@ -30,21 +30,6 @@ jobs:
     - name: Allow unprivileged user namespaces
       if: runner.os == 'Linux'
       run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-    - name: Ensure fusermount3 can unmount without a user namespace
-      if: runner.os == 'Linux'
-      # Belt and braces alongside the sysctl above: fusermount3 should
-      # already be setuid-root on ubuntu-latest, but that's ambient image
-      # state we don't control, and it's been observed missing on some
-      # runner instances (fusermount3 -u failing with EPERM even though
-      # the very same job's mount succeeded) while other jobs in the same
-      # CI run, on other runner instances, were unaffected - consistent
-      # with an inconsistency across GitHub's runner pool rather than
-      # anything this repository's code can influence. Setting the bit
-      # ourselves removes the dependency on that ambient state entirely.
-      run: |
-        FUSERMOUNT="$(command -v fusermount3)"
-        sudo chown root:root "$FUSERMOUNT"
-        sudo chmod u+s "$FUSERMOUNT"
     - name: Enable ProjFS
       if: runner.os == 'Windows'
       shell: powershell
