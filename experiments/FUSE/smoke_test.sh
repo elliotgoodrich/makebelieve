@@ -35,14 +35,30 @@ LOG="$(mktemp)"
 DAEMON_PID=""
 WATCH_PID=""
 
+# Wait up to ~3s for the daemon in $1 to exit, then SIGKILL and reap it.
+# Bounded so a daemon whose mount didn't come down can't wedge `wait` until
+# ctest's TIMEOUT. Teardown only - phase 6 asserts a clean exit.
+reap_daemon() {
+  local pid="$1" _
+  for _ in $(seq 1 30); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
 cleanup() {
   if [[ -n "$WATCH_PID" ]] && kill -0 "$WATCH_PID" 2>/dev/null; then
     kill "$WATCH_PID" 2>/dev/null || true
     wait "$WATCH_PID" 2>/dev/null || true
   fi
   if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-    fusermount3 -u "$MNT" 2>/dev/null || true
-    wait "$DAEMON_PID" 2>/dev/null || true
+    # SIGTERM tells libfuse to unmount and exit; reap_daemon then guarantees
+    # the process is gone. We avoid `fusermount3 -u` - its unprivileged
+    # unmount is denied on some sandboxed runners.
+    kill -TERM "$DAEMON_PID" 2>/dev/null || true
+    reap_daemon "$DAEMON_PID"
   fi
   rm -f "$LOG"
   # fuse_experiment removes $MNT itself after a clean unmount; this is
@@ -82,6 +98,8 @@ record_read() {
 }
 
 event_count() {
+  # grep -c exits 1 on zero matches; zero is a valid count, so don't let
+  # set -e treat it as an error.
   grep -c '^EVENT$' "$LOG" || true
 }
 
@@ -154,11 +172,23 @@ if echo -n x > "$MNT/time.txt" 2>/dev/null; then
 fi
 echo "OK: external write rejected"
 
-# --- 6. a clean unmount removes the mountpoint directory itself ---
-fusermount3 -u "$MNT"
-wait "$DAEMON_PID"
-DAEMON_PID=""  # already reaped; cleanup() shouldn't try to unmount/wait again
-if [[ -e "$MNT" ]]; then
-  fail "mountpoint still exists after a clean unmount"
+# --- 6. a signaled shutdown unmounts and removes the mountpoint ---
+# Stop the daemon the way it's meant to stop - SIGTERM, which libfuse turns
+# into its own unmount - and assert it exits and clears its mountpoint. We
+# avoid `fusermount3 -u`, whose unprivileged unmount is denied on some
+# sandboxed runners; the daemon's own unmount takes a different path.
+kill -TERM "$DAEMON_PID"
+daemon_exited=0
+for _ in $(seq 1 50); do
+  kill -0 "$DAEMON_PID" 2>/dev/null || { daemon_exited=1; break; }
+  sleep 0.1
+done
+if [[ "$daemon_exited" -ne 1 ]]; then
+  fail "daemon still running 5s after SIGTERM"
 fi
-echo "OK: mountpoint removed after a clean unmount"
+wait "$DAEMON_PID" 2>/dev/null || true  # reap; a signaled exit is non-zero
+DAEMON_PID=""  # reaped; cleanup() shouldn't touch it again
+if [[ -e "$MNT" ]]; then
+  fail "mountpoint still exists after shutdown"
+fi
+echo "OK: shutdown unmounted and removed the mountpoint"
