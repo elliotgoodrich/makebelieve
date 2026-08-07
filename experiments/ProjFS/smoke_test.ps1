@@ -105,6 +105,50 @@ function Wait-ForCount([int]$Target, [double]$TimeoutSeconds) {
   return $count
 }
 
+# Re-reads time.txt until its content differs from $Previous, returning the
+# new content's timestamp (or the last one seen if the timeout elapses first,
+# so the caller can still assert and fail loudly). Polls in 50ms steps,
+# recording every read into $readLog for failure diagnostics.
+#
+# Why phase 3 needs to poll here at all, when the FUSE sibling
+# (../FUSE/smoke_test.sh) asserts on a single re-read: the two providers
+# make "the content changed" observable in fundamentally different ways.
+# FUSE opens time.txt with direct_io (see fuse.m.cpp's FUSE::open), so the
+# kernel re-runs the read callback on *every* read, regenerating the content
+# from the live wall clock; once the phase-2 notification has been seen the
+# clock has already crossed the next-second boundary, so the very next read
+# is synchronously guaranteed a new timestamp. ProjFS has no direct_io
+# equivalent: its content is a pure function of the placeholder's stored
+# ContentID, and fire_update()'s PrjUpdateFileIfNeeded (see projfs.m.cpp) is
+# a *metadata-only* push. That push bumps LastWriteTime - which is what fires
+# the notification phase 2 waited for - but ProjFS re-virtualizes the file's
+# data a hair *after* that metadata bump becomes observable to a watcher. So
+# a single read taken the instant the notification is seen can still be
+# served the previous second's already-hydrated content, even though the
+# update itself always advances the ContentID to a strictly later second
+# (fire_update stamps >= t1_second + 1, so any *fresh* re-hydration is
+# guaranteed to differ - the same-second read only ever comes from that brief
+# stale-cache window, never from the update landing in the same second).
+#
+# Polling until the content actually reflects the update - rather than
+# sleeping a fixed amount and hoping - keeps the assertion honest: a provider
+# that genuinely never changes the content still fails, and fails within
+# $TimeoutSeconds rather than hanging. It also preserves phase 4's
+# "exactly one more notification" invariant: only the read that actually
+# re-hydrates re-arms an update (debounced in the provider via
+# g_update_scheduled), and it does so exactly once; the stale reads ahead of
+# it are served from cache without re-hydrating, and the loop stops the
+# moment the first fresh read lands, well before that re-armed update fires.
+function Wait-ForChangedContent([string]$Previous, [double]$TimeoutSeconds) {
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  $t = Record-Read
+  while ($t -eq $Previous -and (Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 50
+    $t = Record-Read
+  }
+  return $t
+}
+
 Add-Type -Name Kernel -Namespace ProjfsSmokeTest -MemberDefinition @"
 [DllImport("kernel32.dll", SetLastError = true)]
 public static extern bool FreeConsole();
@@ -183,7 +227,12 @@ if ($count -ne 1) {
 Write-Host "OK: exactly one notification after a read"
 
 # --- 3. reading again shows the content actually changed ---
-$t2 = Record-Read
+# Poll rather than a single read: ProjFS makes the new content observable a
+# hair after the notification, so the first post-notification read can still
+# be served the previous second's cached content (see Wait-ForChangedContent
+# for the full FUSE-vs-ProjFS rationale). The bounded timeout means a
+# provider that never changes the content still fails, and fails fast.
+$t2 = Wait-ForChangedContent $t1 3
 if ($t1 -eq $t2) {
   Fail "content did not change after the notification (still '$t1')"
 }
