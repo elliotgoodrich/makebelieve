@@ -20,4 +20,4 @@ add_test(NAME projfs_experiment_smoke
     -ProjfsExe "$<TARGET_FILE:projfs_experiment>"
     -FilewatchExe "$<TARGET_FILE:filewatch>"
 )
-set_tests_properties(projfs_experiment_smoke PROPERTIES TIMEOUT 30)
+set_tests_properties(projfs_experiment_smoke PROPERTIES TIMEOUT 45)

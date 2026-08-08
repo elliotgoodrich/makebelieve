@@ -162,7 +162,7 @@ if (-not $ready) {
 # One continuous watch spanning the whole scenario below, rather than
 # re-arming per phase - a fresh watch started right before a read could
 # race the update it's trying to observe.
-$watchProcess = Start-Process -FilePath $FilewatchExe -ArgumentList @((Join-Path $mnt "time.txt"), "10") `
+$watchProcess = Start-Process -FilePath $FilewatchExe -ArgumentList @((Join-Path $mnt "time.txt"), "30") `
   -RedirectStandardOutput $watchOut -WindowStyle Hidden -PassThru
 Start-Sleep -Milliseconds 500  # give the watch time to arm
 
@@ -174,35 +174,63 @@ if ($count -ne 0) {
 }
 Write-Host "OK: no notification while idle"
 
-# --- 2. a read is followed by exactly one notification ---
+# --- 2. a read is followed by a notification ---
+# At least one, not exactly one: once reading stops, the provider re-fires
+# the update a second later if nothing has read through it in the meantime
+# (see fire_update() in projfs.m.cpp), so an idle stretch can leave up to
+# two notifications behind. The next read below normally lands first and
+# suppresses that follow-up, but a slow machine can see it here.
 $t1 = Record-Read
 $count = Wait-ForCount 1 3
-if ($count -ne 1) {
-  Fail "expected exactly 1 notification after a read, got $count"
+if ($count -lt 1) {
+  Fail "expected at least 1 notification after a read, got $count"
 }
-Write-Host "OK: exactly one notification after a read"
+Write-Host "OK: notification after a read"
 
 # --- 3. reading again shows the content actually changed ---
+# Right after the change notification, Windows can still be serving the
+# bytes hydrated for the previous read, so the first read here can come
+# back unchanged. The provider notices nothing read through it and re-fires
+# the update a second later, so on a stale read we wait for that next
+# notification and read once more before giving up.
 $t2 = Record-Read
 if ($t1 -eq $t2) {
-  Fail "content did not change after the notification (still '$t1')"
+  $before = Event-Count
+  $count = Wait-ForCount ($before + 1) 3
+  if ($count -lt ($before + 1)) {
+    Fail "no follow-up notification after a stale read (still '$t1')"
+  }
+  $t2 = Record-Read
+  if ($t1 -eq $t2) {
+    Fail "content did not change even after a second notification (still '$t1')"
+  }
 }
 Write-Host "OK: content changed ('$t1' -> '$t2')"
 
-# --- 4. that second read schedules exactly one more notification ---
-$count = Wait-ForCount 2 3
-if ($count -ne 2) {
-  Fail "expected exactly 2 total notifications after the second read, got $count"
+# --- 4. a further read keeps the heartbeat going, then it settles ---
+# The read schedules one update; with nothing reading through the provider
+# afterwards, that update's stale-content follow-up fires once more - so a
+# couple of trailing notifications are expected, but then it must go quiet
+# rather than firing every second forever.
+$before = Event-Count
+$t3 = Record-Read
+$count = Wait-ForCount ($before + 1) 3
+if ($count -lt ($before + 1)) {
+  Fail "expected another notification after a further read, got $count (was $before)"
 }
-# A short settle window: catches a runaway heartbeat immediately firing a
-# third event, without paying a full extra second on every run just to
-# rule that out.
-Start-Sleep -Milliseconds 500
-$count = Event-Count
-if ($count -ne 2) {
-  Fail "expected exactly 2 total notifications after the second read, got $count"
+# Let the update and its single follow-up drain, then confirm the heartbeat
+# has stopped rather than continuing to fire.
+Start-Sleep -Seconds 3
+$drained = Event-Count
+if (($drained - $before) -gt 3) {
+  Fail "heartbeat did not settle: $($drained - $before) notifications after a single read (expected ~2)"
 }
-Write-Host "OK: exactly one more notification after the second read"
+Start-Sleep -Seconds 1.5
+$final = Event-Count
+if ($final -ne $drained) {
+  Fail "heartbeat still firing after it should have settled ($drained -> $final)"
+}
+Write-Host "OK: heartbeat settled after reads stopped"
 
 # --- 5. writes from anyone else are rejected ---
 $writeSucceeded = $true
