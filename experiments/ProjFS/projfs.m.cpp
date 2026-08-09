@@ -66,6 +66,13 @@ PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT g_ctx = nullptr;
 std::atomic<bool> g_update_scheduled{false};
 
 /**
+ * Set by get_file_data() on every real hydration, cleared by fire_update()
+ * after each push. Lets a completed update tell whether anyone re-read the
+ * file since it ran - see fire_update() for why that matters.
+ */
+std::atomic<bool> g_get_file_data_called{false};
+
+/**
  * Builds time.txt's content for a given moment.
  *
  * @param now The time to render.
@@ -166,53 +173,91 @@ PRJ_PLACEHOLDER_INFO make_placeholder_info(
  *   content is deterministically next_second's content regardless of how
  *   much OS scheduling jitter elapsed between sleep_until(next_second)
  *   returning and this line actually running.
+ * @param retry_count How many stale-content follow-ups to try (see below):
+ *   schedule_next_change() passes 1, and each follow-up decrements it, so an
+ *   idle file settles instead of looping forever.
  */
-void fire_update(std::chrono::system_clock::time_point target) {
-  const std::string content = make_content(target);
-  const PRJ_PLACEHOLDER_INFO info =
-      make_placeholder_info(target, content.size());
+void fire_update(std::chrono::system_clock::time_point target,
+                 int retry_count) {
+  // We run on the background thread schedule_next_change() spawned, so the
+  // follow-ups below just sleep and loop here rather than each spawning a
+  // fresh thread.
+  for (;;) {
+    const std::string content = make_content(target);
+    const PRJ_PLACEHOLDER_INFO info =
+        make_placeholder_info(target, content.size());
 
-  // PRJ_UPDATE_ALLOW_READ_ONLY: time.txt always carries
-  // FILE_ATTRIBUTE_READONLY (see make_placeholder_info), so without this
-  // flag ProjFS would refuse to update it even coming from us.
-  // PRJ_UPDATE_ALLOW_DIRTY_METADATA: covers a placeholder whose metadata
-  // was touched locally (e.g. by a virus scanner or indexer) without going
-  // through us. Deliberately NOT PRJ_UPDATE_ALLOW_DIRTY_DATA or
-  // PRJ_UPDATE_ALLOW_TOMBSTONE: unlike fuse.m.cpp's dummy write, this call
-  // carries no bytes, so there's never legitimate local file content worth
-  // preserving, nor a delete worth silently reverting.
-  //
-  // A read that lands within a few milliseconds of the whole-second
-  // boundary leaves this call almost no lead time before it runs - short
-  // enough that Windows can still be holding the cached section it just
-  // created to serve that read. When that happens PrjUpdateFileIfNeeded
-  // fails with ERROR_SHARING_VIOLATION, a condition that's transient (the
-  // section is released shortly after the read completes), so a short
-  // bounded retry is the correct response here, not a workaround: Windows
-  // Server's own file-sharing service retries the same error the same
-  // way, and defaults to the same 5 attempts -
-  // https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2003/cc778145(v=ws.10).
-  // VFS for Git hits this same failure from PrjUpdateFileIfNeeded and
-  // instead defers to a background retry queue rather than looping
-  // in place -
-  // https://github.com/microsoft/VFSForGit/blob/3b7ac38808bdab9079e7dd94dcac16d6c84a1ea3/GVFS/GVFS.Virtualization/Projection/GitIndexProjection.cs#L1855-L1859
-  // - a better fit for updating hundreds of thousands of placeholders at
-  // once, but wrong for us: we're correcting one file and want it fixed
-  // within about a second, so a short inline retry is what we actually
-  // want here.
-  PRJ_UPDATE_FAILURE_CAUSES failure_reason{};
-  for (int attempt = 0; attempt < 5; ++attempt) {
-    const HRESULT update_hr = PrjUpdateFileIfNeeded(
-        g_ctx, k_time_name.data(), &info, sizeof(info),
-        PRJ_UPDATE_ALLOW_READ_ONLY | PRJ_UPDATE_ALLOW_DIRTY_METADATA,
-        &failure_reason);
-    if (update_hr != HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION)) {
-      break;
+    // PRJ_UPDATE_ALLOW_READ_ONLY: time.txt always carries
+    // FILE_ATTRIBUTE_READONLY (see make_placeholder_info), so without this
+    // flag ProjFS would refuse to update it even coming from us.
+    // PRJ_UPDATE_ALLOW_DIRTY_METADATA: covers a placeholder whose metadata
+    // was touched locally (e.g. by a virus scanner or indexer) without going
+    // through us. Deliberately NOT PRJ_UPDATE_ALLOW_DIRTY_DATA or
+    // PRJ_UPDATE_ALLOW_TOMBSTONE: unlike fuse.m.cpp's dummy write, this call
+    // carries no bytes, so there's never legitimate local file content worth
+    // preserving, nor a delete worth silently reverting.
+    //
+    // A read that lands within a few milliseconds of the whole-second
+    // boundary leaves this call almost no lead time before it runs - short
+    // enough that Windows can still be holding the cached section it just
+    // created to serve that read. When that happens PrjUpdateFileIfNeeded
+    // fails with ERROR_SHARING_VIOLATION, a condition that's transient (the
+    // section is released shortly after the read completes), so a short
+    // bounded retry is the correct response here, not a workaround: Windows
+    // Server's own file-sharing service retries the same error the same
+    // way, and defaults to the same 5 attempts -
+    // https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2003/cc778145(v=ws.10).
+    // VFS for Git hits this same failure from PrjUpdateFileIfNeeded and
+    // instead defers to a background retry queue rather than looping
+    // in place -
+    // https://github.com/microsoft/VFSForGit/blob/3b7ac38808bdab9079e7dd94dcac16d6c84a1ea3/GVFS/GVFS.Virtualization/Projection/GitIndexProjection.cs#L1855-L1859
+    // - a better fit for updating hundreds of thousands of placeholders at
+    // once, but wrong for us: we're correcting one file and want it fixed
+    // within about a second, so a short inline retry is what we actually
+    // want here.
+    PRJ_UPDATE_FAILURE_CAUSES failure_reason{};
+    for (int attempt = 0; attempt < 5; ++attempt) {
+      const HRESULT update_hr = PrjUpdateFileIfNeeded(
+          g_ctx, k_time_name.data(), &info, sizeof(info),
+          PRJ_UPDATE_ALLOW_READ_ONLY | PRJ_UPDATE_ALLOW_DIRTY_METADATA,
+          &failure_reason);
+      if (update_hr != HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION)) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
 
-  g_update_scheduled.store(false, std::memory_order_relaxed);
+    g_update_scheduled.store(false, std::memory_order_relaxed);
+
+    if (retry_count <= 0) {
+      return;
+    }
+
+    // The update above notified watchers, but Windows can keep serving the
+    // previously hydrated bytes for a short window - a read landing there is
+    // served from cache without reaching get_file_data(), so the reader sees
+    // the notification yet still reads stale content. EdenFS documents the
+    // same "PrjFS keeps providing the old contents unless invalidated"
+    // hazard -
+    // https://github.com/facebook/sapling/blob/main/eden/fs/docs/Windows.md
+    // (Invalidations). So wait a second and, if nothing has hydrated since,
+    // loop with fresh content (new ContentID, so it isn't a no-op) to drop
+    // the stale cache and re-notify.
+    g_get_file_data_called.store(false, std::memory_order_relaxed);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    if (g_get_file_data_called.load(std::memory_order_relaxed)) {
+      return;
+    }
+    // Respect the debounce: a read may have raced in and scheduled its own
+    // update while we were waiting.
+    bool expected = false;
+    if (!g_update_scheduled.compare_exchange_strong(expected, true)) {
+      return;
+    }
+
+    target = std::chrono::system_clock::now();
+    --retry_count;
+  }
 }
 
 /**
@@ -236,7 +281,7 @@ void schedule_next_change(std::chrono::system_clock::time_point next_time) {
   // after it's created.
   std::thread([next_time] {
     std::this_thread::sleep_until(next_time);
-    fire_update(next_time);
+    fire_update(next_time, 1);
   }).detach();
 }
 
@@ -375,6 +420,10 @@ struct ProjFS {
     PrjFreeAlignedBuffer(buffer);
 
     if (SUCCEEDED(hr)) {
+      // A read reached us, so a just-fired update's follow-up isn't needed
+      // (see fire_update()).
+      g_get_file_data_called.store(true, std::memory_order_relaxed);
+
       // Schedule for the later of "one second after the content we just
       // served" and "right now". If nobody read the file for a while
       // before this, `moment` can already be several seconds stale, and
