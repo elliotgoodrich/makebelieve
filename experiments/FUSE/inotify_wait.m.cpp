@@ -59,7 +59,7 @@ int main(int argc, char* argv[]) {
       break;
     }
 
-    pollfd pfd{fd, POLLIN, 0};
+    pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
     const int rc = poll(&pfd, 1, static_cast<int>(remaining_ms));
     if (rc < 0) {
       std::fprintf(stderr, "poll: %s\n", std::strerror(errno));

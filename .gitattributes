@@ -1,0 +1,7 @@
+# Enforce line endings in git regardless of editor. Shell scripts must stay LF
+# even on Windows: bash treats a trailing CR as part of the line (a CRLF script
+# fails with e.g. "set: pipefail: invalid option name").
+* text=auto
+*.sh text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
