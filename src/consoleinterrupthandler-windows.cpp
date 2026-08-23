@@ -28,21 +28,26 @@ std::optional<int> g_forced_install_error;
 // hand off from the signal handler before requesting a stop.
 BOOL WINAPI console_handler(DWORD type) {
   switch (type) {
-    case CTRL_C_EVENT: [[fallthrough]];
-    case CTRL_BREAK_EVENT: [[fallthrough]];
-    case CTRL_CLOSE_EVENT: [[fallthrough]];
-    case CTRL_LOGOFF_EVENT: [[fallthrough]];
+    case CTRL_C_EVENT:
+      [[fallthrough]];
+    case CTRL_BREAK_EVENT:
+      [[fallthrough]];
+    case CTRL_CLOSE_EVENT:
+      [[fallthrough]];
+    case CTRL_LOGOFF_EVENT:
+      [[fallthrough]];
     case CTRL_SHUTDOWN_EVENT: {
       if (std::stop_source* source = g_source.load(std::memory_order_acquire)) {
         source->request_stop();
         // Returning TRUE for CTRL_C_EVENT and CTRL_BREAK_EVENT suppresses the
-        // default "terminate immediately", which is what buys the main thread the
-        // time to react to the `std::stop_token` and shut down cleanly.
+        // default "terminate immediately", which is what buys the main thread
+        // the time to react to the `std::stop_token` and shut down cleanly.
         //
-        // For CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT and CTRL_SHUTDOWN_EVENT, Windows
-        // terminates the process once this returns, allowing only a short grace
-        // period. Teardown races that deadline, so a console window closed rather
-        // than interrupted may not have time to react to the `std::stop_token` before the process is killed.
+        // For CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT and CTRL_SHUTDOWN_EVENT,
+        // Windows terminates the process once this returns, allowing only a
+        // short grace period. Teardown races that deadline, so a console window
+        // closed rather than interrupted may not have time to react to the
+        // `std::stop_token` before the process is killed.
         return TRUE;
       }
     }
@@ -54,7 +59,7 @@ BOOL WINAPI console_handler(DWORD type) {
 
 // RAII guard for the single-instance `g_source`.
 class SourceSlot {
-public:
+ public:
   explicit SourceSlot(std::stop_source& source) {
     std::stop_source* expected = nullptr;
     if (!g_source.compare_exchange_strong(expected, &source,
@@ -69,33 +74,33 @@ public:
   SourceSlot& operator=(const SourceSlot&) = delete;
 };
 
-}  // close anonymous namespace
+}  // namespace
 
 class ConsoleInterruptHandler::Impl {
   std::stop_source m_source;
   SourceSlot m_slot;
 
-public:
-  Impl(): m_source(), m_slot(m_source) {
+ public:
+  Impl() : m_source(), m_slot(m_source) {
     // Test seam: a pending injection behaves as though the install below
     // failed, without an actual OS failure. Consumed whether or not it fires.
     // See ConsoleInterruptHandlerTestUtil::fail_next_install().
     if (const std::optional<int> forced =
             std::exchange(g_forced_install_error, std::nullopt)) {
       throw std::system_error(*forced, std::system_category(),
-                              "SetConsoleCtrlHandler failed to install the console interrupt handler");
+                              "SetConsoleCtrlHandler failed to install the "
+                              "console interrupt handler");
     }
 
     if (!::SetConsoleCtrlHandler(console_handler, TRUE)) {
       const DWORD error = ::GetLastError();
       throw std::system_error(static_cast<int>(error), std::system_category(),
-                              "SetConsoleCtrlHandler failed to install the console interrupt handler");
+                              "SetConsoleCtrlHandler failed to install the "
+                              "console interrupt handler");
     }
   }
 
-  ~Impl() {
-    ::SetConsoleCtrlHandler(console_handler, FALSE);
-  }
+  ~Impl() { ::SetConsoleCtrlHandler(console_handler, FALSE); }
 
   Impl(const Impl&) = delete;
   Impl& operator=(const Impl&) = delete;

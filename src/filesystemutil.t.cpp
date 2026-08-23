@@ -38,7 +38,8 @@ TEST_P(AreDisjoint, MatchesExpectation) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    FileSystemUtil, AreDisjoint,
+    FileSystemUtil,
+    AreDisjoint,
     ::testing::Values(
         // A parent/child pair overlaps whichever way round it is passed - the
         // two orderings prove the symmetry.

@@ -53,8 +53,8 @@ struct sigaction g_prev_int {};
 struct sigaction g_prev_term {};
 
 // Runs in signal context, so it writes to the self-pipe and lets the dispatcher
-// thread do the rest. request_stop() takes a lock and runs callbacks and so is *not* legal here,
-// which is the whole reason this backend needs a thread.
+// thread do the rest. request_stop() takes a lock and runs callbacks and so is
+// *not* legal here, which is the whole reason this backend needs a thread.
 extern "C" void handle_signal(int /*signal*/) {
   // write(2) sets errno on failure, and this runs on whichever thread the
   // kernel picks, at whatever point that thread had reached. Left unrestored,
@@ -148,16 +148,18 @@ void stop_dispatcher(std::thread& dispatcher) {
   // The pipe outlives us, so a byte left by a handler firing during teardown
   // would reach the next dispatcher as an interrupt nobody sent. The join means
   // nothing competes for the pipe here.
-  struct pollfd waiting{.fd = g_read_fd, .events = POLLIN, .revents = 0};
+  struct pollfd waiting {
+    .fd = g_read_fd, .events = POLLIN, .revents = 0
+  };
   char discarded = 0;
-  while (::poll(&waiting, 1, 0) == 1 &&
-         ::read(g_read_fd, &discarded, 1) == 1) {
+  while (::poll(&waiting, 1, 0) == 1 && ::read(g_read_fd, &discarded, 1) == 1) {
   }
 }
 
 // Unwinds a failed install. A failed sigaction() leaves its oldact
 // unspecified, so `int_installed` says whether g_prev_int is worth restoring.
-[[noreturn]] void fail_install(std::thread& dispatcher, const int error,
+[[noreturn]] void fail_install(std::thread& dispatcher,
+                               const int error,
                                const bool int_installed) {
   if (int_installed) {
     ::sigaction(SIGINT, &g_prev_int, nullptr);
@@ -170,7 +172,7 @@ void stop_dispatcher(std::thread& dispatcher) {
 
 // RAII guard for the single-instance `g_source`.
 class SourceSlot {
-public:
+ public:
   explicit SourceSlot(std::stop_source& source) {
     std::stop_source* expected = nullptr;
     if (!g_source.compare_exchange_strong(expected, &source,
@@ -185,15 +187,15 @@ public:
   SourceSlot& operator=(const SourceSlot&) = delete;
 };
 
-}  // close anonymous namespace
+}  // namespace
 
 class ConsoleInterruptHandler::Impl {
   std::stop_source m_source;
   SourceSlot m_slot;
   std::thread m_dispatcher;
 
-public:
-  Impl(): m_slot(m_source) {
+ public:
+  Impl() : m_slot(m_source) {
     std::call_once(g_pipe_created, create_wakeup_pipe);
 
     // Started before the handlers are installed so a byte from an immediate
@@ -203,7 +205,8 @@ public:
     struct sigaction action {};
     action.sa_handler = &handle_signal;
     sigemptyset(&action.sa_mask);
-    action.sa_flags = SA_RESTART;  // Let the dispatcher's read() resume, not fail.
+    action.sa_flags =
+        SA_RESTART;  // Let the dispatcher's read() resume, not fail.
 
     // Allowing testing for failure. Stands in for SIGTERM failing, which is
     // the case with a SIGINT install to undo.

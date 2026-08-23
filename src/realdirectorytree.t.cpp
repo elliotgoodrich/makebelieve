@@ -59,7 +59,8 @@ void write_file(const std::filesystem::path& path, std::string_view contents) {
   ASSERT_TRUE(out) << "could not write " << path.string();
 }
 
-void expect_file(const makebelieve::EntryInfo& info, std::size_t expected_size) {
+void expect_file(const makebelieve::EntryInfo& info,
+                 std::size_t expected_size) {
   ASSERT_TRUE(std::holds_alternative<makebelieve::FileInfo>(info))
       << "expected a file, got a directory";
   EXPECT_EQ(std::get<makebelieve::FileInfo>(info).size, expected_size);
@@ -87,7 +88,7 @@ std::vector<std::string> sorted_names(
 // That takes the name, so the class under test is spelled makebelieve::
 // throughout this file.
 class RealDirectoryTree : public ::testing::Test {
-protected:
+ protected:
   void SetUp() override {
     m_root = make_temp_directory();
     ASSERT_FALSE(m_root.empty()) << "could not create a temp directory";
@@ -111,7 +112,7 @@ protected:
   const makebelieve::RealDirectoryTree& tree() const { return *m_tree; }
   const std::filesystem::path& root() const { return m_root; }
 
-private:
+ private:
   std::filesystem::path m_root;
   // Neither copyable nor movable, so it is emplaced once the tree is on disk.
   std::optional<makebelieve::RealDirectoryTree> m_tree;
@@ -156,14 +157,15 @@ TEST_P(EscapingPath, IsRejectedByEveryOperation) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    RealDirectoryTree, EscapingPath,
-    ::testing::Values(
-        EscapeCase{"parent", ".."},
-        EscapeCase{"parent_file", "../outside.txt"},
-        EscapeCase{"through_a_real_directory", "sub/../../outside.txt"},
-        EscapeCase{"interior_segments_collapse", "sub/../.."},
-        EscapeCase{"root_directory", "/absolute.txt"},
-        EscapeCase{"absolute", platform_absolute_path()}),
+    RealDirectoryTree,
+    EscapingPath,
+    ::testing::Values(EscapeCase{"parent", ".."},
+                      EscapeCase{"parent_file", "../outside.txt"},
+                      EscapeCase{"through_a_real_directory",
+                                 "sub/../../outside.txt"},
+                      EscapeCase{"interior_segments_collapse", "sub/../.."},
+                      EscapeCase{"root_directory", "/absolute.txt"},
+                      EscapeCase{"absolute", platform_absolute_path()}),
     [](const ::testing::TestParamInfo<EscapeCase>& info) {
       return std::string(info.param.label);
     });
@@ -204,7 +206,8 @@ TEST_P(StatusEntry, MatchesExpectation) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    RealDirectoryTree, StatusEntry,
+    RealDirectoryTree,
+    StatusEntry,
     ::testing::Values(
         StatusCase{"empty_is_the_root", "", Kind::Directory, 0},
         StatusCase{"dot_is_the_root", ".", Kind::Directory, 0},
@@ -242,8 +245,8 @@ TEST_F(RealDirectoryTree, MTimeMatchesTheFileSystem) {
   for (const std::string_view relative : {"hello.txt", "sub"}) {
     const std::expected<makebelieve::EntryInfo, std::error_code> result =
         tree().status(std::filesystem::path(relative));
-    ASSERT_TRUE(result.has_value()) << relative << ": "
-                                    << result.error().message();
+    ASSERT_TRUE(result.has_value())
+        << relative << ": " << result.error().message();
 
     const std::chrono::file_clock::time_point reported =
         std::visit([](const auto& info) { return info.mtime; }, *result);
@@ -287,7 +290,8 @@ TEST_P(LsListing, MatchesExpectation) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    RealDirectoryTree, LsListing,
+    RealDirectoryTree,
+    LsListing,
     ::testing::Values(
         LsCase{"root", "",
                std::vector<std::string>{"binary.bin", "empty.txt", "hello.txt",
@@ -354,7 +358,8 @@ TEST_P(ReadSlice, ReturnsExpectedBytes) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    RealDirectoryTree, ReadSlice,
+    RealDirectoryTree,
+    ReadSlice,
     ::testing::Values(
         // Whole file, a prefix, and an interior slice.
         ReadCase{"whole_file", "hello.txt", 0, 11, "hello world"},
@@ -410,7 +415,8 @@ TEST_P(ReadFailure, FailsAsExpected) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    RealDirectoryTree, ReadFailure,
+    RealDirectoryTree,
+    ReadFailure,
     ::testing::Values(
         // A missing leaf and a missing interior directory report different raw
         // values on Windows, but map to the same condition - which is why these
@@ -443,7 +449,7 @@ INSTANTIATE_TEST_SUITE_P(
     });
 
 class RealDirectoryTreeWithAMissingRoot : public ::testing::Test {
-protected:
+ protected:
   void SetUp() override {
     const std::filesystem::path parent = make_temp_directory();
     ASSERT_FALSE(parent.empty()) << "could not create a temp directory";
@@ -458,7 +464,7 @@ protected:
 
   const std::filesystem::path& root() const { return m_root; }
 
-private:
+ private:
   std::filesystem::path m_parent;
   std::filesystem::path m_root;
 };

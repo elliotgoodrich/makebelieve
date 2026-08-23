@@ -48,7 +48,7 @@ int main(int argc, char** argv) {
     // Block until the user interrupts the process.
     std::binary_semaphore stopped{0};
     const std::stop_callback callback{interrupt.token(),
-                                    [&stopped] { stopped.release(); }};
+                                      [&stopped] { stopped.release(); }};
     stopped.acquire();
     return 0;
   } catch (const std::exception& error) {

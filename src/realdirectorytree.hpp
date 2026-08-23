@@ -21,7 +21,7 @@ class RealDirectoryTree : public DirectoryTree {
   class Impl;
   std::unique_ptr<Impl> m_impl;
 
-public:
+ public:
   /// Creates a `RealDirectoryTree` at @a root.  If @a root does not exist
   /// then construction still succeeds and every query fails with
   /// `std::errc::no_such_file_or_directory`.
@@ -34,19 +34,19 @@ public:
   RealDirectoryTree(RealDirectoryTree&&) = delete;
   RealDirectoryTree& operator=(RealDirectoryTree&&) = delete;
 
-  /// Returns entry at @a path, or an error_code when it is missing, unreachable, or
-  /// escapes the root.
+  /// Returns entry at @a path, or an error_code when it is missing,
+  /// unreachable, or escapes the root.
   [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
       const std::filesystem::path& path) const override;
 
-  /// Returns the children of @a path, or an error_code when it cannot be listed. An
-  /// existing but empty directory yields an empty vector.
+  /// Returns the children of @a path, or an error_code when it cannot be
+  /// listed. An existing but empty directory yields an empty vector.
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
       const std::filesystem::path& path) const override;
 
-  /// Returns up to @a size bytes of @a path starting at @a offset, or an error_code on
-  /// failure. A result shorter than @a size means end of file. A @a size of 0 succeeds
-  /// with an empty result without opening @a path.
+  /// Returns up to @a size bytes of @a path starting at @a offset, or an
+  /// error_code on failure. A result shorter than @a size means end of file. A
+  /// @a size of 0 succeeds with an empty result without opening @a path.
   [[nodiscard]] std::expected<std::string, std::error_code> read(
       const std::filesystem::path& path,
       Offset offset,

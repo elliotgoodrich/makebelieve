@@ -74,5 +74,5 @@ jobs:
         persist-credentials: false
     - name: Run clang-format
       run: >
-        git ls-files -z 'experiments/*.cpp' 'experiments/*.hpp'
+        git ls-files -z 'experiments/*.cpp' 'experiments/*.hpp' 'src/*.cpp' 'src/*.hpp'
         | xargs -0 clang-format --dry-run --Werror
