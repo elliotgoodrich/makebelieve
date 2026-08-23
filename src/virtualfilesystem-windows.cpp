@@ -126,10 +126,9 @@ class AlignedBuffer {
   PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT m_context;
   void* m_buffer;
 
-public:
+ public:
   AlignedBuffer(PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT context, UINT32 size)
-      : m_context(context),
-        m_buffer(PrjAllocateAlignedBuffer(context, size)) {}
+      : m_context(context), m_buffer(PrjAllocateAlignedBuffer(context, size)) {}
 
   ~AlignedBuffer() {
     if (m_buffer != nullptr) {
@@ -172,13 +171,14 @@ void remove_mountpoint(const std::filesystem::path& mountpoint) noexcept {
     if (error) {
       break;
     }
-    std::filesystem::permissions(it->path(), std::filesystem::perms::owner_write,
+    std::filesystem::permissions(it->path(),
+                                 std::filesystem::perms::owner_write,
                                  std::filesystem::perm_options::add, error);
   }
   std::filesystem::remove_all(mountpoint, error);
 }
 
-}  // close anonymous namespace
+}  // namespace
 
 // ProjFS provider over a DirectoryTree.
 //
@@ -187,7 +187,7 @@ void remove_mountpoint(const std::filesystem::path& mountpoint) noexcept {
 // own const-means-thread-safe contract is what makes querying it from those
 // threads sound.
 class VirtualFileSystem::Impl {
-public:
+ public:
   Impl(const DirectoryTree& tree, const std::filesystem::path& mountpoint)
       : m_tree(tree), m_root(to_projfs_path(mountpoint)) {
     // Create the mountpoint fresh, failing if it already exists - see
@@ -213,8 +213,8 @@ public:
         .GetFileDataCallback = trampoline<&Impl::get_file_data>,
     };
 
-    if (const HRESULT hr = PrjStartVirtualizing(m_root.c_str(), &callbacks, this,
-                                                nullptr, &m_context);
+    if (const HRESULT hr = PrjStartVirtualizing(m_root.c_str(), &callbacks,
+                                                this, nullptr, &m_context);
         FAILED(hr)) {
       throw_hresult(hr, "PrjStartVirtualizing");
     }
@@ -251,7 +251,8 @@ public:
   // drives one enumeration across as many GetDirectoryEnumeration calls as it
   // takes to drain, and a listing that shifted underneath those calls could
   // duplicate or skip entries.
-  HRESULT start_enum(const PRJ_CALLBACK_DATA* data, const GUID* enumeration_id) {
+  HRESULT start_enum(const PRJ_CALLBACK_DATA* data,
+                     const GUID* enumeration_id) {
     std::expected<std::vector<TreeEntry>, std::error_code> entries =
         m_tree.ls(std::filesystem::path(data->FilePathName));
     if (!entries.has_value()) {
@@ -334,15 +335,16 @@ public:
   // Reports an entry's metadata so ProjFS can create its placeholder.
   HRESULT get_placeholder_info(const PRJ_CALLBACK_DATA* data) {
     const std::filesystem::path path(data->FilePathName);
-    const std::expected<EntryInfo, std::error_code> status = m_tree.status(path);
+    const std::expected<EntryInfo, std::error_code> status =
+        m_tree.status(path);
     if (!status.has_value()) {
       return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
     }
 
     const PRJ_PLACEHOLDER_INFO info = make_placeholder_info(*status);
-    const HRESULT hr = PrjWritePlaceholderInfo(
-        data->NamespaceVirtualizationContext, data->FilePathName, &info,
-        sizeof(info));
+    const HRESULT hr =
+        PrjWritePlaceholderInfo(data->NamespaceVirtualizationContext,
+                                data->FilePathName, &info, sizeof(info));
     if (SUCCEEDED(hr)) {
       const std::lock_guard<std::mutex> lock(m_placeholder_mutex);
       m_placeholders.insert(path);
@@ -391,7 +393,7 @@ public:
     return S_OK;
   }
 
-private:
+ private:
   // One in-flight directory enumeration.
   struct Enumeration {
     std::vector<TreeEntry> entries;
@@ -481,7 +483,8 @@ private:
     }
 
     const std::wstring name = to_projfs_path(path);
-    const std::expected<EntryInfo, std::error_code> status = m_tree.status(path);
+    const std::expected<EntryInfo, std::error_code> status =
+        m_tree.status(path);
     PRJ_UPDATE_FAILURE_CAUSES cause{};
 
     if (!status.has_value()) {
@@ -493,9 +496,8 @@ private:
 
     const PRJ_PLACEHOLDER_INFO info = make_placeholder_info(*status);
     for (int attempt = 0; attempt < k_update_attempts; ++attempt) {
-      const HRESULT hr =
-          PrjUpdateFileIfNeeded(m_context, name.c_str(), &info, sizeof(info),
-                                k_update_flags, &cause);
+      const HRESULT hr = PrjUpdateFileIfNeeded(
+          m_context, name.c_str(), &info, sizeof(info), k_update_flags, &cause);
       if (hr != HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION)) {
         break;
       }

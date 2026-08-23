@@ -48,8 +48,8 @@ constexpr std::uint32_t k_watch_mask = IN_CREATE | IN_DELETE | IN_MOVED_FROM |
 // syscall count down under churn.
 constexpr std::size_t k_event_buffer_bytes = std::size_t{64} * 1024;
 
-// Return the calling thread's errno as a std::error_code, for the std::expected the
-// value-returning methods hand back instead of throwing.
+// Return the calling thread's errno as a std::error_code, for the std::expected
+// the value-returning methods hand back instead of throwing.
 std::error_code last_error_code() {
   return {errno, std::system_category()};
 }
@@ -72,7 +72,7 @@ EntryInfo make_info(const struct stat& info) {
 
 using UniqueDir = std::unique_ptr<DIR, int (*)(DIR*)>;
 
-}  // close anonymous namespace
+}  // namespace
 
 class RealDirectoryTree::Impl {
   std::filesystem::path m_root;
@@ -97,7 +97,7 @@ class RealDirectoryTree::Impl {
   mutable std::map<int, std::filesystem::path> m_watch_descriptors;
   mutable std::thread m_watcher;
 
-public:
+ public:
   explicit Impl(const std::filesystem::path& root)
       : m_root(std::filesystem::weakly_canonical(root)) {}
 
@@ -128,11 +128,13 @@ public:
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
       const std::filesystem::path& path) const;
   [[nodiscard]] std::expected<std::string, std::error_code> read(
-      const std::filesystem::path& path, Offset offset, std::size_t size) const;
+      const std::filesystem::path& path,
+      Offset offset,
+      std::size_t size) const;
   [[nodiscard]] Subscription subscribe_to_changes(
       const std::function<void(const DirectoryTreeDiff&)>& callback) const;
 
-private:
+ private:
   // Maps a tree-relative path onto an absolute one, or nullopt when it
   // escapes the root.
   [[nodiscard]] std::optional<std::filesystem::path> resolve(
@@ -166,7 +168,6 @@ private:
   // callback list so that a callback which unsubscribes cannot deadlock
   // against m_mutex.
   void notify_subscribers(const DirectoryTreeDiff& diff) const;
-
 };
 
 std::optional<std::filesystem::path> RealDirectoryTree::Impl::resolve(
@@ -221,9 +222,9 @@ RealDirectoryTree::Impl::ls(const std::filesystem::path& path) const {
   // and_then runs the enumeration only for a path that stayed inside the root.
   // A present-but-empty vector (an empty directory) is a success; only a failed
   // opendir yields nullopt and therefore the error below.
-  const std::optional<std::vector<TreeEntry>> listed = resolve(path).and_then(
-      [](const std::filesystem::path& absolute)
-          -> std::optional<std::vector<TreeEntry>> {
+  const std::optional<std::vector<TreeEntry>> listed =
+      resolve(path).and_then([](const std::filesystem::path& absolute)
+                                 -> std::optional<std::vector<TreeEntry>> {
         const UniqueDir dir(::opendir(absolute.c_str()), &::closedir);
         if (dir == nullptr) {
           return std::nullopt;
@@ -259,10 +260,8 @@ RealDirectoryTree::Impl::ls(const std::filesystem::path& path) const {
           if (::fstatat(dir_fd, entry->d_name, &info, 0) != 0) {
             continue;
           }
-          entries.push_back({
-            .name = std::filesystem::path(name),
-            .info = make_info(info)
-          });
+          entries.push_back(
+              {.name = std::filesystem::path(name), .info = make_info(info)});
         }
         return entries;
       });
@@ -308,27 +307,27 @@ std::expected<std::string, std::error_code> RealDirectoryTree::Impl::read(
 
   std::string contents;
   std::optional<std::error_code> failure;
-  contents.resize_and_overwrite(
-      size, [&](char* data, const std::size_t capacity) noexcept {
-        std::size_t total = 0;
-        while (total < capacity) {
-          const ssize_t read_bytes =
-              ::pread(fd, data + total, capacity - total,
-                      static_cast<off_t>(offset) + static_cast<off_t>(total));
-          if (read_bytes < 0) {
-            if (errno == EINTR) {
-              continue;
-            }
-            failure = last_error_code();
-            break;
-          }
-          if (read_bytes == 0) {
-            break;  // End of file: a short result is how the contract spells EOF.
-          }
-          total += static_cast<std::size_t>(read_bytes);
+  contents.resize_and_overwrite(size, [&](char* data,
+                                          const std::size_t capacity) noexcept {
+    std::size_t total = 0;
+    while (total < capacity) {
+      const ssize_t read_bytes =
+          ::pread(fd, data + total, capacity - total,
+                  static_cast<off_t>(offset) + static_cast<off_t>(total));
+      if (read_bytes < 0) {
+        if (errno == EINTR) {
+          continue;
         }
-        return total;
-      });
+        failure = last_error_code();
+        break;
+      }
+      if (read_bytes == 0) {
+        break;  // End of file: a short result is how the contract spells EOF.
+      }
+      total += static_cast<std::size_t>(read_bytes);
+    }
+    return total;
+  });
 
   if (failure.has_value()) {
     return std::unexpected(*failure);
@@ -345,7 +344,7 @@ Subscription RealDirectoryTree::Impl::subscribe_to_changes(
   }
 
   const auto it = m_subscribers.emplace(m_subscribers.end(), callback);
-  return Subscription([this, it]{
+  return Subscription([this, it] {
     const std::lock_guard<std::mutex> unsubscribe_lock(m_mutex);
     m_subscribers.erase(it);
   });
@@ -485,9 +484,11 @@ void RealDirectoryTree::Impl::watch_loop() const {
 
     DirectoryTreeDiff diff;
     diff.everything_dirty = overflowed;
-    diff.entries_changed.assign(std::make_move_iterator(files.begin()), std::make_move_iterator(files.end()));
-    diff.child_lists_changed.assign(std::make_move_iterator(directories.begin()),
-                                    std::make_move_iterator(directories.end()));
+    diff.entries_changed.assign(std::make_move_iterator(files.begin()),
+                                std::make_move_iterator(files.end()));
+    diff.child_lists_changed.assign(
+        std::make_move_iterator(directories.begin()),
+        std::make_move_iterator(directories.end()));
 
     // The interface promises a diff always says something, so stay silent when
     // a drain turned up nothing actionable (e.g. only bookkeeping events).
@@ -502,11 +503,10 @@ void RealDirectoryTree::Impl::notify_subscribers(
     const DirectoryTreeDiff& diff) const {
   const std::vector<std::function<void(const DirectoryTreeDiff&)>> callbacks =
       [&] {
-    const std::lock_guard<std::mutex> lock(m_mutex);
-    return std::vector<std::function<void(const DirectoryTreeDiff&)>>(
-      m_subscribers.cbegin(),
-      m_subscribers.cend());
-  }();
+        const std::lock_guard<std::mutex> lock(m_mutex);
+        return std::vector<std::function<void(const DirectoryTreeDiff&)>>(
+            m_subscribers.cbegin(), m_subscribers.cend());
+      }();
 
   for (const std::function<void(const DirectoryTreeDiff&)>& cb : callbacks) {
     cb(diff);

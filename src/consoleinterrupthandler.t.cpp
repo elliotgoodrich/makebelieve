@@ -58,9 +58,10 @@ TEST(ConsoleInterruptHandler, ConstructionSurfacesAnInstallFailure) {
     EXPECT_EQ(error.code(),
               std::error_code(fake_error, std::system_category()));
 
-    // Check the error code message is in the exception's what() string, so the user sees it.
-    // Don't check for its contents directly, since that is OS-dependent and we don't want to
-    // hard-code a string that will break on some platforms.
+    // Check the error code message is in the exception's what() string, so the
+    // user sees it. Don't check for its contents directly, since that is
+    // OS-dependent and we don't want to hard-code a string that will break on
+    // some platforms.
     const std::string os_text = error.code().message();
     ASSERT_FALSE(os_text.empty());
 
@@ -113,9 +114,9 @@ TEST(ConsoleInterruptHandler, InterruptRequestsStop) {
 
   // CREATE_NEW_PROCESS_GROUP puts the child in a group of its own, so the
   // CTRL_BREAK below reaches it and nothing else - this test process included.
-  const BOOL created = ::CreateProcessW(
-      nullptr, command.data(), nullptr, nullptr, TRUE,
-      CREATE_NEW_PROCESS_GROUP, nullptr, nullptr, &startup, &process);
+  const BOOL created = ::CreateProcessW(nullptr, command.data(), nullptr,
+                                        nullptr, TRUE, CREATE_NEW_PROCESS_GROUP,
+                                        nullptr, nullptr, &startup, &process);
   ASSERT_TRUE(created) << "CreateProcessW failed: " << ::GetLastError();
 
   // Wait for the child to install its handler before signalling. A timeout
@@ -149,8 +150,8 @@ int serve() {
   const makebelieve::ConsoleInterruptHandler handler;
   const std::stop_token token = handler.token();
 
-  if (const HANDLE ready = ::OpenEventW(EVENT_MODIFY_STATE, FALSE,
-                                        k_ready_event_name);
+  if (const HANDLE ready =
+          ::OpenEventW(EVENT_MODIFY_STATE, FALSE, k_ready_event_name);
       ready != nullptr) {
     ::SetEvent(ready);
     ::CloseHandle(ready);
@@ -197,9 +198,8 @@ std::optional<int> count_open_fds() {
   if (error) {
     return std::nullopt;
   }
-  return static_cast<int>(
-      std::distance(std::filesystem::begin(entries),
-                    std::filesystem::end(entries)));
+  return static_cast<int>(std::distance(std::filesystem::begin(entries),
+                                        std::filesystem::end(entries)));
 }
 
 // Unlike the Windows backend, this one has a self-pipe and a dispatcher thread
@@ -225,7 +225,8 @@ TEST(ConsoleInterruptHandler, AFailedInstallLeavesNothingBehind) {
     makebelieve::ConsoleInterruptHandlerTestUtil::fail_next_install(5);
     EXPECT_THROW(makebelieve::ConsoleInterruptHandler{}, std::system_error);
   }
-  EXPECT_EQ(count_open_fds(), before) << "the failed installs leaked descriptors";
+  EXPECT_EQ(count_open_fds(), before)
+      << "the failed installs leaked descriptors";
 
   // The rollback also has to put SIGINT back as it found it and leave no
   // dispatcher behind, so a handler built afterwards must still work end to

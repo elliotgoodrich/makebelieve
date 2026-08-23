@@ -43,7 +43,7 @@ constexpr std::uint64_t k_read_chunk_bytes = 32ULL * 1024 * 1024;
 // Closes a HANDLE on scope exit.
 template <BOOL(WINAPI* Close)(HANDLE)>
 class ScopedHandle {
-public:
+ public:
   explicit ScopedHandle(HANDLE handle) : m_handle(handle) {}
 
   ~ScopedHandle() {
@@ -60,7 +60,7 @@ public:
   [[nodiscard]] HANDLE get() const { return m_handle; }
   [[nodiscard]] bool valid() const { return m_handle != INVALID_HANDLE_VALUE; }
 
-private:
+ private:
   HANDLE m_handle;
 };
 
@@ -85,9 +85,9 @@ std::uint64_t combine(DWORD high, DWORD low) {
 
 // Converts a FILETIME into a `file_clock::time_point`.
 std::chrono::file_clock::time_point to_file_time(const FILETIME& time) {
-// MSVC's file_clock counts 100ns ticks from the Windows epoch (1601-01-01),
-// which is exactly FILETIME's representation, so this is a reinterpretation
-// rather than a conversion.
+  // MSVC's file_clock counts 100ns ticks from the Windows epoch (1601-01-01),
+  // which is exactly FILETIME's representation, so this is a reinterpretation
+  // rather than a conversion.
   return std::chrono::file_clock::time_point(
       std::chrono::file_clock::duration(static_cast<std::int64_t>(
           combine(time.dwHighDateTime, time.dwLowDateTime))));
@@ -96,16 +96,16 @@ std::chrono::file_clock::time_point to_file_time(const FILETIME& time) {
 // Builds an EntryInfo from the fields both WIN32_FIND_DATAW and
 // WIN32_FILE_ATTRIBUTE_DATA carry, so ls() and status() cannot drift apart.
 EntryInfo make_info(DWORD attributes,
-                   DWORD size_high,
-                   DWORD size_low,
-                   const FILETIME& last_write) {
+                    DWORD size_high,
+                    DWORD size_low,
+                    const FILETIME& last_write) {
   if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
     return DirectoryInfo{to_file_time(last_write)};
   }
   // FileInfo::size is std::size_t, so this truncates for a file above 4GiB
   // on a 32-bit build.
   return FileInfo{static_cast<std::size_t>(combine(size_high, size_low)),
-                    to_file_time(last_write)};
+                  to_file_time(last_write)};
 }
 
 // Walks the FILE_NOTIFY_INFORMATION chain into a diff.
@@ -168,13 +168,14 @@ DirectoryTreeDiff parse_changes(const std::byte* buffer, DWORD bytes) {
   }
 
   DirectoryTreeDiff diff;
-  diff.entries_changed.assign(std::make_move_iterator(files.begin()), std::make_move_iterator(files.end()));
+  diff.entries_changed.assign(std::make_move_iterator(files.begin()),
+                              std::make_move_iterator(files.end()));
   diff.child_lists_changed.assign(std::make_move_iterator(directories.begin()),
-                                         std::make_move_iterator(directories.end()));
+                                  std::make_move_iterator(directories.end()));
   return diff;
 }
 
-}  // close anonymous namespace
+}  // namespace
 
 class RealDirectoryTree::Impl {
   std::filesystem::path m_root;
@@ -195,7 +196,7 @@ class RealDirectoryTree::Impl {
   mutable HANDLE m_stop_event = nullptr;
   mutable std::thread m_watcher;
 
-public:
+ public:
   explicit Impl(const std::filesystem::path& root)
       : m_root(std::filesystem::weakly_canonical(root)) {}
 
@@ -227,11 +228,13 @@ public:
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
       const std::filesystem::path& path) const;
   [[nodiscard]] std::expected<std::string, std::error_code> read(
-      const std::filesystem::path& path, Offset offset, std::size_t size) const;
+      const std::filesystem::path& path,
+      Offset offset,
+      std::size_t size) const;
   [[nodiscard]] Subscription subscribe_to_changes(
       const std::function<void(const DirectoryTreeDiff&)>& callback) const;
 
-private:
+ private:
   // Maps a tree-relative path onto an absolute one, or nullopt when it
   // escapes the root.
   [[nodiscard]] std::optional<std::filesystem::path> resolve(
@@ -248,7 +251,6 @@ private:
   // callback list so that a callback which unsubscribes cannot deadlock
   // against m_mutex.
   void notify_subscribers(const DirectoryTreeDiff& diff) const;
-
 };
 
 std::optional<std::filesystem::path> RealDirectoryTree::Impl::resolve(
@@ -288,7 +290,7 @@ std::expected<EntryInfo, std::error_code> RealDirectoryTree::Impl::status(
           return std::nullopt;
         }
         return make_info(data.dwFileAttributes, data.nFileSizeHigh,
-                           data.nFileSizeLow, data.ftLastWriteTime);
+                         data.nFileSizeLow, data.ftLastWriteTime);
       });
 
   if (found.has_value()) {
@@ -303,9 +305,9 @@ RealDirectoryTree::Impl::ls(const std::filesystem::path& path) const {
   // and_then runs the enumeration only for a path that stayed inside the root.
   // A present-but-empty vector (an empty directory) is a success; only a failed
   // FindFirstFileExW yields nullopt and therefore the error below.
-  const std::optional<std::vector<TreeEntry>> listed = resolve(path).and_then(
-      [](const std::filesystem::path& absolute)
-          -> std::optional<std::vector<TreeEntry>> {
+  const std::optional<std::vector<TreeEntry>> listed =
+      resolve(path).and_then([](const std::filesystem::path& absolute)
+                                 -> std::optional<std::vector<TreeEntry>> {
         // FindExInfoBasic skips the 8.3 short name, which we never use, and
         // LARGE_FETCH batches directory reads. Both matter for the wide
         // directories a build tree tends to have.
@@ -324,11 +326,10 @@ RealDirectoryTree::Impl::ls(const std::filesystem::path& path) const {
           if (name == L"." || name == L"..") {
             continue;
           }
-          entries.emplace_back(std::filesystem::path(name),
-                                      make_info(data.dwFileAttributes,
-                                                  data.nFileSizeHigh,
-                                                  data.nFileSizeLow,
-                                                  data.ftLastWriteTime));
+          entries.emplace_back(
+              std::filesystem::path(name),
+              make_info(data.dwFileAttributes, data.nFileSizeHigh,
+                        data.nFileSizeLow, data.ftLastWriteTime));
         } while (FindNextFileW(find.get(), &data));
 
         return entries;
@@ -366,49 +367,48 @@ std::expected<std::string, std::error_code> RealDirectoryTree::Impl::read(
   // an open and a close; a small handle cache keyed on the resolved path is
   // the natural fix, and it needs to be one, given every method here is
   // callable concurrently.
-  const UniqueHandle file(CreateFileW(
-      resolved->c_str(), GENERIC_READ,
-      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+  const UniqueHandle file(
+      CreateFileW(resolved->c_str(), GENERIC_READ,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
   if (!file.valid()) {
     return std::unexpected(last_error_code());
   }
 
   std::string contents;
   std::optional<std::error_code> failure;
-  contents.resize_and_overwrite(
-      size, [&](char* const data, const std::size_t capacity) noexcept {
-        std::size_t total = 0;
-        while (total < capacity) {
-          // The handle is synchronous, so passing an OVERLAPPED here does not
-          // make the read asynchronous - it just supplies the file position,
-          // which is what lets concurrent reads of the same path share no
-          // state.
-          const std::uint64_t position =
-              static_cast<std::uint64_t>(offset) + total;
-          OVERLAPPED overlapped{};
-          overlapped.Offset = static_cast<DWORD>(position & 0xFFFFFFFFULL);
-          overlapped.OffsetHigh = static_cast<DWORD>(position >> 32);
+  contents.resize_and_overwrite(size, [&](char* const data,
+                                          const std::size_t capacity) noexcept {
+    std::size_t total = 0;
+    while (total < capacity) {
+      // The handle is synchronous, so passing an OVERLAPPED here does not
+      // make the read asynchronous - it just supplies the file position,
+      // which is what lets concurrent reads of the same path share no
+      // state.
+      const std::uint64_t position = static_cast<std::uint64_t>(offset) + total;
+      OVERLAPPED overlapped{};
+      overlapped.Offset = static_cast<DWORD>(position & 0xFFFFFFFFULL);
+      overlapped.OffsetHigh = static_cast<DWORD>(position >> 32);
 
-          const DWORD chunk = static_cast<DWORD>(
-              std::min<std::uint64_t>(capacity - total, k_read_chunk_bytes));
-          DWORD read_bytes = 0;
-          if (!ReadFile(file.get(), data + total, chunk, &read_bytes,
-                        &overlapped)) {
-            // A positioned read that starts at or past the end reports itself
-            // this way rather than as a zero-byte success.
-            if (GetLastError() != ERROR_HANDLE_EOF) {
-              failure = last_error_code();
-            }
-            break;
-          }
-          if (read_bytes == 0) {
-            break;
-          }
-          total += read_bytes;
+      const DWORD chunk = static_cast<DWORD>(
+          std::min<std::uint64_t>(capacity - total, k_read_chunk_bytes));
+      DWORD read_bytes = 0;
+      if (!ReadFile(file.get(), data + total, chunk, &read_bytes,
+                    &overlapped)) {
+        // A positioned read that starts at or past the end reports itself
+        // this way rather than as a zero-byte success.
+        if (GetLastError() != ERROR_HANDLE_EOF) {
+          failure = last_error_code();
         }
-        return total;
-      });
+        break;
+      }
+      if (read_bytes == 0) {
+        break;
+      }
+      total += read_bytes;
+    }
+    return total;
+  });
 
   if (failure.has_value()) {
     return std::unexpected(*failure);
@@ -428,7 +428,7 @@ Subscription RealDirectoryTree::Impl::subscribe_to_changes(
   }
 
   const auto it = m_subscribers.emplace(m_subscribers.end(), callback);
-  return Subscription([this, it]{
+  return Subscription([this, it] {
     const std::lock_guard<std::mutex> unsubscribe_lock(m_mutex);
     m_subscribers.erase(it);
   });
@@ -443,11 +443,11 @@ void RealDirectoryTree::Impl::start_watcher() const {
 
   // FILE_LIST_DIRECTORY is the access right ReadDirectoryChangesW needs;
   // BACKUP_SEMANTICS is what allows a directory handle at all.
-  m_directory = CreateFileW(
-      m_root.c_str(), FILE_LIST_DIRECTORY,
-      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-      nullptr);
+  m_directory =
+      CreateFileW(m_root.c_str(), FILE_LIST_DIRECTORY,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING,
+                  FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
   if (m_directory == INVALID_HANDLE_VALUE) {
     CloseHandle(m_stop_event);
     m_stop_event = nullptr;
@@ -507,12 +507,10 @@ void RealDirectoryTree::Impl::watch_loop() const {
 
 void RealDirectoryTree::Impl::notify_subscribers(
     const DirectoryTreeDiff& diff) const {
-  std::vector<std::function<void(const DirectoryTreeDiff&)>> callbacks = [&]
-  {
+  std::vector<std::function<void(const DirectoryTreeDiff&)>> callbacks = [&] {
     const std::lock_guard<std::mutex> lock(m_mutex);
     return std::vector<std::function<void(const DirectoryTreeDiff&)>>(
-      m_subscribers.cbegin(),
-      m_subscribers.cend());
+        m_subscribers.cbegin(), m_subscribers.cend());
   }();
 
   for (const std::function<void(const DirectoryTreeDiff&)>& cb : callbacks) {

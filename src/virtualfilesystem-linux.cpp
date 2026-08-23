@@ -3,14 +3,14 @@
 
 #include "directorytree.hpp"
 
-#include <cassert>
-#include <cerrno>
-#include <cstddef>
-#include <cstring>
 #include <algorithm>
 #include <atomic>
+#include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <optional>
@@ -52,16 +52,16 @@ timespec to_timespec(std::chrono::file_clock::time_point time) {
       std::chrono::clock_cast<std::chrono::system_clock>(time);
   const auto since_epoch = system_time.time_since_epoch();
   const auto seconds = std::chrono::floor<std::chrono::seconds>(since_epoch);
-  const auto nanoseconds =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(since_epoch -
-                                                           seconds);
+  const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      since_epoch - seconds);
   return {
       .tv_sec = static_cast<time_t>(seconds.count()),
       .tv_nsec = static_cast<long>(nanoseconds.count()),
   };
 }
 
-// Throw if `mountpoint` already exists, otherwise attempt to create it + parents.
+// Throw if `mountpoint` already exists, otherwise attempt to create it +
+// parents.
 void create_mountpoint(const std::filesystem::path& mountpoint) {
   std::error_code error;
   if (std::filesystem::exists(mountpoint, error)) {
@@ -85,7 +85,7 @@ void remove_mountpoint(const std::filesystem::path& mountpoint) noexcept {
 
 constexpr std::string_view k_fake_write_contents{"\0", 1};
 
-}  // close anonymous namespace
+}  // namespace
 
 // libfuse provider over a DirectoryTree.
 class VirtualFileSystem::Impl {
@@ -120,7 +120,7 @@ class VirtualFileSystem::Impl {
   // state they touch goes away.
   std::optional<Subscription> m_subscription;
 
-public:
+ public:
   // Selects the constructor that brings the object into existence without
   // starting anything, so that the one below can delegate to it.
   struct Unstarted {};
@@ -199,7 +199,7 @@ public:
   Impl(Impl&&) = delete;
   Impl& operator=(Impl&&) = delete;
 
-private:
+ private:
   // Acquires the mountpoint and nothing else. Called from our other
   // constructor so if we throw from it, our destructor will be called and
   // we can cleanup.
@@ -257,9 +257,7 @@ private:
 
   // Reports an entry's metadata. Everything is read-only: directories 0555,
   // files 0444.
-  int op_getattr(const char* path,
-                 struct stat* out,
-                 fuse_file_info* /*info*/) {
+  int op_getattr(const char* path, struct stat* out, fuse_file_info* /*info*/) {
     const std::filesystem::path relative = to_tree_path(path);
     const std::expected<EntryInfo, std::error_code> status =
         m_tree.status(relative);
@@ -490,12 +488,11 @@ private:
     // A (void) cast does not silence warn_unused_result on GCC, so the result
     // is bound and discarded the way handle_signal does it. Nothing here could
     // act on a failed write anyway: the poke is best effort.
-    const ssize_t written = ::write(fd, k_fake_write_contents.data(),
-                                    k_fake_write_contents.size());
+    const ssize_t written =
+        ::write(fd, k_fake_write_contents.data(), k_fake_write_contents.size());
     static_cast<void>(written);
     ::close(fd);
   }
-
 };
 
 VirtualFileSystem::VirtualFileSystem(const DirectoryTree& tree,
