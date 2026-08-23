@@ -1,7 +1,10 @@
-cmake_minimum_required(VERSION 3.16)
+# 3.25 is the floor for standard 23: cxx_std_23 arrived in 3.20, and mapping it
+# to MSVC's /std:c++latest (MSVC ships no stable /std:c++23) is reliable from
+# 3.25 on.
+cmake_minimum_required(VERSION 3.25)
 project(makebelieve LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(ENABLE_CLANG_TIDY "Enable clang-tidy static analysis" OFF)
@@ -16,13 +19,27 @@ find_package(Threads REQUIRED)
 
 enable_testing()
 
+option(BUILD_TESTING "Build the tests." ON)
+if(BUILD_TESTING)
+  include(FetchContent)
+  FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG v1.17.0
+    GIT_SHALLOW TRUE
+  )
+  # Make GoogleTest link the same dynamic CRT this project builds with
+  # (/MDd, /MD). Its default is the static CRT, and mixing the two is a hard
+  # link error on MSVC - the single most common way a first gtest build fails.
+  set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(googletest)
+  include(GoogleTest)
+endif()
+
 add_compile_options(
   $<$<CXX_COMPILER_ID:MSVC>:/W4>
   $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall>
   $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wextra>
-  # These experiments designated-initialize large C callback tables (e.g.
-  # fuse_operations) and rely on the rest being zero-initialized - that's
-  # the whole point of the idiom, not an oversight, so don't warn on it.
   $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wno-missing-field-initializers>
 )
 
@@ -47,11 +64,13 @@ function(makebelieve_apply_clang_tidy target)
   endif()
 endfunction()
 
-# Each subdirectory under experiments/ is a standalone example application
-# exercising one OS filesystem/tracing mechanism (FUSE, ProjFS, ETW,
-# Detours, ...); add new ones here as they're written.
-add_subdirectory(experiments/FUSE)
-add_subdirectory(experiments/FUSE_tracing)
-add_subdirectory(experiments/ProjFS)
-add_subdirectory(experiments/ETW_tracing)
-add_subdirectory(experiments/detours_tracing)
+add_subdirectory(src)
+
+# Add experiments
+if(BUILD_TESTING)
+  add_subdirectory(experiments/FUSE)
+  add_subdirectory(experiments/FUSE_tracing)
+  add_subdirectory(experiments/ProjFS)
+  add_subdirectory(experiments/ETW_tracing)
+  add_subdirectory(experiments/detours_tracing)
+endif()
