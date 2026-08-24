@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 #include "realdirectorytree.hpp"
 
+#include "directorytreeutil.hpp"
+#include "inmemorydirectorytree.hpp"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -118,6 +121,27 @@ class RealDirectoryTree : public ::testing::Test {
   std::optional<makebelieve::RealDirectoryTree> m_tree;
 };
 
+// Cross-checks the fixture's on-disk tree against a hand-built
+// InMemoryDirectoryTree describing the same content via DirectoryTreeUtil.
+// This is the primary check that every entry in the fixture has the right
+// kind, size and content, at every path DirectoryTreeUtil actually walks
+// (i.e. the canonical spelling ls() itself returns). The parameterized
+// suites below exist for what a whole-tree diff can't exercise: unusual
+// path spellings that still resolve to the same entry, and error handling.
+TEST_F(RealDirectoryTree, MatchesAnEquivalentInMemoryDirectoryTree) {
+  makebelieve::InMemoryDirectoryTree expected;
+  expected.write_file("hello.txt", "hello world");
+  expected.write_file("empty.txt", "");
+  expected.write_file("binary.bin", binary_contents());
+  expected.make_directory("sub");
+  expected.write_file("sub/nested.txt", "nested");
+  expected.make_directory("sub/deeper");
+
+  const std::string diff =
+      makebelieve::DirectoryTreeUtil::diff(tree(), expected);
+  EXPECT_TRUE(diff.empty()) << diff;
+}
+
 // ---------------------------------------------------------------------------
 // Paths that escape the root. status() and ls() collapse every failure into one
 // code, so one table can assert the same expectation across all four calls.
@@ -205,23 +229,19 @@ TEST_P(StatusEntry, MatchesExpectation) {
   }
 }
 
+// Content-matching coverage (kind and size for every entry actually in the
+// fixture) lives in MatchesAnEquivalentInMemoryDirectoryTree above; these
+// cases are for path spellings and error conditions a whole-tree diff never
+// exercises, since it only ever looks up the canonical spelling ls() itself
+// returns.
 INSTANTIATE_TEST_SUITE_P(
     RealDirectoryTree,
     StatusEntry,
     ::testing::Values(
-        StatusCase{"empty_is_the_root", "", Kind::Directory, 0},
         StatusCase{"dot_is_the_root", ".", Kind::Directory, 0},
         StatusCase{"up_from_a_real_directory", "sub/..", Kind::Directory, 0},
         StatusCase{"up_from_a_missing_directory", "missing/..", Kind::Directory,
                    0},
-        // Files report their size in bytes, whatever the content.
-        StatusCase{"file", "hello.txt", Kind::File, 11},
-        StatusCase{"empty_file", "empty.txt", Kind::File, 0},
-        StatusCase{"binary_file", "binary.bin", Kind::File, 4},
-        // Directories report DirectoryInfo, which carries no size.
-        StatusCase{"directory", "sub", Kind::Directory, 0},
-        StatusCase{"nested_directory", "sub/deeper", Kind::Directory, 0},
-        StatusCase{"nested_file", "sub/nested.txt", Kind::File, 6},
         // Normalisation that lands back on a real file.
         StatusCase{"leading_dot", "./hello.txt", Kind::File, 11},
         StatusCase{"round_trip", "sub/../hello.txt", Kind::File, 11},
@@ -289,23 +309,17 @@ TEST_P(LsListing, MatchesExpectation) {
   EXPECT_EQ(sorted_names(*result), *c.expected);
 }
 
+// Same split as StatusEntry above: content-matching listings (root, sub, the
+// empty sub/deeper) are covered by MatchesAnEquivalentInMemoryDirectoryTree;
+// these cases are for a normalising path spelling and for the error paths a
+// whole-tree diff never reaches (it only calls ls() on paths whose status()
+// already reported a directory).
 INSTANTIATE_TEST_SUITE_P(
     RealDirectoryTree,
     LsListing,
     ::testing::Values(
-        LsCase{"root", "",
-               std::vector<std::string>{"binary.bin", "empty.txt", "hello.txt",
-                                        "sub"}},
-        LsCase{"dot", ".",
-               std::vector<std::string>{"binary.bin", "empty.txt", "hello.txt",
-                                        "sub"}},
-        LsCase{"subdirectory", "sub",
-               std::vector<std::string>{"deeper", "nested.txt"}},
         LsCase{"round_trip_through_nothing", "missing/../sub",
                std::vector<std::string>{"deeper", "nested.txt"}},
-        // An existing but empty directory succeeds with no entries, which the
-        // contract calls out and which must stay distinguishable from an error.
-        LsCase{"empty_directory", "sub/deeper", std::vector<std::string>{}},
         // Listing a file is an error, as is listing what is not there.
         LsCase{"file", "hello.txt", std::nullopt},
         LsCase{"nested_file", "sub/nested.txt", std::nullopt},

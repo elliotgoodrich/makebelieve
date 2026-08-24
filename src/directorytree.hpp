@@ -105,7 +105,6 @@ class Subscription {
   }
 
   Subscription(const Subscription&) = delete;
-  Subscription& operator=(const Subscription&) = delete;
 };
 
 /// @class DirectoryTree
