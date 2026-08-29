@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-#include "directorytree.hpp"
-
 #include <string>
 
 namespace makebelieve {
+
+class DirectoryTree;
 
 /// @class DirectoryTreeUtil
 /// Provides a namespace for DirectoryTree-related utility functions.

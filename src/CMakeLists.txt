@@ -6,10 +6,13 @@ string(TOLOWER "${CMAKE_SYSTEM_NAME}" MAKEBELIEVE_PLATFORM)
 # Split from the executable so that tests can link the daemon's guts directly
 # rather than driving it through the binary.
 add_library(makebelieve_core STATIC
+  builddirectorytree.cpp
   consoleinterrupthandler-${MAKEBELIEVE_PLATFORM}.cpp
   directorytreeutil.cpp
   filesystemutil.cpp
   inmemorydirectorytree.cpp
+  manifest.cpp
+  processutil-${MAKEBELIEVE_PLATFORM}.cpp
   realdirectorytree-${MAKEBELIEVE_PLATFORM}.cpp
   virtualfilesystem-${MAKEBELIEVE_PLATFORM}.cpp
 )
@@ -62,7 +65,10 @@ if(BUILD_TESTING)
     gtest_discover_tests(${name}_test PROPERTIES TIMEOUT 30)
   endfunction()
 
+  makebelieve_add_test(builddirectorytree)
   makebelieve_add_test(filesystemutil)
+  makebelieve_add_test(manifest)
+  makebelieve_add_test(processutil)
   makebelieve_add_test(realdirectorytree)
   makebelieve_add_test(inmemorydirectorytree)
   makebelieve_add_test(directorytreeutil)

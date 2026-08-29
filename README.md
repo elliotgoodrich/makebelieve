@@ -6,8 +6,8 @@ Declare `output <- command` rules in a `build.makebelieve` file,
 
 ```text
 # build.makebelieve
-hello.txt <- /bin/sh -c 'printf "hello world\n" > $out'
-copied.txt <- cp source.txt $out
+@/hello.txt <- /bin/sh -c 'printf "hello world\n" > %out'
+@/copied.txt <- cp source.txt %out
 ```
 
 Then **Makebelieve** will instantly manifest this as a folder,
