@@ -48,12 +48,19 @@ target_include_directories(detours PUBLIC "${detours_SOURCE_DIR}/src")
 target_compile_options(detours PRIVATE
   $<$<CXX_COMPILER_ID:MSVC>:/W0>
 )
-# Matches src/Makefile's own CFLAGS (WIN32_LEAN_AND_MEAN, _WIN32_WINNT=0x501)
-# on both the library and its consumers below - a library and its callers
-# disagreeing on _WIN32_WINNT-conditional declarations in detours.h/windows.h
-# is exactly the kind of silent ABI mismatch worth ruling out explicitly
-# rather than leaving to whatever windows.h's own unversioned default is.
-target_compile_definitions(detours PUBLIC WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x501)
+# WIN32_LEAN_AND_MEAN matches src/Makefile's own CFLAGS. _WIN32_WINNT,
+# though, is deliberately raised to 0x0A00 (Windows 10) rather than the
+# Makefile's 0x501 (XP): the hook DLL calls GetFinalPathNameByHandleW to
+# canonicalize a traced open's path, which windows.h only declares at Vista
+# (0x0600) and above. This project targets Windows 11 (ProjFS needs 1809+),
+# so 0x501 was only ever a floor inherited from Detours' ancient Makefile,
+# never a ceiling this code needs to honour. It stays PUBLIC so the library
+# and both its consumers below compile against one _WIN32_WINNT - a library
+# and its callers disagreeing on _WIN32_WINNT-conditional declarations in
+# detours.h/windows.h is exactly the kind of silent ABI mismatch worth
+# ruling out explicitly. (../../thirdparty/detours/README.md notes this
+# raised floor alongside the vendored source's one local patch.)
+target_compile_definitions(detours PUBLIC WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
 
 # The payload DLL injected into the traced command (and, transitively,
 # every child process it spawns - see detours_tracing_hook.cpp).

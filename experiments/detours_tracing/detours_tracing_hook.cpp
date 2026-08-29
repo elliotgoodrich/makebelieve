@@ -2,20 +2,27 @@
  * @file
  * Payload DLL injected (via DetourCreateProcessWithDllExW - see
  * detours_tracing.m.cpp) into the traced command and, transitively, every
- * child process it spawns. Detours CreateFileW/CreateFileA and
+ * child process it spawns. Detours NtCreateFile/NtOpenFile and
  * CreateProcessW/CreateProcessA:
  *
- *   - CreateFileW/A: records the resolved path of every successful,
- *     read-access, non-directory open that falls under the traced root
- *     (both passed in via environment variables the launcher sets before
- *     spawning), appending it to a shared log file.
+ *   - NtCreateFile/NtOpenFile: records the resolved path of every
+ *     successful, read-access, non-directory open that falls under the
+ *     traced root (both passed in via environment variables the launcher
+ *     sets before spawning), appending it to a shared log file. These are
+ *     the two ntdll stubs *every* user-mode file open funnels through -
+ *     whether the caller reached them via CreateFileW/A, the C runtime
+ *     (fopen/ifstream/...), or by calling NtCreateFile directly - so
+ *     hooking here sees all of them, unlike hooking CreateFileW/A which
+ *     only sees opens made through those two Win32 entry points.
  *   - CreateProcessW/A: re-injects this same DLL into every child process,
  *     via the same DetourCreateProcessWithDllEx mechanism the launcher
  *     itself uses, so descendant processes are traced too - something
  *     FUSE_tracing gets for free from being mount-scoped rather than
  *     process-scoped (see ../ETW_tracing/README.md for the same point
  *     made about ETW, which gets it for free from being system-scoped
- *     instead).
+ *     instead). Process creation is left at the Win32 layer on purpose:
+ *     Detours' re-injection is built around CreateProcess, not the
+ *     NtCreateUserProcess stub beneath it.
  *
  * Findings are appended to a plain log file rather than streamed back
  * over a pipe: every write completes synchronously inside the hooked
@@ -32,8 +39,12 @@
 // AMD64 vs ...) tests _AMD64_/_X86_/etc., which windows.h's own headers
 // define from the compiler's _M_* macros - detours.h doesn't include
 // windows.h itself, so without this order it sees none of them defined
-// and fails with "Unknown architecture".
+// and fails with "Unknown architecture". winternl.h (for OBJECT_ATTRIBUTES,
+// IO_STATUS_BLOCK, NTSTATUS and friends, used by the Nt* signatures below)
+// likewise needs windows.h first.
 #include <windows.h>
+
+#include <winternl.h>
 
 #include <detours.h>
 
@@ -41,6 +52,12 @@
 #include <cwctype>
 #include <string>
 #include <string_view>
+
+// winternl.h supplies NTSTATUS and the object/IO-status types but not this
+// classic success predicate; define it only if some other header has not.
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+#endif
 
 namespace {
 
@@ -51,8 +68,38 @@ std::wstring g_log_path;
 std::wstring g_root_prefix_lower;  // lowercased, with a trailing separator
 std::wstring g_hook_dll_path;
 
-decltype(&::CreateFileW) TrueCreateFileW = ::CreateFileW;
-decltype(&::CreateFileA) TrueCreateFileA = ::CreateFileA;
+// Set while this thread is inside record_if_interesting, so the file opens
+// our own bookkeeping performs (writing the log line, and the volume/path
+// resolution GetFinalPathNameByHandleW may itself do) re-enter the Nt hooks
+// without being recorded - or recursing into recording again. The traced
+// command's real open is never suppressed by this: the hooks always call
+// the true Nt* function first and unconditionally, and only the recording
+// that follows is guarded.
+thread_local bool g_recording = false;
+
+// The ntdll entry points we patch, resolved by name at attach time (see
+// DllMain). Detours overwrites these with trampolines to the originals.
+using NtCreateFileFn = NTSTATUS(NTAPI*)(PHANDLE,
+                                        ACCESS_MASK,
+                                        POBJECT_ATTRIBUTES,
+                                        PIO_STATUS_BLOCK,
+                                        PLARGE_INTEGER,
+                                        ULONG,
+                                        ULONG,
+                                        ULONG,
+                                        ULONG,
+                                        PVOID,
+                                        ULONG);
+using NtOpenFileFn = NTSTATUS(NTAPI*)(PHANDLE,
+                                      ACCESS_MASK,
+                                      POBJECT_ATTRIBUTES,
+                                      PIO_STATUS_BLOCK,
+                                      ULONG,
+                                      ULONG);
+
+NtCreateFileFn TrueNtCreateFile = nullptr;
+NtOpenFileFn TrueNtOpenFile = nullptr;
+
 decltype(&::CreateProcessW) TrueCreateProcessW = ::CreateProcessW;
 decltype(&::CreateProcessA) TrueCreateProcessA = ::CreateProcessA;
 
@@ -80,40 +127,24 @@ std::string to_utf8(std::wstring_view wide) {
   return result;
 }
 
-std::wstring to_wide(std::string_view narrow) {
-  if (narrow.empty()) {
-    return {};
-  }
-  const int len = ::MultiByteToWideChar(
-      CP_ACP, 0, narrow.data(), static_cast<int>(narrow.size()), nullptr, 0);
-  if (len <= 0) {
-    return {};
-  }
-  std::wstring result(static_cast<std::size_t>(len), L'\0');
-  ::MultiByteToWideChar(CP_ACP, 0, narrow.data(),
-                        static_cast<int>(narrow.size()), result.data(), len);
-  return result;
-}
-
 /// Best-effort: a failure here just means one dependency goes unreported,
 /// consistent with this tracer's general best-effort posture (see the
 /// file comment).
 ///
-/// Calls TrueCreateFileW, not plain ::CreateFileW: Detours patches the
-/// process-wide CreateFileW entry point, so a call through the bare name
-/// here would re-enter HookedCreateFileW recursively (bounded - the log
-/// file's own FILE_APPEND_DATA-only access fails record_if_interesting's
-/// GENERIC_READ check and returns immediately - but still pointless
-/// extra work through the whole detour machinery on every single logged
-/// access, and one less thing to reason about being safe to do from
-/// inside a hook that can fire arbitrarily early in a process's life).
+/// This opens the log through the ordinary CreateFileW, which reaches the
+/// now-hooked NtCreateFile - but it only runs from inside
+/// record_if_interesting, where g_recording is set, so that re-entry skips
+/// recording rather than looping. (It would be harmless even without the
+/// guard: the log is opened FILE_APPEND_DATA-only, which fails
+/// record_if_interesting's read-access check immediately - but the guard
+/// spares the whole detour round-trip on every logged access.)
 void append_log_line(std::wstring_view path) {
   if (g_log_path.empty()) {
     return;
   }
-  const HANDLE h = TrueCreateFileW(g_log_path.c_str(), FILE_APPEND_DATA,
-                                   FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                                   OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  const HANDLE h = ::CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (h == INVALID_HANDLE_VALUE) {
     return;
   }
@@ -125,15 +156,24 @@ void append_log_line(std::wstring_view path) {
   ::CloseHandle(h);
 }
 
-/// Records `raw_path` if it was opened with read access, resolves to an
-/// existing non-directory file, and falls under the traced root.
-/// `raw_path` is exactly what was passed to CreateFileW/A - not yet
-/// canonicalized - so it's resolved against the process's own current
-/// directory via GetFullPathNameW before the boundary check.
-void record_if_interesting(std::wstring_view raw_path,
-                           DWORD desired_access,
-                           HANDLE handle) {
-  if (handle == INVALID_HANDLE_VALUE || (desired_access & GENERIC_READ) == 0 ||
+/// Records the file behind @a handle if it was opened with read (data)
+/// access, is a real non-directory file, and falls under the traced root.
+/// The path is taken from the successfully-opened @a handle itself via
+/// GetFinalPathNameByHandleW rather than from the call's ObjectName: that
+/// canonicalizes it (resolving a relative or RootDirectory-based open, and
+/// following symlinks) and sidesteps parsing ntdll's `\??\`-prefixed NT
+/// paths. GetFinalPathNameByHandleW is Vista+, which is why the build
+/// raises _WIN32_WINNT above Detours' own Makefile default (see the
+/// experiment's CMakeLists.txt).
+///
+/// The read test looks for FILE_READ_DATA, not GENERIC_READ: kernel32 maps
+/// a CreateFileW(GENERIC_READ) request onto the specific FILE_GENERIC_READ
+/// rights before it reaches NtCreateFile, so by this layer the generic bit
+/// is usually already gone. GENERIC_READ is still checked as well, for a
+/// caller that hands the generic bit straight to NtCreateFile.
+void record_if_interesting(ACCESS_MASK desired_access, HANDLE handle) {
+  if (handle == nullptr || handle == INVALID_HANDLE_VALUE ||
+      (desired_access & (FILE_READ_DATA | GENERIC_READ)) == 0 ||
       g_root_prefix_lower.empty()) {
     return;
   }
@@ -145,14 +185,24 @@ void record_if_interesting(std::wstring_view raw_path,
   }
 
   wchar_t full[32768];
-  const DWORD full_len =
-      ::GetFullPathNameW(std::wstring(raw_path).c_str(),
-                         static_cast<DWORD>(std::size(full)), full, nullptr);
+  const DWORD full_len = ::GetFinalPathNameByHandleW(
+      handle, full, static_cast<DWORD>(std::size(full)),
+      FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
   if (full_len == 0 || full_len >= std::size(full)) {
     return;
   }
 
-  const std::wstring_view resolved(full, full_len);
+  std::wstring_view resolved(full, full_len);
+  // GetFinalPathNameByHandleW returns an extended-length ("\\?\") path;
+  // strip that prefix so the report and the root check use ordinary DOS
+  // paths, the way the CreateFile-based tracer's GetFullPathNameW output
+  // did. A UNC result ("\\?\UNC\...") keeps its remainder and simply won't
+  // match a drive-letter root, which is correct - it is outside it.
+  constexpr std::wstring_view k_extended_prefix = L"\\\\?\\";
+  if (resolved.starts_with(k_extended_prefix)) {
+    resolved.remove_prefix(k_extended_prefix.size());
+  }
+
   const std::wstring lower = to_lower(resolved);
   if (lower.size() <= g_root_prefix_lower.size() ||
       lower.compare(0, g_root_prefix_lower.size(), g_root_prefix_lower) != 0) {
@@ -162,41 +212,49 @@ void record_if_interesting(std::wstring_view raw_path,
   append_log_line(resolved);
 }
 
-HANDLE WINAPI HookedCreateFileW(LPCWSTR file_name,
-                                DWORD desired_access,
-                                DWORD share_mode,
-                                LPSECURITY_ATTRIBUTES security_attributes,
-                                DWORD creation_disposition,
-                                DWORD flags_and_attributes,
-                                HANDLE template_file) {
-  const HANDLE h = TrueCreateFileW(file_name, desired_access, share_mode,
-                                   security_attributes, creation_disposition,
-                                   flags_and_attributes, template_file);
-  // Guard against constructing a wstring_view from a null file_name -
-  // that would call wcslen(nullptr) while binding the argument below,
-  // before record_if_interesting's own body ever runs.
-  if (file_name != nullptr) {
-    record_if_interesting(file_name, desired_access, h);
+/// Shared tail of both file hooks: on a successful open, record the file
+/// behind the out-handle. Guarded by g_recording so the recording's own
+/// opens (see append_log_line, and GetFinalPathNameByHandleW's own volume
+/// resolution) do not re-enter it.
+void maybe_record(NTSTATUS status, PHANDLE file_handle, ACCESS_MASK access) {
+  if (g_recording || !NT_SUCCESS(status) || file_handle == nullptr) {
+    return;
   }
-  return h;
+  g_recording = true;
+  record_if_interesting(access, *file_handle);
+  g_recording = false;
 }
 
-HANDLE WINAPI HookedCreateFileA(LPCSTR file_name,
-                                DWORD desired_access,
-                                DWORD share_mode,
-                                LPSECURITY_ATTRIBUTES security_attributes,
-                                DWORD creation_disposition,
-                                DWORD flags_and_attributes,
-                                HANDLE template_file) {
-  const HANDLE h = TrueCreateFileA(file_name, desired_access, share_mode,
-                                   security_attributes, creation_disposition,
-                                   flags_and_attributes, template_file);
-  // Same null guard as HookedCreateFileW above, for the string_view
-  // to_wide() constructs from file_name.
-  if (file_name != nullptr) {
-    record_if_interesting(to_wide(file_name), desired_access, h);
-  }
-  return h;
+NTSTATUS NTAPI HookedNtCreateFile(PHANDLE file_handle,
+                                  ACCESS_MASK desired_access,
+                                  POBJECT_ATTRIBUTES object_attributes,
+                                  PIO_STATUS_BLOCK io_status_block,
+                                  PLARGE_INTEGER allocation_size,
+                                  ULONG file_attributes,
+                                  ULONG share_access,
+                                  ULONG create_disposition,
+                                  ULONG create_options,
+                                  PVOID ea_buffer,
+                                  ULONG ea_length) {
+  const NTSTATUS status = TrueNtCreateFile(
+      file_handle, desired_access, object_attributes, io_status_block,
+      allocation_size, file_attributes, share_access, create_disposition,
+      create_options, ea_buffer, ea_length);
+  maybe_record(status, file_handle, desired_access);
+  return status;
+}
+
+NTSTATUS NTAPI HookedNtOpenFile(PHANDLE file_handle,
+                                ACCESS_MASK desired_access,
+                                POBJECT_ATTRIBUTES object_attributes,
+                                PIO_STATUS_BLOCK io_status_block,
+                                ULONG share_access,
+                                ULONG open_options) {
+  const NTSTATUS status =
+      TrueNtOpenFile(file_handle, desired_access, object_attributes,
+                     io_status_block, share_access, open_options);
+  maybe_record(status, file_handle, desired_access);
+  return status;
 }
 
 /// Re-injects this DLL into a newly-created child process by forwarding
@@ -278,6 +336,22 @@ void read_env_config(HINSTANCE hinst) {
   }
 }
 
+/// Resolves the ntdll file-open stubs we detour by name. They are plain
+/// exports of ntdll (already mapped into every process), so a
+/// GetModuleHandle/GetProcAddress pair avoids taking a link-time dependency
+/// on an ntdll import library for functions the SDK does not uniformly
+/// provide one for.
+void resolve_ntdll_targets() {
+  const HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+  if (ntdll == nullptr) {
+    return;
+  }
+  TrueNtCreateFile =
+      reinterpret_cast<NtCreateFileFn>(::GetProcAddress(ntdll, "NtCreateFile"));
+  TrueNtOpenFile =
+      reinterpret_cast<NtOpenFileFn>(::GetProcAddress(ntdll, "NtOpenFile"));
+}
+
 }  // namespace
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID /*reserved*/) {
@@ -289,19 +363,30 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID /*reserved*/) {
     ::DetourRestoreAfterWith();
     ::DisableThreadLibraryCalls(hinst);
     read_env_config(hinst);
+    resolve_ntdll_targets();
 
     ::DetourTransactionBegin();
     ::DetourUpdateThread(::GetCurrentThread());
-    ::DetourAttach(&(PVOID&)TrueCreateFileW, HookedCreateFileW);
-    ::DetourAttach(&(PVOID&)TrueCreateFileA, HookedCreateFileA);
+    // Guard each Nt attach: a null target (GetProcAddress failed) would
+    // otherwise fail the whole transaction and leave nothing hooked.
+    if (TrueNtCreateFile != nullptr) {
+      ::DetourAttach(&(PVOID&)TrueNtCreateFile, HookedNtCreateFile);
+    }
+    if (TrueNtOpenFile != nullptr) {
+      ::DetourAttach(&(PVOID&)TrueNtOpenFile, HookedNtOpenFile);
+    }
     ::DetourAttach(&(PVOID&)TrueCreateProcessW, HookedCreateProcessW);
     ::DetourAttach(&(PVOID&)TrueCreateProcessA, HookedCreateProcessA);
     ::DetourTransactionCommit();
   } else if (reason == DLL_PROCESS_DETACH) {
     ::DetourTransactionBegin();
     ::DetourUpdateThread(::GetCurrentThread());
-    ::DetourDetach(&(PVOID&)TrueCreateFileW, HookedCreateFileW);
-    ::DetourDetach(&(PVOID&)TrueCreateFileA, HookedCreateFileA);
+    if (TrueNtCreateFile != nullptr) {
+      ::DetourDetach(&(PVOID&)TrueNtCreateFile, HookedNtCreateFile);
+    }
+    if (TrueNtOpenFile != nullptr) {
+      ::DetourDetach(&(PVOID&)TrueNtOpenFile, HookedNtOpenFile);
+    }
     ::DetourDetach(&(PVOID&)TrueCreateProcessW, HookedCreateProcessW);
     ::DetourDetach(&(PVOID&)TrueCreateProcessA, HookedCreateProcessA);
     ::DetourTransactionCommit();
