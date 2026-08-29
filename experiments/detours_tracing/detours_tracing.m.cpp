@@ -8,13 +8,16 @@
  *
  * Unlike FUSE_tracing, which is itself the filesystem the traced command
  * sees, this tracer works by API interposition: the injected DLL detours
- * CreateFileW/CreateFileA in the traced process's own address space (see
- * detours_tracing_hook.cpp) and appends every interesting open to a log
- * file this launcher reads back once the command exits. That means it
- * only sees opens made through those two Win32 entry points - a
- * statically-linked binary, or one that calls NtCreateFile directly, is
- * invisible to it, the same structural limitation Detours-based tracers
- * have everywhere (see the project's own design discussion).
+ * ntdll's NtCreateFile/NtOpenFile in the traced process's own address
+ * space (see detours_tracing_hook.cpp) and appends every interesting open
+ * to a log file this launcher reads back once the command exits. Those two
+ * stubs are the funnel every user-mode file open passes through - whether
+ * the caller reached them via CreateFileW/A, the C runtime, or NtCreateFile
+ * directly - so a statically-linked binary or a direct NtCreateFile caller
+ * is seen just the same. What stays invisible is only an open that bypasses
+ * those stubs (issuing the raw syscall itself), and a child launched other
+ * than through the hooked CreateProcessW/A (e.g. NtCreateUserProcess
+ * directly) - see the project's own design discussion.
  *
  * The launcher and its target must match bitness (both 32-bit or both
  * 64-bit) - DetourCreateProcessWithDllEx cannot inject across an

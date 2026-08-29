@@ -1,8 +1,8 @@
 # Detours Tracing Experiment
 
 `detours_tracing_experiment <command> [args...]` runs `<command>` with
-[Microsoft Detours](https://github.com/microsoft/Detours) hooking
-`CreateFileW`/`CreateFileA` inside its own process, and prints every file
+[Microsoft Detours](https://github.com/microsoft/Detours) hooking ntdll's
+`NtCreateFile`/`NtOpenFile` inside its own process, and prints every file
 under the current directory that the command - or a descendant process it
 spawns - opened for reading. It's the Detours counterpart to
 [`../FUSE_tracing`](../FUSE_tracing) and [`../ETW_tracing`](../ETW_tracing),
@@ -17,11 +17,18 @@ filesystem or a system-wide observer.
    which creates the process suspended, injects the DLL, and only then
    resumes it - so the hooks are always installed before `<command>`'s own
    code runs.
-2. The injected DLL detours `CreateFileW`/`CreateFileA` in `<command>`'s
-   own address space. Every successful, read-access, non-directory open
-   under the current directory is appended to a log file, whose path (and
-   the current directory itself) the launcher passed in via environment
-   variables before spawning.
+2. The injected DLL detours `NtCreateFile`/`NtOpenFile` in `<command>`'s
+   own address space - the two ntdll stubs every user-mode file open
+   funnels through, whether the caller reached them via `CreateFileW`/`A`,
+   the C runtime, or `NtCreateFile` directly. Every successful,
+   read-access, non-directory open under the current directory is appended
+   to a log file, whose path (and the current directory itself) the
+   launcher passed in via environment variables before spawning. The
+   opened file's canonical path is read back from the returned handle with
+   `GetFinalPathNameByHandleW`, so a relative or `RootDirectory`-based
+   (`openat`-style) open is resolved for free rather than parsed out of
+   ntdll's `\??\` NT path. (That API is Vista+, so the build raises
+   `_WIN32_WINNT` above Detours' Makefile default - see `CMakeLists.txt`.)
 3. The DLL also detours `CreateProcessW`/`CreateProcessA`, re-injecting
    itself into every child process `<command>` spawns via the same
    `DetourCreateProcessWithDllEx` mechanism - so a build action that
@@ -34,13 +41,18 @@ filesystem or a system-wide observer.
 
 ## Differences from FUSE_tracing/ETW_tracing
 
-- **Scope: two Win32 entry points, not the filesystem stack.** This
-  tracer only sees opens made through `CreateFileW`/`CreateFileA`. A
-  statically-linked binary, or one that calls `NtCreateFile` directly, is
-  structurally invisible to it - unlike FUSE_tracing (which sits below all
-  of that, at the filesystem-driver boundary) or ETW_tracing (which
-  observes the same kernel-level `NtCreateFile` activity ETW_tracing's own
-  `FileIo_Create` events are drawn from).
+- **Scope: the ntdll open stubs, not the filesystem stack.** This tracer
+  sees opens made through `NtCreateFile`/`NtOpenFile` - which is every
+  user-mode open, since `CreateFileW`/`A`, the C runtime, and direct
+  `NtCreateFile` callers all funnel through them (this is the same
+  kernel-level `NtCreateFile` activity ETW_tracing observes via its
+  `FileIo_Create` events, just caught in-process instead of system-wide).
+  What remains invisible is only an open that bypasses those stubs by
+  issuing the raw syscall itself, and a child launched other than through
+  the hooked `CreateProcessW`/`A` (e.g. `NtCreateUserProcess` directly) -
+  neither of which FUSE_tracing can miss, since it sits below all of that
+  at the filesystem-driver boundary and is scoped by the mount rather than
+  by which process or API made the call.
 - **Bitness-locked.** The launcher and `<command>` must both be the same
   bitness (32-bit or 64-bit) - `DetourCreateProcessWithDllEx` cannot
   inject across that boundary.
