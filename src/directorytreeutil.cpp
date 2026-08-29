@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "directorytreeutil.hpp"
 
+#include "directorytree.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <expected>

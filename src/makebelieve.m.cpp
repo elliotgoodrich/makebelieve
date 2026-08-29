@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+#include "builddirectorytree.hpp"
 #include "consoleinterrupthandler.hpp"
 #include "filesystemutil.hpp"
 #include "realdirectorytree.hpp"
@@ -23,11 +24,6 @@ int main(int argc, char** argv) {
 
     const ConsoleInterruptHandler interrupt;
 
-    // TODO: a BuildTree belongs between these two - it will take the
-    // .makebelieve manifest and this RealDirectoryTree, subscribe to its
-    // changes, and present a DirectoryTree of the built outputs for the
-    // filesystem to project instead of the sources directly.
-
     const std::filesystem::path source = std::filesystem::current_path();
     const std::filesystem::path mountpoint = std::filesystem::absolute(argv[1]);
 
@@ -40,7 +36,17 @@ int main(int argc, char** argv) {
     }
 
     const RealDirectoryTree tree(source);
-    const VirtualFileSystem vfs(tree, argv[1]);
+
+    // Sits between the source tree and the filesystem: it reads the
+    // build.makebelieve manifest out of the source and presents the declared
+    // outputs for the filesystem to project instead of the sources directly,
+    // building each one lazily - through the shell - the first time it is read.
+    // TODO: it does not yet subscribe to the source's changes, nor track each
+    // command's input dependencies to rebuild an output once it is stale.
+    const BuildDirectoryTree build_tree(
+        tree, BuildDirectoryTree::shell_runner(source));
+
+    const VirtualFileSystem vfs(build_tree, argv[1]);
 
     std::println(stderr, "makebelieve serving [{}], press Ctrl+C to stop",
                  argv[1]);

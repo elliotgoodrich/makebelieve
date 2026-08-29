@@ -1,0 +1,15 @@
+# A tiny MakeBelieve manifest. Each rule declares one generated file:
+#
+#     @/<output> <- <command>
+#
+# The command runs through the system shell with its working directory set to
+# this folder (so `input.txt` below resolves here), and `%out` is replaced with
+# the path the command should write its result to. Comments and blank lines are
+# ignored.
+#
+# The commands use `cmake -E`, CMake's built-in cross-platform command shim, so
+# the same manifest works whether the shell is sh or cmd.exe (cmake just needs
+# to be on PATH).
+
+@/hello.txt    <- cmake -E echo "hello, makebelieve" > %out
+@/greeting.txt <- cmake -E copy input.txt %out
