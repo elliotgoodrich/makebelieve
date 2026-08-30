@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -13,6 +14,12 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+
+#ifdef _WIN32
+#include <array>
+
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -80,8 +87,64 @@ TEST_F(ProcessUtil, CapturesStdoutOfACommandRunInTheWorkingDirectory) {
 
   ASSERT_TRUE(result.has_value());
   // `type` and `cat` copy the file's bytes to stdout verbatim.
-  EXPECT_EQ(*result, "hello world");
+  EXPECT_EQ(result->standard_output, "hello world");
 }
+
+TEST_F(ProcessUtil, TracesFilesTheCommandReadAsInputs) {
+  write_input("input.txt", "hello world");
+
+  const makebelieve::ProcessUtil::Result result =
+      run(print_file_command("input.txt"));
+
+  ASSERT_TRUE(result.has_value());
+#ifdef _WIN32
+  // The command read input.txt; the tracer should report it, by absolute path
+  // under the working directory. (Files it read outside the root - cmake's own
+  // install, say - are filtered out, so this stays about the command's inputs.)
+  const bool found =
+      std::ranges::any_of(result->inputs, [&](const std::filesystem::path& p) {
+        std::error_code ec;
+        return std::filesystem::equivalent(p, work / "input.txt", ec);
+      });
+  EXPECT_TRUE(found) << "expected input.txt among the traced reads";
+#else
+  // Tracing is not wired up on this platform yet, so inputs is always empty.
+  EXPECT_TRUE(result->inputs.empty());
+#endif
+}
+
+#ifdef _WIN32
+// A working directory given in 8.3 short-name form - as a runner's temp path
+// can be - must still trace reads under it. The hook resolves each opened file
+// to its long canonical form, so the root it filters against is canonicalized
+// to match; without that, nothing under a short-named root is reported.
+TEST_F(ProcessUtil, TracesInputsWhenWorkingDirectoryIsAShortPath) {
+  write_input("input.txt", "hello world");
+
+  std::array<wchar_t, 32768> buffer{};
+  const DWORD n = GetShortPathNameW(work.c_str(), buffer.data(),
+                                    static_cast<DWORD>(buffer.size()));
+  const std::filesystem::path short_work =
+      (n > 0 && n < buffer.size()) ? std::filesystem::path(buffer.data())
+                                   : work;
+  if (short_work == work) {
+    GTEST_SKIP() << "8.3 short names unavailable on this volume";
+  }
+
+  makebelieve::ProcessUtil::Result result;
+  makebelieve::ProcessUtil::run(
+      short_work, print_file_command("input.txt"), {},
+      [&](makebelieve::ProcessUtil::Result r) { result = std::move(r); });
+
+  ASSERT_TRUE(result.has_value());
+  const bool found =
+      std::ranges::any_of(result->inputs, [&](const std::filesystem::path& p) {
+        std::error_code ec;
+        return std::filesystem::equivalent(p, work / "input.txt", ec);
+      });
+  EXPECT_TRUE(found) << "expected input.txt traced under a short-path root";
+}
+#endif
 
 TEST_F(ProcessUtil, ReportsCancellationWhenStopIsAlreadyRequested) {
   std::stop_source source;

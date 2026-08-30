@@ -10,7 +10,9 @@
 #include <functional>
 #include <list>
 #include <map>
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -63,6 +65,16 @@ class InMemoryDirectoryTree::Impl {
 
   std::map<std::filesystem::path, Node> m_entries{
       {std::filesystem::path{}, Node{.info = DirectoryInfo{}}}};
+
+  // Guards m_entries: shared for readers, exclusive for mutators. A mutator
+  // releases it before notifying subscribers, so a callback that reads back
+  // through the tree takes a fresh shared lock rather than deadlocking.
+  mutable std::shared_mutex m_mutex;
+
+  // Guards m_subscribers, held only to add, remove, or copy the callback list,
+  // never across a callback. Separate from m_mutex so (un)subscribing does not
+  // block the tree's readers.
+  mutable std::mutex m_subscribers_mutex;
   mutable std::list<std::function<void(const DirectoryTreeDiff&)>>
       m_subscribers;
 
@@ -74,22 +86,25 @@ class InMemoryDirectoryTree::Impl {
     assert(normalized.has_value() && !normalized->empty() &&
            "write_file() needs a path under the root");
 
-    assert(parent_is_directory(*normalized) &&
-           "write_file()'s parent directory must already exist");
-
-    const auto it = m_entries.find(*normalized);
-    assert((it == m_entries.end() ||
-            std::holds_alternative<FileInfo>(it->second.info)) &&
-           "write_file() must not target an existing directory");
-
     DirectoryTreeDiff diff;
-    diff.entries_changed = {*normalized};
-    if (it == m_entries.end()) {
-      diff.child_lists_changed = {normalized->parent_path()};
+    {
+      const std::unique_lock lock(m_mutex);
+      assert(parent_is_directory(*normalized) &&
+             "write_file()'s parent directory must already exist");
+
+      const auto it = m_entries.find(*normalized);
+      assert((it == m_entries.end() ||
+              std::holds_alternative<FileInfo>(it->second.info)) &&
+             "write_file() must not target an existing directory");
+
+      diff.entries_changed = {*normalized};
+      if (it == m_entries.end()) {
+        diff.child_lists_changed = {normalized->parent_path()};
+      }
+      m_entries[*normalized] =
+          Node{.info = FileInfo{.size = content.size(), .mtime = mtime},
+               .content = std::string(content)};
     }
-    m_entries[*normalized] =
-        Node{.info = FileInfo{.size = content.size(), .mtime = mtime},
-             .content = std::string(content)};
     notify_subscribers(diff);
   }
 
@@ -99,15 +114,18 @@ class InMemoryDirectoryTree::Impl {
     assert(normalized.has_value() && !normalized->empty() &&
            "make_directory() needs a path under the root");
 
-    assert(parent_is_directory(*normalized) &&
-           "make_directory()'s parent directory must already exist");
-    assert(!m_entries.contains(*normalized) &&
-           "make_directory() must not target an existing entry");
-
     DirectoryTreeDiff diff;
-    diff.entries_changed = {*normalized};
-    diff.child_lists_changed = {normalized->parent_path()};
-    m_entries[*normalized] = Node{.info = DirectoryInfo{.mtime = mtime}};
+    {
+      const std::unique_lock lock(m_mutex);
+      assert(parent_is_directory(*normalized) &&
+             "make_directory()'s parent directory must already exist");
+      assert(!m_entries.contains(*normalized) &&
+             "make_directory() must not target an existing entry");
+
+      diff.entries_changed = {*normalized};
+      diff.child_lists_changed = {normalized->parent_path()};
+      m_entries[*normalized] = Node{.info = DirectoryInfo{.mtime = mtime}};
+    }
     notify_subscribers(diff);
   }
 
@@ -116,17 +134,20 @@ class InMemoryDirectoryTree::Impl {
     assert(normalized.has_value() && !normalized->empty() &&
            "remove() must not target the root");
 
-    assert(m_entries.contains(*normalized) &&
-           "remove() must target an existing entry");
-
     DirectoryTreeDiff diff;
-    diff.child_lists_changed = {normalized->parent_path()};
-    for (auto it = m_entries.begin(); it != m_entries.end();) {
-      if (it->first == *normalized || is_within(it->first, *normalized)) {
-        diff.entries_changed.push_back(it->first);
-        it = m_entries.erase(it);
-      } else {
-        ++it;
+    {
+      const std::unique_lock lock(m_mutex);
+      assert(m_entries.contains(*normalized) &&
+             "remove() must target an existing entry");
+
+      diff.child_lists_changed = {normalized->parent_path()};
+      for (auto it = m_entries.begin(); it != m_entries.end();) {
+        if (it->first == *normalized || is_within(it->first, *normalized)) {
+          diff.entries_changed.push_back(it->first);
+          it = m_entries.erase(it);
+        } else {
+          ++it;
+        }
       }
     }
     notify_subscribers(diff);
@@ -137,13 +158,16 @@ class InMemoryDirectoryTree::Impl {
     const std::optional<std::filesystem::path> normalized = normalize(path);
     assert(normalized.has_value() && "set_mtime() must not escape the root");
 
-    const auto it = m_entries.find(*normalized);
-    assert(it != m_entries.end() &&
-           "set_mtime() must target an existing entry");
-    std::visit([mtime](auto& info) { info.mtime = mtime; }, it->second.info);
-
     DirectoryTreeDiff diff;
-    diff.entries_changed = {*normalized};
+    {
+      const std::unique_lock lock(m_mutex);
+      const auto it = m_entries.find(*normalized);
+      assert(it != m_entries.end() &&
+             "set_mtime() must target an existing entry");
+      std::visit([mtime](auto& info) { info.mtime = mtime; }, it->second.info);
+
+      diff.entries_changed = {*normalized};
+    }
     notify_subscribers(diff);
   }
 
@@ -155,6 +179,7 @@ class InMemoryDirectoryTree::Impl {
           std::make_error_code(std::errc::no_such_file_or_directory));
     }
 
+    const std::shared_lock lock(m_mutex);
     const auto it = m_entries.find(*normalized);
     if (it == m_entries.end()) {
       return std::unexpected(
@@ -171,6 +196,7 @@ class InMemoryDirectoryTree::Impl {
           std::make_error_code(std::errc::no_such_file_or_directory));
     }
 
+    const std::shared_lock lock(m_mutex);
     const auto it = m_entries.find(*normalized);
     if (it == m_entries.end() ||
         !std::holds_alternative<DirectoryInfo>(it->second.info)) {
@@ -211,6 +237,7 @@ class InMemoryDirectoryTree::Impl {
       return std::string{};
     }
 
+    const std::shared_lock lock(m_mutex);
     const auto it = m_entries.find(*normalized);
     if (it == m_entries.end()) {
       return std::unexpected(
@@ -229,8 +256,12 @@ class InMemoryDirectoryTree::Impl {
 
   [[nodiscard]] Subscription subscribe_to_changes(
       const std::function<void(const DirectoryTreeDiff&)>& callback) const {
+    const std::lock_guard lock(m_subscribers_mutex);
     const auto it = m_subscribers.emplace(m_subscribers.end(), callback);
-    return Subscription([this, it] { m_subscribers.erase(it); });
+    return Subscription([this, it] {
+      const std::lock_guard lock(m_subscribers_mutex);
+      m_subscribers.erase(it);
+    });
   }
 
  private:
@@ -241,13 +272,16 @@ class InMemoryDirectoryTree::Impl {
            std::holds_alternative<DirectoryInfo>(it->second.info);
   }
 
-  // Invokes every registered callback with @a diff. Takes a copy of the
-  // callback list first so that a callback which subscribes, unsubscribes,
-  // or otherwise mutates m_subscribers does not invalidate the iteration
-  // this is in the middle of.
+  // Invokes every registered callback with @a diff, from a copy of the list
+  // taken under m_subscribers_mutex so a callback may (un)subscribe while it
+  // runs. Must be called with m_mutex unlocked, so a callback can read the
+  // tree.
   void notify_subscribers(const DirectoryTreeDiff& diff) const {
-    const std::vector<std::function<void(const DirectoryTreeDiff&)>> callbacks(
-        m_subscribers.cbegin(), m_subscribers.cend());
+    std::vector<std::function<void(const DirectoryTreeDiff&)>> callbacks;
+    {
+      const std::lock_guard lock(m_subscribers_mutex);
+      callbacks.assign(m_subscribers.cbegin(), m_subscribers.cend());
+    }
     for (const std::function<void(const DirectoryTreeDiff&)>& callback :
          callbacks) {
       callback(diff);

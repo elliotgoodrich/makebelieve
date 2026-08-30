@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <variant>
 #include <vector>
 
@@ -507,6 +508,79 @@ TEST_F(InMemoryDirectoryTree, UnsubscribingStopsFurtherNotifications) {
 
   tree().write_file("another.txt", "y");
   EXPECT_EQ(calls, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Thread safety.
+// ---------------------------------------------------------------------------
+
+// A callback may read the tree: notifications fire with the write's lock
+// released, so the re-entrant read takes a fresh shared lock instead of
+// deadlocking, and sees the just-written value.
+TEST_F(InMemoryDirectoryTree, ACallbackCanReadTheTreeDuringNotification) {
+  std::optional<std::string> observed;
+  const makebelieve::Subscription subscription =
+      tree().subscribe_to_changes([&](const auto&) {
+        const std::expected<std::string, std::error_code> content =
+            tree().read("reentrant.txt", 0, 64);
+        if (content.has_value()) {
+          observed = *content;
+        }
+      });
+
+  tree().write_file("reentrant.txt", "written");
+
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(*observed, "written");
+}
+
+// Many threads at once: each writer owns distinct files while readers race
+// them. Every write must read back afterwards as its own name, with no data
+// race.
+TEST_F(InMemoryDirectoryTree, ConcurrentReadersAndWritersStayConsistent) {
+  constexpr int k_writers = 8;
+  constexpr int k_writes_per_thread = 100;
+
+  const auto name_for = [](int writer, int index) {
+    return "w" + std::to_string(writer) + "_" + std::to_string(index) + ".txt";
+  };
+
+  {
+    std::vector<std::jthread> threads;
+    threads.reserve(k_writers * 2);
+    for (int w = 0; w < k_writers; ++w) {
+      threads.emplace_back([this, w, &name_for] {
+        for (int i = 0; i < k_writes_per_thread; ++i) {
+          const std::string name = name_for(w, i);
+          tree().write_file(name, name);
+        }
+      });
+    }
+    // Readers race the writers; ls() is an O(n) scan, so it runs only
+    // occasionally, keeping the readers contention pressure rather than a hot
+    // loop.
+    for (int r = 0; r < k_writers; ++r) {
+      threads.emplace_back([this] {
+        for (int i = 0; i < k_writes_per_thread; ++i) {
+          (void)tree().status("w0_0.txt");
+          if (i % 20 == 0) {
+            (void)tree().ls("");
+          }
+        }
+      });
+    }
+  }  // jthreads join here
+
+  // Every write landed and reads back as itself.
+  for (int w = 0; w < k_writers; ++w) {
+    for (int i = 0; i < k_writes_per_thread; ++i) {
+      const std::string name = name_for(w, i);
+      const std::expected<std::string, std::error_code> content =
+          tree().read(name, 0, 64);
+      ASSERT_TRUE(content.has_value()) << name;
+      EXPECT_EQ(*content, name);
+    }
+  }
 }
 
 }  // namespace

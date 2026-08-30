@@ -115,7 +115,9 @@ void ProcessUtil::run(const std::filesystem::path& working_directory,
     on_done(
         std::unexpected(std::make_error_code(std::errc::operation_canceled)));
   } else {
-    on_done(std::move(output));
+    // Inputs are left empty: the Linux launch does not trace reads yet (a
+    // FUSE-based tracer, mirroring experiments/FUSE_tracing, comes later).
+    on_done(Output{.standard_output = std::move(output), .inputs = {}});
   }
 }
 

@@ -13,6 +13,7 @@
 #include <ios>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <set>
@@ -131,6 +132,39 @@ std::optional<std::string> read_all(const DirectoryTree& tree,
   }
 }
 
+// Recasts absolute traced input paths into paths relative to @a root, dropping
+// any that fall outside it.
+std::vector<std::filesystem::path> relativize(
+    const std::vector<std::filesystem::path>& inputs,
+    const std::filesystem::path& root) {
+  // relative() is lexical, so it only cancels root against an input whose
+  // leading components match exactly. Traced inputs are canonicalised and can
+  // differ in case from root as given, so canonicalise root to match.
+  std::error_code ec;
+  std::filesystem::path canonical_root =
+      std::filesystem::weakly_canonical(root, ec);
+  if (ec) {
+    canonical_root = root;
+  }
+
+  std::vector<std::filesystem::path> result;
+  result.reserve(inputs.size());
+  for (const std::filesystem::path& input : inputs) {
+    std::error_code relative_ec;
+    const std::filesystem::path relative =
+        std::filesystem::relative(input, canonical_root, relative_ec);
+    if (relative_ec || relative.empty()) {
+      continue;
+    }
+    const std::filesystem::path normal = relative.lexically_normal();
+    if (normal.begin() != normal.end() && *normal.begin() == "..") {
+      continue;  // escapes the root
+    }
+    result.push_back(normal);
+  }
+  return result;
+}
+
 // Creates every missing directory on the way to @a output's parent inside
 // @a tree, so write_file()'s precondition that the parent exists holds even
 // for a nested output like `@/out/foo.o`.
@@ -148,19 +182,41 @@ void ensure_parent_directories(InMemoryDirectoryTree& tree,
 }  // namespace
 
 class BuildDirectoryTree::Impl {
-  // The directory structure and file contents we present. Each declared
-  // output starts life as a placeholder (see k_placeholder_content); its real
-  // content replaces the placeholder once its command reports success.
+  // The directory structure and file contents we present. Each declared output
+  // starts as a placeholder, replaced by real content once its command
+  // succeeds.
   InMemoryDirectoryTree m_structure;
 
-  // Outputs that still need building, mapped to the command that builds them.
-  // An entry is erased only once its output has been built successfully, so a
-  // command that fails is retried on the next read.
-  std::map<std::filesystem::path, std::string> m_pending;
+  // Guards all the build bookkeeping below, which reads (on filesystem threads)
+  // and source-change notifications (on the source's watcher thread) race over.
+  // Never held across a call to the runner or m_structure, so a synchronous
+  // runner or a subscriber reading back through us cannot deadlock on it.
+  std::mutex m_mutex;
 
-  // Outputs whose build has been started and is awaiting its completion; keeps
-  // a second read from launching the same command while the first is in flight.
+  // Every declared output mapped to the command that (re)builds it, fixed at
+  // construction.
+  std::map<std::filesystem::path, std::string> m_commands;
+
+  // Outputs that need (re)building: every output starts stale, a successful
+  // build clears it, an input change marks it stale again.
+  std::set<std::filesystem::path> m_stale;
+
+  // Outputs whose build has started and is awaiting completion, so a second
+  // read or a coincident input change does not launch it again.
   std::set<std::filesystem::path> m_in_flight;
+
+  // Outputs read at least once. An input change rebuilds one of these eagerly;
+  // an output nobody has read is only marked stale, to build on its next read.
+  std::set<std::filesystem::path> m_materialized;
+
+  // The inputs each built output last read. Kept so a rebuild can refresh
+  // m_dependents when an output's set of inputs changes.
+  std::map<std::filesystem::path, std::vector<std::filesystem::path>>
+      m_dependencies;
+
+  // The reverse of m_dependencies: each input mapped to the outputs that read
+  // it, matched against a source change to find what to rebuild.
+  std::map<std::filesystem::path, std::set<std::filesystem::path>> m_dependents;
 
   CommandRunner m_runner;
 
@@ -168,24 +224,55 @@ class BuildDirectoryTree::Impl {
   // longer wanted.
   std::stop_source m_stop;
 
+  // Drains the source-change callback on teardown: the callback holds the gate
+  // while it touches our state and bails if closed, and the destructor closes
+  // it (waiting out any callback in progress) before destroying that state. A
+  // shared_ptr so the callback can lock it safely even after we are gone.
+  struct Gate {
+    std::mutex mutex;
+    bool open = true;
+  };
+  std::shared_ptr<Gate> m_gate = std::make_shared<Gate>();
+
+  // Observes the source for input changes for as long as this tree lives.
+  std::optional<Subscription> m_source_subscription;
+
  public:
   Impl(const DirectoryTree& source, CommandRunner runner)
       : m_runner(std::move(runner)) {
     const std::optional<std::string> manifest =
         read_all(source, k_manifest_name);
-    if (!manifest.has_value()) {
-      return;
+    if (manifest.has_value()) {
+      const Manifest parsed = Manifest::parse(*manifest);
+      for (const Manifest::Rule& rule : parsed.rules()) {
+        ensure_parent_directories(m_structure, rule.output);
+        m_structure.write_file(rule.output, k_placeholder_content);
+        m_commands.insert_or_assign(rule.output, rule.command);
+        m_stale.insert(rule.output);
+      }
     }
 
-    const Manifest parsed = Manifest::parse(*manifest);
-    for (const Manifest::Rule& rule : parsed.rules()) {
-      ensure_parent_directories(m_structure, rule.output);
-      m_structure.write_file(rule.output, k_placeholder_content);
-      m_pending.insert_or_assign(rule.output, rule.command);
-    }
+    // Subscribe only once the outputs are in place, so the callback cannot race
+    // the constructor.
+    m_source_subscription = source.subscribe_to_changes(
+        [this, gate = m_gate](const DirectoryTreeDiff& diff) {
+          const std::lock_guard lock(gate->mutex);
+          if (gate->open) {
+            on_source_change(diff);
+          }
+        });
   }
 
-  ~Impl() { m_stop.request_stop(); }
+  ~Impl() {
+    // Close the gate first, so no source notification runs against the state we
+    // are about to destroy; then stop observing and cancel in-flight runners.
+    {
+      const std::lock_guard lock(m_gate->mutex);
+      m_gate->open = false;
+    }
+    m_source_subscription.reset();
+    m_stop.request_stop();
+  }
 
   Impl(const Impl&) = delete;
   Impl& operator=(const Impl&) = delete;
@@ -202,16 +289,17 @@ class BuildDirectoryTree::Impl {
     return m_structure.ls(path);
   }
 
-  // The first read of a declared output hands its command to the runner; the
-  // completion swaps the placeholder for the real result. Reads taken before
-  // that completes (or while another is in flight) see the placeholder.
+  // The first read of a declared output triggers its build and marks it read
+  // (so a later input change rebuilds it eagerly); reads before the build
+  // completes see the placeholder.
   [[nodiscard]] std::expected<std::string, std::error_code>
   read(const std::filesystem::path& path, Offset offset, std::size_t size) {
-    // A zero-size read never opens the file (so never triggers a build), and a
-    // negative offset is a caller error the structure will reject; in both
-    // cases building first would be pointless work.
+    // A zero-size read or negative offset never yields content, so skip the
+    // build it would otherwise trigger.
     if (size != 0 && offset >= 0) {
-      start_build(path.lexically_normal());
+      const std::filesystem::path output = path.lexically_normal();
+      mark_materialized(output);
+      start_build(output);
     }
     return m_structure.read(path, offset, size);
   }
@@ -222,20 +310,33 @@ class BuildDirectoryTree::Impl {
   }
 
  private:
-  void start_build(const std::filesystem::path& output) {
-    const auto pending = m_pending.find(output);
-    if (pending == m_pending.end() || m_in_flight.contains(output)) {
-      return;
+  void mark_materialized(const std::filesystem::path& output) {
+    const std::lock_guard lock(m_mutex);
+    if (m_commands.contains(output)) {
+      m_materialized.insert(output);
     }
-    m_in_flight.insert(output);
+  }
 
-    // A synchronous runner reports back inside this call, so the read that
-    // triggered the build already sees the finished content; an asynchronous
-    // one reports later and the placeholder stands until it does.
-    m_runner(pending->second, m_stop.get_token(),
-             // A completion legitimately allocates (it writes the built bytes
-             // into the structure); a synchronous runner lets that propagate
-             // out of read().
+  void start_build(const std::filesystem::path& output) {
+    std::string command;
+    {
+      const std::lock_guard lock(m_mutex);
+      if (!m_stale.contains(output) || m_in_flight.contains(output)) {
+        return;
+      }
+      const auto it = m_commands.find(output);
+      if (it == m_commands.end()) {
+        return;
+      }
+      m_stale.erase(output);
+      m_in_flight.insert(output);
+      command = it->second;
+    }
+
+    // Outside the lock: a synchronous runner re-enters finish_build from within
+    // this call.
+    m_runner(command, m_stop.get_token(),
+             // A synchronous completion allocates and lets that escape read().
              // NOLINTNEXTLINE(bugprone-exception-escape)
              [this, output](BuildResult result) {
                finish_build(output, std::move(result));
@@ -243,10 +344,95 @@ class BuildDirectoryTree::Impl {
   }
 
   void finish_build(const std::filesystem::path& output, BuildResult result) {
-    m_in_flight.erase(output);
-    if (result.has_value()) {
-      m_structure.write_file(output, std::move(*result));
-      m_pending.erase(output);
+    bool rebuild_again = false;
+    {
+      const std::lock_guard lock(m_mutex);
+      m_in_flight.erase(output);
+      if (!result.has_value()) {
+        // A failed build stays stale, so a later read or input change retries.
+        m_stale.insert(output);
+        return;
+      }
+      update_dependents(output, std::move(result->inputs));
+      // An input that changed mid-build left it stale again; rebuild if
+      // watched.
+      rebuild_again =
+          m_stale.contains(output) && m_materialized.contains(output);
+    }
+
+    // Outside the lock: write_file notifies subscribers, who may read back
+    // through us.
+    m_structure.write_file(output, std::move(result->bytes));
+
+    if (rebuild_again) {
+      start_build(output);
+    }
+  }
+
+  // Refreshes the reverse index for @a output to @a inputs: drops the output
+  // from its previous inputs' dependent sets and adds it to the new ones.
+  // @pre m_mutex is held.
+  void update_dependents(const std::filesystem::path& output,
+                         std::vector<std::filesystem::path> inputs) {
+    const auto previous = m_dependencies.find(output);
+    if (previous != m_dependencies.end()) {
+      for (const std::filesystem::path& input : previous->second) {
+        const auto it = m_dependents.find(input);
+        if (it != m_dependents.end()) {
+          it->second.erase(output);
+          if (it->second.empty()) {
+            m_dependents.erase(it);
+          }
+        }
+      }
+    }
+    for (const std::filesystem::path& input : inputs) {
+      m_dependents[input].insert(output);
+    }
+    m_dependencies.insert_or_assign(output, std::move(inputs));
+  }
+
+  // Collects the outputs depending on whatever changed, then invalidates each.
+  // Invalidation runs outside the lock, since it may start an eager rebuild.
+  void on_source_change(const DirectoryTreeDiff& diff) {
+    std::vector<std::filesystem::path> affected;
+    {
+      const std::lock_guard lock(m_mutex);
+      if (diff.everything_dirty) {
+        // Which inputs changed is unknown, so every output might be stale.
+        affected.reserve(m_commands.size());
+        for (const auto& [output, command] : m_commands) {
+          affected.push_back(output);
+        }
+      } else {
+        for (const std::filesystem::path& changed : diff.entries_changed) {
+          const auto it = m_dependents.find(changed);
+          if (it != m_dependents.end()) {
+            affected.insert(affected.end(), it->second.begin(),
+                            it->second.end());
+          }
+        }
+      }
+    }
+    for (const std::filesystem::path& output : affected) {
+      invalidate(output);
+    }
+  }
+
+  void invalidate(const std::filesystem::path& output) {
+    bool eager = false;
+    {
+      const std::lock_guard lock(m_mutex);
+      if (!m_commands.contains(output)) {
+        return;
+      }
+      m_stale.insert(output);
+      // Eager only if read and not already building; an in-flight build re-runs
+      // on completion when it finds it stale.
+      eager = m_materialized.contains(output) && !m_in_flight.contains(output);
+    }
+    if (eager) {
+      start_build(output);
     }
   }
 };
@@ -270,18 +456,21 @@ BuildDirectoryTree::CommandRunner BuildDirectoryTree::shell_runner(
     const auto scratch = std::make_shared<TempDirectory>(make_temp_directory());
     const std::filesystem::path out_path = scratch->path() / "out";
 
-    ProcessUtil::run(working_directory, substitute_out(command, out_path), stop,
-                     // Reading the output allocates; a synchronous ProcessUtil
-                     // lets that propagate back out to the triggering read().
-                     // NOLINTNEXTLINE(bugprone-exception-escape)
-                     [scratch, out_path, on_done = std::move(on_done)](
-                         ProcessUtil::Result result) mutable {
-                       if (result.has_value()) {
-                         on_done(read_file(out_path));
-                       } else {
-                         on_done(std::unexpected(result.error()));
-                       }
-                     });
+    ProcessUtil::run(
+        working_directory, substitute_out(command, out_path), stop,
+        // Reading the output allocates; a synchronous ProcessUtil
+        // lets that propagate back out to the triggering read().
+        // NOLINTNEXTLINE(bugprone-exception-escape)
+        [scratch, out_path, working_directory,
+         on_done = std::move(on_done)](ProcessUtil::Result result) mutable {
+          if (result.has_value()) {
+            on_done(BuildOutput{
+                .bytes = read_file(out_path),
+                .inputs = relativize(result->inputs, working_directory)});
+          } else {
+            on_done(std::unexpected(result.error()));
+          }
+        });
   };
 }
 

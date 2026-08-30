@@ -14,6 +14,7 @@ add_library(makebelieve_core STATIC
   manifest.cpp
   processutil-${MAKEBELIEVE_PLATFORM}.cpp
   realdirectorytree-${MAKEBELIEVE_PLATFORM}.cpp
+  stringutil.cpp
   virtualfilesystem-${MAKEBELIEVE_PLATFORM}.cpp
 )
 target_include_directories(makebelieve_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -36,6 +37,14 @@ target_compile_definitions(makebelieve_core PUBLIC
   $<$<PLATFORM_ID:Windows>:NOMINMAX>
 )
 
+# Detours backs the Windows dependency tracer. Linked PRIVATE so its usage
+# requirements - notably the raised _WIN32_WINNT detours.h needs - reach core's
+# own translation units without leaking onto every test that links core; a
+# static lib still forwards the .lib to the final link line.
+target_link_libraries(makebelieve_core PRIVATE
+  $<$<PLATFORM_ID:Windows>:detours>
+)
+
 # The libfuse3 lookup is a configure-time command, not a value, so it cannot be
 # a generator expression and stays behind a plain guard. It backs the Linux
 # virtual filesystem and advertises, via pkg-config, both its versioned include
@@ -50,6 +59,29 @@ if(NOT WIN32)
 endif()
 
 makebelieve_apply_clang_tidy(makebelieve_core)
+
+# The payload DLL makebelieve injects into a build command to trace its file
+# reads. Windows-only. It lands beside makebelieve and the test binaries, where
+# processutil looks for it at runtime.
+if(WIN32)
+  # stringutil.cpp is compiled in directly so the hook stays a self-contained
+  # payload without pulling in makebelieve_core.
+  add_library(makebelievehook SHARED makebelievehook.m.cpp stringutil.cpp)
+  target_link_libraries(makebelievehook PRIVATE detours)
+  # Required: DetourCreateProcessWithDllEx rewrites the target's import table to
+  # reference ordinal #1 of the injected DLL, and the loader rejects the image if
+  # nothing is exported there. DetourFinishHelperProcess is a real detours
+  # function, so this just forwards to existing code.
+  target_link_options(makebelievehook PRIVATE
+    "/export:DetourFinishHelperProcess,@1,NONAME"
+  )
+  target_compile_definitions(makebelievehook PRIVATE UNICODE _UNICODE)
+  makebelieve_apply_clang_tidy(makebelievehook)
+
+  # Build the hook whenever core - and any binary linking it - is built, so the
+  # DLL is beside the executable at runtime.
+  add_dependencies(makebelieve_core makebelievehook)
+endif()
 
 add_executable(makebelieve makebelieve.m.cpp)
 target_link_libraries(makebelieve PRIVATE makebelieve_core)
