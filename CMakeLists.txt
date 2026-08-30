@@ -64,6 +64,14 @@ function(makebelieve_apply_clang_tidy target)
   endif()
 endfunction()
 
+# Vendored Detours, as one shared static-library target (Windows-only). Added
+# before src so makebelieve_core - which injects a Detours-built hook DLL to
+# trace a build command's file reads - and the experiments below are all
+# downstream of a single detours target rather than each rebuilding it.
+if(WIN32)
+  add_subdirectory(thirdparty/detours)
+endif()
+
 add_subdirectory(src)
 
 # Add experiments

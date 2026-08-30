@@ -26,19 +26,30 @@ namespace makebelieve {
 /// @link CommandRunner. When the runner reports the result, it replaces the
 /// placeholder; later reads are served from that result.
 ///
-/// This is deliberately the minimal slice of the build system: it does not
-/// observe @a source for later changes, it does not rebuild an output once it
-/// has been built successfully, and it does not track which inputs a command
-/// consumed. @a source is only borrowed for the duration of the constructor.
+/// It then observes @a source for the rest of its life, recording the inputs
+/// each build reads, so a change to one of those inputs rebuilds the outputs
+/// that depend on it: eagerly for an output already read, lazily on its next
+/// read otherwise. @a source must outlive this tree.
+///
+/// A change to `build.makebelieve` itself is not yet handled: the rule set is
+/// fixed for the tree's lifetime.
 class BuildDirectoryTree : public DirectoryTree {
   // Pimpl not necessary but kind of nice to keep things rebuilding quickly
   class Impl;
   std::unique_ptr<Impl> m_impl;
 
  public:
-  /// The outcome of running a command: the bytes it produced, or an
-  /// `error_code` when it could not be run to completion.
-  using BuildResult = std::expected<std::string, std::error_code>;
+  /// What running a command produced: the bytes of the output it built, and the
+  /// input files it read (its dependencies), relative to the source tree's
+  /// root. Best-effort, and empty where tracing is unavailable.
+  struct BuildOutput {
+    std::string bytes;
+    std::vector<std::filesystem::path> inputs;
+  };
+
+  /// The outcome of running a command: a @link BuildOutput, or an `error_code`
+  /// when it could not be run to completion.
+  using BuildResult = std::expected<BuildOutput, std::error_code>;
 
   /// Reports the outcome of a single command back to the tree. Move-only so it
   /// can carry move-only state, and single-shot - call it exactly once.
@@ -60,6 +71,7 @@ class BuildDirectoryTree : public DirectoryTree {
   /// delegating each command to @a runner - any callable convertible to a
   /// @link CommandRunner. A @a source without a `build.makebelieve` file
   /// yields an empty tree.
+  /// @pre @a source outlives this tree; it is observed for its whole life.
   BuildDirectoryTree(const DirectoryTree& source, CommandRunner runner);
 
   ~BuildDirectoryTree() override;
@@ -73,7 +85,9 @@ class BuildDirectoryTree : public DirectoryTree {
   /// runs the command through the system shell with the working directory set
   /// to @a working_directory (so relative inputs resolve against it), and
   /// reports the bytes the command wrote to that file. It runs the command
-  /// synchronously, reporting the result before returning.
+  /// synchronously, reporting the result before returning. Traced inputs are
+  /// reported relative to @a working_directory, so for dependency tracking to
+  /// line up it should be the filesystem root that @a source mirrors.
   [[nodiscard]] static CommandRunner shell_runner(
       std::filesystem::path working_directory);
 

@@ -37,12 +37,10 @@ int main(int argc, char** argv) {
 
     const RealDirectoryTree tree(source);
 
-    // Sits between the source tree and the filesystem: it reads the
-    // build.makebelieve manifest out of the source and presents the declared
-    // outputs for the filesystem to project instead of the sources directly,
-    // building each one lazily - through the shell - the first time it is read.
-    // TODO: it does not yet subscribe to the source's changes, nor track each
-    // command's input dependencies to rebuild an output once it is stale.
+    // Presents the manifest's declared outputs, building each lazily through
+    // the shell. The runner's working directory is the source root, so the
+    // inputs it traces line up with the source's own change notifications.
+    // TODO: reparse the manifest when build.makebelieve changes.
     const BuildDirectoryTree build_tree(
         tree, BuildDirectoryTree::shell_runner(source));
 

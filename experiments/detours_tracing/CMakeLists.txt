@@ -3,63 +3,11 @@ if(NOT WIN32)
   return()
 endif()
 
-# Detours ships no CMakeLists.txt of its own - its native build is an
-# nmake Makefile (src/Makefile) - so the static library below is our own
-# translation of that Makefile's OBJS list into CMake, not something
-# Detours provides.
-#
-# Vendored (not FetchContent'd) under ../../thirdparty/detours - see that
-# directory's README.md for exactly which tag this is and the one local
-# patch already applied to creatwth.cpp (a real MSVC error C2362 in
-# upstream v4.0.1, fixed by hoisting a few declarations past some
-# `goto Cleanup;` jumps that leave them in scope but skip their
-# initializer). Detours is 8 years unmaintained at this tag, so a live
-# fetch bought nothing but a network dependency and a patch step that
-# could silently stop matching; a vendored copy is strictly simpler.
-set(detours_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../thirdparty/detours")
-
-# Mirrors src/Makefile's OBJS list exactly, all five per-architecture
-# disassemblers included: Detours' own official build compiles all of
-# them into detours.lib on every target architecture (each disolXXX.cpp
-# exports a differently-named entry point, so nothing collides), rather
-# than selecting just one to match the host architecture.
-#
-# uimports.cpp is deliberately not listed as its own source file -
-# src/Makefile's dependency line for creatwth.obj
-# ("creatwth.obj : creatwth.cpp uimports.cpp detours.h") shows it's
-# textually #included by creatwth.cpp itself, not compiled as a separate
-# translation unit; listing it here too would double-define its symbols.
-add_library(detours STATIC
-  "${detours_SOURCE_DIR}/src/detours.cpp"
-  "${detours_SOURCE_DIR}/src/modules.cpp"
-  "${detours_SOURCE_DIR}/src/disasm.cpp"
-  "${detours_SOURCE_DIR}/src/image.cpp"
-  "${detours_SOURCE_DIR}/src/creatwth.cpp"
-  "${detours_SOURCE_DIR}/src/disolx86.cpp"
-  "${detours_SOURCE_DIR}/src/disolx64.cpp"
-  "${detours_SOURCE_DIR}/src/disolia64.cpp"
-  "${detours_SOURCE_DIR}/src/disolarm.cpp"
-  "${detours_SOURCE_DIR}/src/disolarm64.cpp"
-)
-target_include_directories(detours PUBLIC "${detours_SOURCE_DIR}/src")
-# Detours' own headers rely on implicit int/pointer conversions and benign
-# sign-compare mismatches throughout; this is vendored, unmodified
-# third-party source, not code this project owns the warnings for.
-target_compile_options(detours PRIVATE
-  $<$<CXX_COMPILER_ID:MSVC>:/W0>
-)
-# WIN32_LEAN_AND_MEAN matches src/Makefile's own CFLAGS. _WIN32_WINNT,
-# though, is deliberately raised to 0x0A00 (Windows 10) rather than the
-# Makefile's 0x501 (XP): the hook DLL calls GetFinalPathNameByHandleW to
-# canonicalize a traced open's path, which windows.h only declares at Vista
-# (0x0600) and above. This project targets Windows 11 (ProjFS needs 1809+),
-# so 0x501 was only ever a floor inherited from Detours' ancient Makefile,
-# never a ceiling this code needs to honour. It stays PUBLIC so the library
-# and both its consumers below compile against one _WIN32_WINNT - a library
-# and its callers disagreeing on _WIN32_WINNT-conditional declarations in
-# detours.h/windows.h is exactly the kind of silent ABI mismatch worth
-# ruling out explicitly. (../../thirdparty/detours/README.md notes this
-# raised floor alongside the vendored source's one local patch.)
+# The `detours` static library is defined once at ../../thirdparty/detours and
+# pulled in from the root CMakeLists (before src), since the product links it
+# too now; this experiment just consumes that shared target. See that
+# directory's README.md and CMakeLists.txt for the vendored tag, the local
+# creatwth.cpp patch, and the raised _WIN32_WINNT floor.
 target_compile_definitions(detours PUBLIC WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
 
 # The payload DLL injected into the traced command (and, transitively,

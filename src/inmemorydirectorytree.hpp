@@ -19,6 +19,12 @@ namespace makebelieve {
 /// @class InMemoryDirectoryTree
 /// A `DirectoryTree` backed entirely by memory, with manipulators to build
 /// and mutate its contents directly.
+///
+/// Thread-safe: readers (`status`/`ls`/`read`) run concurrently; mutators
+/// serialise against them and each other. Change notifications are delivered
+/// with no lock held, so a callback may read back through the tree - but a
+/// concurrent mutation may by then have moved the tree past the state the diff
+/// describes.
 class InMemoryDirectoryTree : public DirectoryTree {
   // Pimpl idiom not really needed, but this class is used for testing
   // so the extra indirection isn't critical and pimpl allows us to avoid
