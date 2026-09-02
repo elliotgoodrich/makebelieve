@@ -1,0 +1,2 @@
+@/copy.txt <- cmake -E copy input.txt %out
+@/second.txt <- cmake -E copy other.txt %out

@@ -471,10 +471,10 @@ TEST_F(BuildDirectoryTreeTest, CoalescesInputChangesDuringAnInFlightRebuild) {
   EXPECT_EQ(runs, 3);
 }
 
-#ifdef _WIN32
-// End to end on Windows: a real watched source, real shell builds, and real
-// tracing. Editing a traced input on disk rebuilds the output that read it,
-// with no one re-reading it. (Windows only: tracing is not wired up elsewhere.)
+#if defined(_WIN32) || defined(__linux__)
+// End to end: a real watched source, real shell builds, and real tracing.
+// Editing a traced input on disk rebuilds the output that read it, with no one
+// re-reading it. Guarded to the platforms where tracing is wired up.
 TEST_F(BuildDirectoryTreeTest, RebuildsThroughRealTracingWhenAnInputChanges) {
   using namespace std::chrono_literals;
 

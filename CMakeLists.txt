@@ -81,4 +81,23 @@ if(BUILD_TESTING)
   add_subdirectory(experiments/ProjFS)
   add_subdirectory(experiments/ETW_tracing)
   add_subdirectory(experiments/detours_tracing)
+
+  if(WIN32)
+    add_test(NAME makebelieve_integration
+      COMMAND "${CMAKE_COMMAND}" -E echo
+        "SKIP: makebelieve_integration is not yet implemented for ProjFS")
+    set_tests_properties(makebelieve_integration PROPERTIES
+      SKIP_REGULAR_EXPRESSION "SKIP:")
+  else()
+    add_test(NAME makebelieve_integration
+      COMMAND "${CMAKE_COMMAND}"
+        "-DMAKEBELIEVE_EXE=$<TARGET_FILE:makebelieve>"
+        "-DNOTIFY_PROBE_EXE=$<TARGET_FILE:notifyprobe>"
+        "-DFIXTURE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/integration/fixture"
+        "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/integration/work"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_integration_test.cmake")
+    set_tests_properties(makebelieve_integration PROPERTIES
+      SKIP_REGULAR_EXPRESSION "SKIP:"
+      TIMEOUT 90)
+  endif()
 endif()

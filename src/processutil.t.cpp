@@ -97,7 +97,7 @@ TEST_F(ProcessUtil, TracesFilesTheCommandReadAsInputs) {
       run(print_file_command("input.txt"));
 
   ASSERT_TRUE(result.has_value());
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
   // The command read input.txt; the tracer should report it, by absolute path
   // under the working directory. (Files it read outside the root - cmake's own
   // install, say - are filtered out, so this stays about the command's inputs.)
@@ -143,6 +143,42 @@ TEST_F(ProcessUtil, TracesInputsWhenWorkingDirectoryIsAShortPath) {
         return std::filesystem::equivalent(p, work / "input.txt", ec);
       });
   EXPECT_TRUE(found) << "expected input.txt traced under a short-path root";
+}
+#endif
+
+#ifdef __linux__
+// A working directory reached through a symlink must still trace reads under
+// it: the tracer canonicalizes the root, so a symlinked root and the reads
+// resolve to the same path.
+TEST_F(ProcessUtil, TracesInputsWhenWorkingDirectoryIsSymlinked) {
+  write_input("input.txt", "hello world");
+
+  const std::filesystem::path link =
+      std::filesystem::temp_directory_path() /
+      ("makebelieve-proc-link-" +
+       std::string(
+           ::testing::UnitTest::GetInstance()->current_test_info()->name()));
+  std::error_code ec;
+  std::filesystem::remove(link, ec);
+  std::filesystem::create_directory_symlink(work, link, ec);
+  if (ec) {
+    GTEST_SKIP() << "could not create a directory symlink on this platform";
+  }
+
+  makebelieve::ProcessUtil::Result result;
+  makebelieve::ProcessUtil::run(
+      link, print_file_command("input.txt"), {},
+      [&](makebelieve::ProcessUtil::Result r) { result = std::move(r); });
+  std::filesystem::remove(link, ec);
+
+  ASSERT_TRUE(result.has_value());
+  const bool found =
+      std::ranges::any_of(result->inputs, [&](const std::filesystem::path& p) {
+        std::error_code equivalent_ec;
+        return std::filesystem::equivalent(p, work / "input.txt",
+                                           equivalent_ec);
+      });
+  EXPECT_TRUE(found) << "expected input.txt traced under a symlinked root";
 }
 #endif
 
