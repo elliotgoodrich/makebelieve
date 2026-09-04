@@ -83,3 +83,21 @@ And an individual output can override the rule:
 ```
 
 Precedence is **output → rule → filename selector**.
+
+## Serving
+
+The manifest in the current directory is served at a mountpoint with:
+
+```sh
+makebelieve mount <mountpoint>
+```
+
+This runs in the foreground and serves the outputs until stopped, either
+by Ctrl+C or, from another terminal, by:
+
+```sh
+makebelieve unmount <mountpoint>
+```
+
+`unmount` signals the instance serving that mountpoint to shut down and
+blocks until it has fully torn down.
