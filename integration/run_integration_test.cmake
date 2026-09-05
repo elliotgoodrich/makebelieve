@@ -26,10 +26,10 @@ file(READ "${SRC}/input.txt" EXPECTED_INITIAL)
 set(EXPECTED_UPDATED "updated makebelieve input\n")
 file(WRITE "${WORK_DIR}/updated.txt" "${EXPECTED_UPDATED}")
 
-# Launch the daemon in the background, recording its pid for teardown.
+# Launch the daemon in the background.
 execute_process(
   COMMAND sh -c
-  "cd \"${SRC}\" && \"${MAKEBELIEVE_EXE}\" \"${MNT}\" >\"${WORK_DIR}/daemon.log\" 2>&1 & echo $! >\"${WORK_DIR}/daemon.pid\"")
+  "cd \"${SRC}\" && \"${MAKEBELIEVE_EXE}\" mount \"${MNT}\" >\"${WORK_DIR}/daemon.log\" 2>&1 &")
 
 set(FAILURES "")
 
@@ -89,21 +89,17 @@ else()
   endif()
 endif()
 
-# Signal the daemon so it unmounts and exits cleanly, then wait for it to go.
-if(EXISTS "${WORK_DIR}/daemon.pid")
-  file(READ "${WORK_DIR}/daemon.pid" pid)
-  string(STRIP "${pid}" pid)
-  if(pid)
-    execute_process(COMMAND kill -TERM "${pid}" ERROR_QUIET)
-    foreach(attempt RANGE 1 100)
-      execute_process(COMMAND kill -0 "${pid}"
-                      RESULT_VARIABLE alive OUTPUT_QUIET ERROR_QUIET)
-      if(NOT alive EQUAL 0)
-        break()
-      endif()
-      execute_process(COMMAND "${CMAKE_COMMAND}" -E sleep 0.05)
-    endforeach()
-  endif()
+# Ask the daemon to unmount, which blocks until it has torn down.
+execute_process(COMMAND "${MAKEBELIEVE_EXE}" unmount "${MNT}"
+                RESULT_VARIABLE unmount_result OUTPUT_QUIET ERROR_QUIET)
+if(NOT unmount_result EQUAL 0)
+  list(APPEND FAILURES "unmount did not report success (was ${unmount_result})")
+endif()
+
+# unmount only returns once teardown is complete, so the mountpoint the daemon
+# created must be gone.
+if(EXISTS "${MNT}")
+  list(APPEND FAILURES "mountpoint still exists after unmount returned")
 endif()
 
 if(FAILURES)

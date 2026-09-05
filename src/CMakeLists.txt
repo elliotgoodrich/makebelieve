@@ -15,6 +15,8 @@ add_library(makebelieve_core STATIC
   processutil-${MAKEBELIEVE_PLATFORM}.cpp
   realdirectorytree-${MAKEBELIEVE_PLATFORM}.cpp
   stringutil.cpp
+  unmountchannel-${MAKEBELIEVE_PLATFORM}.cpp
+  unmountchannel-common.cpp
   virtualfilesystem-${MAKEBELIEVE_PLATFORM}.cpp
 )
 target_include_directories(makebelieve_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
