@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <expected>
@@ -17,6 +18,7 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -219,8 +221,10 @@ class VirtualFileSystem::Impl {
       throw_hresult(hr, "PrjStartVirtualizing");
     }
 
-    // Taken last, so no notification can arrive before there is a context to
-    // service it with.
+    // The notifier has to be running before a change can be queued for it, and
+    // the subscription is taken last so no notification can arrive before there
+    // is a context to service it with.
+    m_notifier = std::thread([this]() { notify_loop(); });
     m_subscription.emplace(m_tree.subscribe_to_changes(
         [this](const DirectoryTreeDiff& diff) { on_tree_changed(diff); }));
   }
@@ -229,6 +233,19 @@ class VirtualFileSystem::Impl {
     // Unsubscribe first: a notification landing after PrjStopVirtualizing
     // would call into a torn-down context.
     m_subscription.reset();
+
+    // Then stop the notifier and wait for it to drain. It calls
+    // PrjUpdateFileIfNeeded/PrjDeleteFile against m_context, so it has to be
+    // gone before PrjStopVirtualizing tears that context down.
+    {
+      const std::lock_guard<std::mutex> lock(m_notify_mutex);
+      m_stopping = true;
+    }
+    m_wake.notify_one();
+    if (m_notifier.joinable()) {
+      m_notifier.join();
+    }
+
     if (m_context != nullptr) {
       PrjStopVirtualizing(m_context);
     }
@@ -438,37 +455,72 @@ class VirtualFileSystem::Impl {
   template <auto MemFn>
   static constexpr auto trampoline = Bridge<MemFn>::call;
 
-  // Drops whatever the OS has cached for the paths the tree reports changed.
+  // Queues a tree change for the notifier thread.
+  //
+  // Runs on whichever thread the tree notifies from, so it does no I/O. The
+  // first read of a lazily-built output runs the build synchronously inside
+  // get_file_data, and the tree change that build produces is delivered right
+  // there on the ProjFS callback thread; a PrjUpdateFileIfNeeded issued from
+  // that stack would re-enter ProjFS re-entrantly and fail with
+  // ERROR_SHARING_VIOLATION. Handing the poke to the notifier defers it until
+  // get_file_data has returned.
   void on_tree_changed(const DirectoryTreeDiff& diff) {
-    if (diff.everything_dirty) {
-      // Iterate the placeholders we know we created rather than walking the
-      // mountpoint. Enumerating our own virtualization root from inside the
-      // provider would re-enter these callbacks, and this is a notification
-      // thread, so that would be a deadlock.
-      std::set<std::filesystem::path> known;
-      {
-        const std::lock_guard<std::mutex> lock(m_placeholder_mutex);
-        known = m_placeholders;
-      }
-      for (const std::filesystem::path& path : known) {
-        invalidate(path);
-      }
+    const std::lock_guard<std::mutex> lock(m_notify_mutex);
+    if (m_stopping) {
       return;
     }
-
-    for (const std::filesystem::path& path : diff.entries_changed) {
-      invalidate(path);
+    if (diff.everything_dirty) {
+      m_everything_dirty = true;
+    } else {
+      m_pending.insert(diff.entries_changed.begin(),
+                       diff.entries_changed.end());
     }
 
     // child_lists_changed is deliberately not handled beyond what
     // entries_changed already covers, because ProjFS exposes no primitive for
     // invalidating a cached directory enumeration. Removals and modifications
-    // arrive as entries_changed entries and are handled above; a *newly added*
+    // arrive as entries_changed entries and are handled below; a *newly added*
     // file may therefore not appear in a listing of a directory that has
     // already been enumerated, until something touches it by name and
     // GetPlaceholderInfoCallback runs.
     //
     // TODO: Investigate further.
+    m_wake.notify_one();
+  }
+
+  // Drains queued changes, invalidating each affected placeholder in turn.
+  void notify_loop() {
+    std::unique_lock<std::mutex> lock(m_notify_mutex);
+    while (true) {
+      m_wake.wait(lock, [this] {
+        return m_stopping || m_everything_dirty || !m_pending.empty();
+      });
+      if (m_stopping) {
+        break;
+      }
+
+      std::set<std::filesystem::path> batch;
+      if (m_everything_dirty) {
+        // The tree lost track of what changed, so everything we projected could
+        // be stale. Invalidate the placeholders we know we created rather than
+        // walking the mount: enumerating our own virtualization root would
+        // re-enter the ProjFS callbacks.
+        m_everything_dirty = false;
+        m_pending.clear();
+        const std::lock_guard<std::mutex> placeholder_lock(m_placeholder_mutex);
+        batch = m_placeholders;
+      } else {
+        batch = std::exchange(m_pending, {});
+      }
+
+      // Unlocked for the invalidations themselves, so a change arriving
+      // mid-batch simply queues up for the next pass.
+      lock.unlock();
+      for (const std::filesystem::path& path : batch) {
+        invalidate(path);
+      }
+      lock.lock();
+    }
   }
 
   // Re-pushes or removes one placeholder to match the tree.
@@ -516,6 +568,16 @@ class VirtualFileSystem::Impl {
   // OS could be caching anything about.
   std::mutex m_placeholder_mutex;
   std::set<std::filesystem::path> m_placeholders;
+
+  // The notifier thread and the queue on_tree_changed hands it. m_pending
+  // coalesces: a path repeated across diffs is invalidated once per pass, and
+  // m_everything_dirty supersedes the lot.
+  std::mutex m_notify_mutex;
+  std::condition_variable m_wake;
+  std::set<std::filesystem::path> m_pending;
+  bool m_everything_dirty = false;
+  bool m_stopping = false;
+  std::thread m_notifier;
 
   // Declared last so it is destroyed first, stopping notifications before the
   // state they touch goes away.

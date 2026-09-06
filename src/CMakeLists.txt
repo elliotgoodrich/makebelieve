@@ -90,11 +90,9 @@ target_link_libraries(makebelieve PRIVATE makebelieve_core)
 makebelieve_apply_clang_tidy(makebelieve)
 
 if(BUILD_TESTING)
-  # Waits for an inotify modify notification. Linux-only.
-  if(NOT WIN32)
-    add_executable(notifyprobe notifyprobe.m.cpp)
-    makebelieve_apply_clang_tidy(notifyprobe)
-  endif()
+  # Waits for a filesystem change notification naming a file.
+  add_executable(notifyprobe notifyprobe-${MAKEBELIEVE_PLATFORM}.m.cpp)
+  makebelieve_apply_clang_tidy(notifyprobe)
 
   function(makebelieve_add_test name)
     add_executable(${name}_test ${name}.t.cpp)
