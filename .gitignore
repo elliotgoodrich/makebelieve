@@ -1,1 +1,4 @@
 /build/
+/docs_output/
+__pycache__/
+/node_modules/

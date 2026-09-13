@@ -1,0 +1,10 @@
+{
+  "name": "makebelieve-docs",
+  "private": true,
+  "scripts": {
+    "docs:serve": "browser-sync start --config docs/browser-sync.cjs"
+  },
+  "devDependencies": {
+    "browser-sync": "3.0.4"
+  }
+}

@@ -93,4 +93,27 @@ if(BUILD_TESTING)
   set_tests_properties(makebelieve_integration PROPERTIES
     SKIP_REGULAR_EXPRESSION "SKIP:"
     TIMEOUT 90)
+
+  # The placeholder feature has its own end-to-end test: a multi-byte
+  # placeholder must be readable in full and survive until its build lands.
+  # Windows-only for now, since it drives reads through a separate process to
+  # keep a stuck ProjFS read from hanging the suite.
+  if(WIN32)
+    find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+      add_test(NAME makebelieve_placeholder_integration
+        COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_windows_integration_test.py"
+          "$<TARGET_FILE:makebelieve>"
+          "${CMAKE_CURRENT_BINARY_DIR}/integration")
+      set_tests_properties(makebelieve_placeholder_integration PROPERTIES
+        TIMEOUT 60)
+    else()
+      add_test(NAME makebelieve_placeholder_integration
+        COMMAND "${CMAKE_COMMAND}" -E echo
+          "SKIP: Python 3.10+ is required for the placeholder integration test")
+      set_tests_properties(makebelieve_placeholder_integration PROPERTIES
+        SKIP_REGULAR_EXPRESSION "SKIP:")
+    endif()
+  endif()
 endif()

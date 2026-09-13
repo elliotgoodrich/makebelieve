@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -120,6 +121,55 @@ TEST_F(BuildDirectoryTreeTest, NoManifestYieldsAnEmptyTree) {
   ASSERT_TRUE(root.has_value());
   EXPECT_TRUE(root->empty());
   EXPECT_EQ(runs, 0);
+}
+
+TEST_F(BuildDirectoryTreeTest, CustomPlaceholderSurvivesUntilBuildCompletes) {
+  const std::string html = "<!doctype html><html><body></body></html>";
+  source.write_file("loading.html", html);
+  write_manifest(
+      "[*.html]\n  %placeholder = loading.html\n"
+      "@/page.html <- build\n");
+  BuildDirectoryTree::BuildComplete complete;
+  int runs = 0;
+  const BuildDirectoryTree tree(source,
+                                [&](std::string, std::stop_token,
+                                    BuildDirectoryTree::BuildComplete done) {
+                                  ++runs;
+                                  complete = std::move(done);
+                                });
+  EXPECT_EQ(output_size(tree, "page.html"), html.size());
+  EXPECT_EQ(runs, 0);
+  EXPECT_EQ(read_output(tree, "page.html"), html);
+  EXPECT_EQ(read_output(tree, "page.html"), html);
+  EXPECT_EQ(runs, 1);
+  complete(built("<html><body>Generated page</body></html>"));
+  EXPECT_EQ(read_output(tree, "page.html"),
+            "<html><body>Generated page</body></html>");
+}
+
+TEST_F(BuildDirectoryTreeTest,
+       PlaceholderBytesArePreservedAndOverridesApplied) {
+  source.write_file("default", "default placeholder");
+  const std::string bytes("a\0b", 3);
+  source.write_file("binary", bytes);
+  write_manifest(
+      "[*]\n  %placeholder = default\n"
+      "@/one <- build\n  %placeholder = binary\n"
+      "@/two <- build\n");
+  const BuildDirectoryTree tree(
+      source,
+      [](std::string, std::stop_token, BuildDirectoryTree::BuildComplete) {});
+  EXPECT_EQ(read_output(tree, "one"), bytes);
+  EXPECT_EQ(read_output(tree, "two"), "default placeholder");
+}
+
+TEST_F(BuildDirectoryTreeTest, RejectsMissingAndEmptyPlaceholderFiles) {
+  write_manifest("[*]\n  %placeholder = missing\n@/one <- build\n");
+  EXPECT_THROW(BuildDirectoryTree(source, returning("done")),
+               std::runtime_error);
+  source.write_file("missing", "");
+  EXPECT_THROW(BuildDirectoryTree(source, returning("done")),
+               std::runtime_error);
 }
 
 TEST_F(BuildDirectoryTreeTest,

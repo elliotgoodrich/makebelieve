@@ -6,18 +6,24 @@
 #include "unmountchannel.hpp"
 #include "virtualfilesystem.hpp"
 
+#include <algorithm>
 #include <array>
 #include <concepts>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
+#include <deque>
 #include <exception>
 #include <filesystem>
+#include <mutex>
 #include <print>
 #include <semaphore>
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -62,8 +68,69 @@ int mount(const char* mountpoint_arg) {
   // the shell. The runner's working directory is the source root, so the
   // inputs it traces line up with the source's own change notifications.
   // TODO: reparse the manifest when build.makebelieve changes.
-  const BuildDirectoryTree build_tree(tree,
-                                      BuildDirectoryTree::shell_runner(source));
+  struct BuildJob {
+    std::string command;
+    std::stop_token stop;
+    BuildDirectoryTree::BuildComplete complete;
+  };
+  std::mutex jobs_mutex;
+  std::condition_variable_any jobs_ready;
+  std::deque<BuildJob> jobs;
+  const BuildDirectoryTree build_tree(
+      tree, [&](std::string command, std::stop_token stop,
+                BuildDirectoryTree::BuildComplete complete) {
+        {
+          const std::lock_guard lock(jobs_mutex);
+          jobs.push_back(
+              {std::move(command), std::move(stop), std::move(complete)});
+        }
+        jobs_ready.notify_one();
+      });
+
+  // ProcessUtil blocks. Run commands outside the filesystem callback so the
+  // initial read can return its placeholder before the mount updates that
+  // file. One worker per core, since the jobs are independent - each command
+  // gets its own scratch directory, and BuildDirectoryTree already keeps a
+  // second build of the same output off the queue.
+  //
+  // Declared after build_tree: cancellation and joining happen while the tree
+  // (and every completion callback's target) is still alive.
+  const auto worker = [&](const std::stop_token& stop) {
+    const BuildDirectoryTree::CommandRunner run =
+        BuildDirectoryTree::shell_runner(source);
+    while (!stop.stop_requested()) {
+      std::unique_lock lock(jobs_mutex);
+      if (!jobs_ready.wait(lock, stop, [&] { return !jobs.empty(); })) {
+        return;
+      }
+      BuildJob job = std::move(jobs.front());
+      jobs.pop_front();
+      lock.unlock();
+      std::stop_source command_stop;
+      const std::stop_callback worker_stopped(
+          stop, [&] { command_stop.request_stop(); });
+      const std::stop_callback tree_stopped(
+          job.stop, [&] { command_stop.request_stop(); });
+      run(job.command, command_stop.get_token(), std::move(job.complete));
+    }
+  };
+  std::vector<std::jthread> builders;
+  for (unsigned i = std::max(1U, std::thread::hardware_concurrency()); i != 0;
+       --i) {
+    builders.emplace_back(worker);
+  }
+
+  // Destroyed before `builders`, so every worker is told to stop before the
+  // vector joins them one at a time - otherwise shutdown waits out each
+  // running command in turn rather than cancelling them all at once.
+  const struct StopBuilders {
+    std::vector<std::jthread>& builders;
+    ~StopBuilders() {
+      for (std::jthread& builder : builders) {
+        builder.request_stop();
+      }
+    }
+  } stop_builders{builders};
 
   const VirtualFileSystem vfs(build_tree, mountpoint_arg);
 

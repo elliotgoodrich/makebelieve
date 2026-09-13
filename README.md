@@ -25,7 +25,7 @@ outside the source directory, so it can't live inside it as `./output`.
 It runs in the foreground until stopped, so run the commands below from
 another terminal (or background it with `&`).
 
-On first access, files will be empty,
+On first access, files contain a placeholder (one null byte by default),
 
 ```sh
 $ cat ../output/hello.txt
@@ -60,3 +60,15 @@ a static website generator where the browser can reload when a file is
 updated.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for build and test instructions.
+
+## Documentation website
+
+The site in [`docs/`](docs/index.md) is a working MakeBelieve example: Pandoc
+transforms each Markdown page into HTML, and MakeBelieve projects the results
+into the sibling `docs_output/` directory. See the
+[getting-started guide](docs/getting-started.md) for prerequisites and commands.
+
+Run `makebelieve mount ../docs_output` from `docs/`, then run
+`npm install` and `npm run docs:serve` from the repository root, then open
+<http://localhost:8000>. MakeBelieve supplies HTML placeholders; BrowserSync
+injects its reload client and watches the generated files for changes.

@@ -1,0 +1,12 @@
+# Run makebelieve from this directory, with ../docs_output as the mountpoint.
+# Explicit outputs use the syntax supported by the current parser.
+[*.html]
+    %placeholder = placeholders/page.html
+
+[*.css]
+    %placeholder = placeholders/page.css
+
+@/index.html <- pandoc index.md --from=markdown --to=html5 --standalone --template=template.html --css=style.css -o %out
+@/getting-started.html <- pandoc getting-started.md --from=markdown --to=html5 --standalone --template=template.html --css=style.css -o %out
+@/manifest.html <- pandoc manifest.md --from=markdown --to=html5 --standalone --template=template.html --css=style.css -o %out
+@/style.css <- cmake -E copy style.css %out

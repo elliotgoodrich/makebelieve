@@ -18,6 +18,7 @@
 #include <random>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -79,22 +80,12 @@ std::filesystem::path make_temp_directory() {
 }
 
 // Replaces every `%out` in @a command with @a out_path, quoted so paths
-// containing spaces survive the shell.
+// containing spaces survive the shell. A longer name that merely starts with
+// `%out` - `%output` - is left alone; Manifest::substitute draws that line.
 std::string substitute_out(std::string_view command,
                            const std::filesystem::path& out_path) {
-  const std::string replacement = "\"" + out_path.string() + "\"";
-  std::string result;
-  std::size_t pos = 0;
-  while (true) {
-    const std::size_t found = command.find(k_out_placeholder, pos);
-    if (found == std::string_view::npos) {
-      result += command.substr(pos);
-      return result;
-    }
-    result += command.substr(pos, found - pos);
-    result += replacement;
-    pos = found + k_out_placeholder.size();
-  }
+  return Manifest::substitute(command, k_out_placeholder,
+                              "\"" + out_path.string() + "\"");
 }
 
 std::string read_file(const std::filesystem::path& path) {
@@ -244,9 +235,28 @@ class BuildDirectoryTree::Impl {
         read_all(source, k_manifest_name);
     if (manifest.has_value()) {
       const Manifest parsed = Manifest::parse(*manifest);
+      // Outputs commonly share one placeholder through a `[*.html]` selector,
+      // so each distinct file is read from the source only once.
+      std::map<std::filesystem::path, std::string> placeholders;
       for (const Manifest::Rule& rule : parsed.rules()) {
         ensure_parent_directories(m_structure, rule.output);
-        m_structure.write_file(rule.output, k_placeholder_content);
+        std::string_view placeholder = k_placeholder_content;
+        if (rule.placeholder) {
+          auto it = placeholders.find(*rule.placeholder);
+          if (it == placeholders.end()) {
+            std::optional<std::string> bytes =
+                read_all(source, *rule.placeholder);
+            if (!bytes || bytes->empty()) {
+              throw std::runtime_error(
+                  "placeholder must be a readable, non-empty source file: " +
+                  rule.placeholder->string());
+            }
+            it = placeholders.emplace(*rule.placeholder, std::move(*bytes))
+                     .first;
+          }
+          placeholder = it->second;
+        }
+        m_structure.write_file(rule.output, std::string(placeholder));
         m_commands.insert_or_assign(rule.output, rule.command);
         m_stale.insert(rule.output);
       }

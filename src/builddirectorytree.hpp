@@ -21,8 +21,8 @@ namespace makebelieve {
 ///
 /// On construction it reads the manifest from a @a source tree and presents
 /// one entry per declared `@/output <- command` rule. Each output is built
-/// lazily: until it is first read it appears as a one-byte placeholder holding
-/// a single null byte, and the first read of it hands the command to a
+/// lazily: until it is first read it holds the configured placeholder's bytes
+/// (a single null byte by default), and the first read hands the command to a
 /// @link CommandRunner. When the runner reports the result, it replaces the
 /// placeholder; later reads are served from that result.
 ///
