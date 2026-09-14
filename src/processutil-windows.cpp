@@ -218,6 +218,16 @@ void ProcessUtil::run(const std::filesystem::path& working_directory,
                       const std::string& command,
                       const std::stop_token& stop,
                       Complete on_done) {
+  // Nothing is spawned once the result is already unwanted. Without this the
+  // command would run, be killed by the stop callback below, and report the
+  // same cancellation - having had whatever side effects it managed first.
+  // The Linux backend checks in the same place.
+  if (stop.stop_requested()) {
+    on_done(
+        std::unexpected(std::make_error_code(std::errc::operation_canceled)));
+    return;
+  }
+
   // A pipe carries the child's standard output back to us; the write end is
   // inheritable so the child receives it, the read end is not.
   SECURITY_ATTRIBUTES attributes = {

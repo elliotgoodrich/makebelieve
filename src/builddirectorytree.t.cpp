@@ -6,12 +6,15 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <expected>
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <mutex>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -31,6 +34,21 @@ using namespace makebelieve;
 BuildDirectoryTree::BuildResult built(std::string bytes) {
   return BuildDirectoryTree::BuildOutput{.bytes = std::move(bytes),
                                          .inputs = {}};
+}
+
+// Blocks until a predicate holds, so a test that queues work onto another
+// thread fails by timing out rather than hanging the suite.
+template <typename Predicate>
+[[nodiscard]] bool wait_until(Predicate done) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (done()) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return false;
 }
 
 // A runner that produces fixed bytes for any command, so the tree's behaviour

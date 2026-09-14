@@ -1,5 +1,3 @@
-# Run makebelieve from this directory, with ../docs_output as the mountpoint.
-# Explicit outputs use the syntax supported by the current parser.
 [*.html]
     %placeholder = placeholders/page.html
 

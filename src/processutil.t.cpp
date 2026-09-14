@@ -34,6 +34,12 @@ std::string print_file_command(std::string_view name) {
   return "cmake -E cat " + std::string(name);
 }
 
+// A command that creates the file @a name in the working directory, so a test
+// can tell whether it ran at all rather than only what it reported.
+std::string touch_command(std::string_view name) {
+  return "cmake -E touch " + std::string(name);
+}
+
 // A command that blocks for about @a seconds, so cancellation has something to
 // interrupt.
 std::string sleep_command(int seconds) {
@@ -192,6 +198,43 @@ TEST_F(ProcessUtil, ReportsCancellationWhenStopIsAlreadyRequested) {
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error(),
             std::make_error_code(std::errc::operation_canceled));
+}
+
+// Cancelled before it started means it must not reach the shell at all:
+// callers queueing commands rely on an already-stopped token meaning "drop
+// this", not "run it and throw the answer away".
+//
+// Asserting only that the command had no side effect would not show that - the
+// stop callback kills the child so promptly that even a spawned `touch` loses
+// the race, so that assertion holds either way. Timing does show it: many
+// cancelled runs together stay far below the cost of the one real spawn
+// measured here, which they could not if each were spawning a process.
+TEST_F(ProcessUtil, SpawnsNothingWhenStopIsAlreadyRequested) {
+  const auto baseline_start = std::chrono::steady_clock::now();
+  ASSERT_TRUE(run(touch_command("baseline.txt")).has_value());
+  const auto one_spawn = std::chrono::steady_clock::now() - baseline_start;
+
+  std::stop_source source;
+  source.request_stop();
+
+  constexpr int k_runs = 20;
+  const auto start = std::chrono::steady_clock::now();
+  for (int i = 0; i < k_runs; ++i) {
+    const makebelieve::ProcessUtil::Result result =
+        run(touch_command("side-effect.txt"), source.get_token());
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(),
+              std::make_error_code(std::errc::operation_canceled));
+  }
+  const auto cancelled = std::chrono::steady_clock::now() - start;
+
+  // A quarter of one spawn, which returning early clears by orders of
+  // magnitude while spawning-then-killing cannot come close to.
+  EXPECT_LT(cancelled, one_spawn / 4)
+      << k_runs
+      << " cancelled runs cost close to a real spawn, so they are "
+         "spawning processes rather than returning early";
+  EXPECT_FALSE(std::filesystem::exists(work / "side-effect.txt"));
 }
 
 TEST_F(ProcessUtil, TerminatesARunningCommandWhenStopIsRequested) {

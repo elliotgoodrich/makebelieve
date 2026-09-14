@@ -18,6 +18,7 @@ add_library(makebelieve_core STATIC
   unmountchannel-${MAKEBELIEVE_PLATFORM}.cpp
   unmountchannel-common.cpp
   virtualfilesystem-${MAKEBELIEVE_PLATFORM}.cpp
+  workqueue.cpp
 )
 target_include_directories(makebelieve_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 
@@ -104,6 +105,7 @@ if(BUILD_TESTING)
   endfunction()
 
   makebelieve_add_test(builddirectorytree)
+  makebelieve_add_test(workqueue)
   makebelieve_add_test(filesystemutil)
   makebelieve_add_test(manifest)
   makebelieve_add_test(processutil)
