@@ -197,7 +197,12 @@ class VirtualFileSystem::Impl {
                               "fuse_mount failed");
     }
 
-    m_loop = std::thread([this]() { fuse_loop(m_fuse); });
+    // Multithreaded, so an open blocked on a build (see op_open) does not hold
+    // up other requests. Every callback here is safe to run concurrently.
+    m_loop = std::thread([this]() {
+      fuse_loop_config config{.clone_fd = 0, .max_idle_threads = 10};
+      fuse_loop_mt(m_fuse, &config);
+    });
 
     // The notifier has to be running before a change can be queued for it, and
     // the subscription is taken last so no change can arrive before there is a
@@ -400,16 +405,13 @@ class VirtualFileSystem::Impl {
   // Ubuntu 24.04 ships 3.14. Compilers, linkers and indexers map their inputs,
   // so that is not a corner worth giving up.
   //
-  // Going through the page cache is also safe for a file whose size only
-  // settles once it has been read (a lazily built output): the kernel clamps a
-  // read to the size it last saw, so the read that triggers a build returns a
-  // truncated first chunk, but the next read lands past that size, has the
-  // kernel re-ask getattr, and the size change drops the cached page - so a
-  // reader that reads to end of file still ends up with exactly the built
-  // content.
+  // A read open blocks in the tree's open() until the file is final; a stat
+  // never comes here. With attribute caching off, the kernel re-reads the size
+  // before a read or fstat, so it sees the settled one.
   int op_open(const char* path, fuse_file_info* info) {
+    const std::filesystem::path relative = to_tree_path(path);
     const std::expected<EntryInfo, std::error_code> status =
-        m_tree.status(to_tree_path(path));
+        m_tree.status(relative);
     if (!status.has_value()) {
       return -ENOENT;
     }
@@ -429,6 +431,13 @@ class VirtualFileSystem::Impl {
       // that byte in place of the real content.
       info->direct_io = 1;
       return 0;
+    }
+
+    if (const std::expected<FileInfo, std::error_code> opened =
+            m_tree.open(relative);
+        !opened.has_value()) {
+      const int code = opened.error().value();
+      return code > 0 ? -code : -EIO;
     }
     return 0;
   }

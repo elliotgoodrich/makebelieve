@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -17,6 +18,7 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <string>
@@ -660,6 +662,115 @@ class FailingReadTree : public makebelieve::DirectoryTree {
   }
 };
 
+// Forwards to an in-memory tree, but open() writes a file's final contents
+// first, like BuildDirectoryTree. Counts its opens.
+class SettleOnOpenTree : public makebelieve::DirectoryTree {
+  makebelieve::InMemoryDirectoryTree& m_inner;
+  std::string m_final;
+  mutable std::atomic<int> m_opens = 0;
+
+ public:
+  SettleOnOpenTree(makebelieve::InMemoryDirectoryTree& inner, std::string final)
+      : m_inner(inner), m_final(std::move(final)) {}
+
+  [[nodiscard]] int opens() const { return m_opens; }
+
+  [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
+      const std::filesystem::path& path) const override {
+    return m_inner.status(path);
+  }
+
+  [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
+                              std::error_code>
+  ls(const std::filesystem::path& path) const override {
+    return m_inner.ls(path);
+  }
+
+  [[nodiscard]] std::expected<makebelieve::FileInfo, std::error_code> open(
+      const std::filesystem::path& path) const override {
+    ++m_opens;
+    m_inner.write_file(path, m_final);
+    return DirectoryTree::open(path);
+  }
+
+  [[nodiscard]] std::expected<std::string, std::error_code> read(
+      const std::filesystem::path& path,
+      makebelieve::Offset offset,
+      std::size_t size) const override {
+    return m_inner.read(path, offset, size);
+  }
+
+  [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
+      const std::function<void(const makebelieve::DirectoryTreeDiff&)>&
+          callback) const override {
+    return m_inner.subscribe_to_changes(callback);
+  }
+};
+
+// Forwards to an in-memory tree, but holds open() of one path until released.
+class GatedOpenTree : public makebelieve::DirectoryTree {
+  const makebelieve::DirectoryTree& m_inner;
+  std::filesystem::path m_gated;
+  mutable std::mutex m_mutex;
+  mutable std::condition_variable m_changed;
+  mutable bool m_waiting = false;
+  bool m_released = false;
+
+ public:
+  GatedOpenTree(const makebelieve::DirectoryTree& inner,
+                std::filesystem::path gated)
+      : m_inner(inner), m_gated(std::move(gated)) {}
+
+  // Waits (bounded) until an open() of the gated path is held.
+  [[nodiscard]] bool wait_until_held() const {
+    std::unique_lock lock(m_mutex);
+    return m_changed.wait_for(lock, k_timeout, [this] { return m_waiting; });
+  }
+
+  void release() {
+    {
+      const std::lock_guard lock(m_mutex);
+      m_released = true;
+    }
+    m_changed.notify_all();
+  }
+
+  [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
+      const std::filesystem::path& path) const override {
+    return m_inner.status(path);
+  }
+
+  [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
+                              std::error_code>
+  ls(const std::filesystem::path& path) const override {
+    return m_inner.ls(path);
+  }
+
+  [[nodiscard]] std::expected<makebelieve::FileInfo, std::error_code> open(
+      const std::filesystem::path& path) const override {
+    if (path == m_gated) {
+      std::unique_lock lock(m_mutex);
+      m_waiting = true;
+      m_changed.notify_all();
+      m_changed.wait(lock, [this] { return m_released; });
+    }
+    return m_inner.open(path);
+  }
+
+  [[nodiscard]] std::expected<std::string, std::error_code> read(
+      const std::filesystem::path& path,
+      makebelieve::Offset offset,
+      std::size_t size) const override {
+    return m_inner.read(path, offset, size);
+  }
+
+  [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
+      const std::function<void(const makebelieve::DirectoryTreeDiff&)>&
+          callback) const override {
+    return m_inner.subscribe_to_changes(callback);
+  }
+};
+
 // Named for the type under test so TEST_F reads as VirtualFileSystem.<case>.
 // That takes the name, so the class under test is spelled makebelieve::
 // throughout this file.
@@ -908,6 +1019,59 @@ TEST_F(VirtualFileSystem, RefusesEveryKindOfWrite) {
             (std::vector<std::string>{"a.txt", "sub"}));
   EXPECT_TRUE(tree().status("a.txt").has_value());
   EXPECT_FALSE(tree().status("new.txt").has_value());
+}
+
+// Opening for read reaches the tree's open() and a stat does not; the handle
+// then reports the size open() settled on.
+TEST_F(VirtualFileSystem, OpeningAFileSettlesItAndAStatDoesNot) {
+  tree().write_file("a.txt", "x");
+  const std::string settled = "settled contents";
+  const SettleOnOpenTree settling(tree(), settled);
+  const makebelieve::VirtualFileSystem vfs(settling, mountpoint());
+
+  EXPECT_EQ(std::filesystem::file_size(mountpoint() / "a.txt"), 1U);
+  EXPECT_TRUE(std::filesystem::is_regular_file(mountpoint() / "a.txt"));
+  EXPECT_EQ(settling.opens(), 0);
+
+  std::ifstream in(mountpoint() / "a.txt", std::ios::binary);
+  ASSERT_TRUE(in);
+  EXPECT_GE(settling.opens(), 1);
+  in.seekg(0, std::ios::end);
+  EXPECT_EQ(in.tellg(), static_cast<std::streamoff>(settled.size()));
+  in.seekg(0);
+  EXPECT_EQ(read_rest(in), settled);
+}
+
+// While one open waits on the tree, other files can still be stat-ed and read.
+TEST_F(VirtualFileSystem, AnOpenThatWaitsDoesNotHoldUpOtherRequests) {
+  tree().write_file("slow.txt", "slow");
+  tree().write_file("fast.txt", "fast");
+  GatedOpenTree gated(tree(), "slow.txt");
+  const makebelieve::VirtualFileSystem vfs(gated, mountpoint());
+
+  // After the mount, so these finish before it is torn down.
+  std::future<std::optional<std::string>> slow = std::async(
+      std::launch::async, [&] { return read_file(mountpoint() / "slow.txt"); });
+  if (!gated.wait_until_held()) {
+    gated.release();  // or slow's destructor would hang
+    FAIL() << "the open of slow.txt never reached the tree";
+  }
+
+  std::future<std::optional<std::string>> fast =
+      std::async(std::launch::async, [&] {
+        std::error_code ignored;
+        static_cast<void>(
+            std::filesystem::file_size(mountpoint() / "fast.txt", ignored));
+        return read_file(mountpoint() / "fast.txt");
+      });
+  const bool fast_finished =
+      fast.wait_for(k_timeout) == std::future_status::ready;
+  // Released either way, so a failure cannot wedge the mount.
+  gated.release();
+
+  EXPECT_TRUE(fast_finished) << "a waiting open held up another file";
+  EXPECT_EQ(fast.get(), "fast");
+  EXPECT_EQ(slow.get(), "slow");
 }
 
 // An error the tree reports should reach the reader as that error, whichever

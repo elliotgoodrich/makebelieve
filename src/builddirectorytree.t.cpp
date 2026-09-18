@@ -6,12 +6,17 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <expected>
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <memory>
+#include <mutex>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -58,6 +63,56 @@ BuildDirectoryTree::CommandRunner counting_with_inputs(
   };
 }
 
+// A thread-safe runner that holds each build in flight until the test
+// completes it.
+class DeferredRunner {
+  struct State {
+    std::mutex mutex;
+    std::condition_variable started;
+    std::deque<BuildDirectoryTree::BuildComplete> pending;
+    int runs = 0;
+  };
+  std::shared_ptr<State> m_state = std::make_shared<State>();
+
+ public:
+  [[nodiscard]] BuildDirectoryTree::CommandRunner runner() const {
+    return [state = m_state](std::string /*command*/, std::stop_token /*stop*/,
+                             BuildDirectoryTree::BuildComplete on_done) {
+      {
+        const std::lock_guard lock(state->mutex);
+        ++state->runs;
+        state->pending.push_back(std::move(on_done));
+      }
+      state->started.notify_all();
+    };
+  }
+
+  // Waits (bounded) until @a count builds have started.
+  [[nodiscard]] bool wait_for_runs(int count) const {
+    std::unique_lock lock(m_state->mutex);
+    return m_state->started.wait_for(lock, std::chrono::seconds(10),
+                                     [&] { return m_state->runs >= count; });
+  }
+
+  // Completes the oldest pending build.
+  void complete(BuildDirectoryTree::BuildResult result) const {
+    BuildDirectoryTree::BuildComplete on_done;
+    {
+      const std::lock_guard lock(m_state->mutex);
+      ASSERT_FALSE(m_state->pending.empty());
+      on_done = std::move(m_state->pending.front());
+      m_state->pending.pop_front();
+    }
+    // Unlocked: completing may start the next build.
+    on_done(std::move(result));
+  }
+
+  [[nodiscard]] int runs() const {
+    const std::lock_guard lock(m_state->mutex);
+    return m_state->runs;
+  }
+};
+
 class BuildDirectoryTreeTest : public ::testing::Test {
  protected:
   InMemoryDirectoryTree source;
@@ -96,14 +151,17 @@ class BuildDirectoryTreeTest : public ::testing::Test {
     return std::get<FileInfo>(*info).size;
   }
 
-  // Reads a whole output. The read itself is what triggers the lazy build, so
-  // it deliberately does not size the request from a prior status() call - that
-  // would still report the pre-build placeholder size.
+  // Opens (which builds) then reads a whole output.
   static std::string read_output(const BuildDirectoryTree& tree,
                                  const std::filesystem::path& path) {
-    const auto content = tree.read(path, 0, 1U << 20);
+    const std::expected<FileInfo, std::error_code> opened = tree.open(path);
+    EXPECT_TRUE(opened.has_value());
+    if (!opened.has_value()) {
+      return {};
+    }
+    const auto content = tree.read(path, 0, opened->size);
     EXPECT_TRUE(content.has_value());
-    return *content;
+    return content.value_or(std::string{});
   }
 };
 
@@ -122,8 +180,8 @@ TEST_F(BuildDirectoryTreeTest, NoManifestYieldsAnEmptyTree) {
   EXPECT_EQ(runs, 0);
 }
 
-TEST_F(BuildDirectoryTreeTest,
-       DeclaredOutputsAppearAsPlaceholdersBeforeAnyRead) {
+// Only open() builds; until then an output reports size 1.
+TEST_F(BuildDirectoryTreeTest, OnlyOpenBuilds) {
   write_manifest("@/output.txt <- anything %out\n");
 
   int runs = 0;
@@ -138,8 +196,27 @@ TEST_F(BuildDirectoryTreeTest,
   ASSERT_TRUE(root.has_value());
   ASSERT_EQ(root->size(), 1U);
   EXPECT_EQ((*root)[0].name, "output.txt");
-  EXPECT_EQ(output_size(tree, "output.txt"), 1U);  // one null byte
-  EXPECT_EQ(runs, 0);                              // not built until read
+  EXPECT_EQ(output_size(tree, "output.txt"), 1U);
+  EXPECT_TRUE(tree.read("output.txt", 0, 16).has_value());
+  EXPECT_EQ(runs, 0);
+
+  const std::expected<FileInfo, std::error_code> opened =
+      tree.open("output.txt");
+  ASSERT_TRUE(opened.has_value());
+  EXPECT_EQ(opened->size, 5U);
+  EXPECT_EQ(runs, 1);
+}
+
+TEST_F(BuildDirectoryTreeTest, OpenOfAnythingButAnOutputIsNotABuild) {
+  write_manifest("@/out/file.txt <- anything %out\n");
+
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
+
+  EXPECT_EQ(tree.open("out").error(), std::errc::is_a_directory);
+  EXPECT_EQ(tree.open("missing.txt").error(),
+            std::errc::no_such_file_or_directory);
+  EXPECT_EQ(runs, 0);
 }
 
 TEST_F(BuildDirectoryTreeTest, ReadHandsTheRawCommandToTheRunner) {
@@ -192,12 +269,15 @@ TEST_F(BuildDirectoryTreeTest, RetriesAfterAFailedBuild) {
         }
       });
 
-  // The failed first build leaves the placeholder in place...
-  read_output(tree, "output.txt");
+  // The failed first build fails the open...
+  const std::expected<FileInfo, std::error_code> failed =
+      tree.open("output.txt");
+  ASSERT_FALSE(failed.has_value());
+  EXPECT_EQ(failed.error(), std::errc::io_error);
   EXPECT_EQ(runs, 1);
   EXPECT_EQ(output_size(tree, "output.txt"), 1U);
 
-  // ...so a later read tries again, and this time it sticks.
+  // ...so a later open tries again, and this time it sticks.
   EXPECT_EQ(read_output(tree, "output.txt"), "recovered");
   EXPECT_EQ(runs, 2);
   EXPECT_EQ(read_output(tree, "output.txt"), "recovered");
@@ -243,31 +323,51 @@ TEST_F(BuildDirectoryTreeTest, RunnerCompletionHandlerCanBeGeneric) {
   EXPECT_EQ(read_output(tree, "output.txt"), "generic");
 }
 
-// An asynchronous runner reports later: the triggering read sees the
-// placeholder, and the real content only appears once the runner completes.
-TEST_F(BuildDirectoryTreeTest, AsynchronousRunnerCompletesLater) {
+// open() waits for the build to report back; status() does not.
+TEST_F(BuildDirectoryTreeTest, OpenBlocksUntilTheBuildReportsBack) {
   write_manifest("@/output.txt <- build %out\n");
 
-  std::vector<BuildDirectoryTree::BuildComplete> deferred;
-  const BuildDirectoryTree tree(
-      source, [&deferred](std::string, std::stop_token,
-                          BuildDirectoryTree::BuildComplete done) {
-        deferred.push_back(std::move(done));
-      });
+  const DeferredRunner builds;
+  const BuildDirectoryTree tree(source, builds.runner());
 
-  // The first read starts the build but it has not reported back yet.
-  EXPECT_EQ(read_output(tree, "output.txt"), std::string(1, '\0'));
+  std::atomic<bool> returned = false;
+  std::string content;
+  std::thread reader([&] {
+    content = read_output(tree, "output.txt");
+    returned = true;
+  });
+
+  ASSERT_TRUE(builds.wait_for_runs(1));
+  // Its build is still pending.
+  EXPECT_FALSE(returned);
   EXPECT_EQ(output_size(tree, "output.txt"), 1U);
-  ASSERT_EQ(deferred.size(), 1U);
 
-  // A second read must not start a second build while the first is in flight.
-  EXPECT_EQ(read_output(tree, "output.txt"), std::string(1, '\0'));
-  ASSERT_EQ(deferred.size(), 1U);
-
-  // Completing it swaps in the real content.
-  deferred.front()(built("done later"));
-  EXPECT_EQ(read_output(tree, "output.txt"), "done later");
+  builds.complete(built("done later"));
+  reader.join();
+  EXPECT_EQ(content, "done later");
   EXPECT_EQ(output_size(tree, "output.txt"), 10U);
+  EXPECT_EQ(builds.runs(), 1);
+}
+
+// Two opens of one unbuilt output share one build.
+TEST_F(BuildDirectoryTreeTest, ConcurrentOpensShareOneBuild) {
+  write_manifest("@/output.txt <- build %out\n");
+
+  const DeferredRunner builds;
+  const BuildDirectoryTree tree(source, builds.runner());
+
+  std::string first;
+  std::string second;
+  std::thread first_reader([&] { first = read_output(tree, "output.txt"); });
+  ASSERT_TRUE(builds.wait_for_runs(1));
+  std::thread second_reader([&] { second = read_output(tree, "output.txt"); });
+
+  builds.complete(built("shared"));
+  first_reader.join();
+  second_reader.join();
+  EXPECT_EQ(first, "shared");
+  EXPECT_EQ(second, "shared");
+  EXPECT_EQ(builds.runs(), 1);
 }
 
 // Destroying the tree requests a stop on the token handed to in-flight runners.
@@ -278,10 +378,11 @@ TEST_F(BuildDirectoryTreeTest, DestructionRequestsStop) {
   {
     const BuildDirectoryTree tree(
         source, [&token](std::string, std::stop_token stop,
-                         BuildDirectoryTree::BuildComplete) {
-          token = std::move(stop);  // never completes: an abandoned build
+                         BuildDirectoryTree::BuildComplete done) {
+          token = std::move(stop);
+          done(built("built"));
         });
-    EXPECT_EQ(read_output(tree, "output.txt"), std::string(1, '\0'));
+    EXPECT_EQ(read_output(tree, "output.txt"), "built");
     EXPECT_TRUE(token.stop_possible());
     EXPECT_FALSE(token.stop_requested());
   }
@@ -298,7 +399,7 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerBuildsLazilyThroughTheShell) {
 
   const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
 
-  EXPECT_EQ(output_size(tree, "output.txt"), 1U);  // placeholder before read
+  EXPECT_EQ(output_size(tree, "output.txt"), 1U);  // unbuilt until opened
   EXPECT_EQ(read_output(tree, "output.txt"), "hello world");
   EXPECT_EQ(output_size(tree, "output.txt"), 11U);
 }
@@ -429,46 +530,87 @@ TEST_F(BuildDirectoryTreeTest, CoalescesInputChangesDuringAnInFlightRebuild) {
   source.write_file("input.txt", "v1");
   write_manifest("@/output.txt <- build %out\n");
 
+  // Build #1 completes at once; later ones are held in flight.
   std::vector<BuildDirectoryTree::BuildComplete> deferred;
   int runs = 0;
-  const BuildDirectoryTree tree(source,
-                                [&](std::string, std::stop_token,
-                                    BuildDirectoryTree::BuildComplete on_done) {
-                                  ++runs;
-                                  deferred.push_back(std::move(on_done));
-                                });
+  const BuildDirectoryTree tree(
+      source, [&](std::string, std::stop_token,
+                  BuildDirectoryTree::BuildComplete on_done) {
+        ++runs;
+        if (runs == 1) {
+          on_done(BuildDirectoryTree::BuildOutput{.bytes = "build 1",
+                                                  .inputs = {"input.txt"}});
+        } else {
+          deferred.push_back(std::move(on_done));
+        }
+      });
 
   const auto complete_latest = [&deferred](std::string bytes) {
     deferred.back()(BuildDirectoryTree::BuildOutput{.bytes = std::move(bytes),
                                                     .inputs = {"input.txt"}});
   };
 
-  // Read starts build #1; complete it so input.txt is recorded as a dependency.
-  read_output(tree, "output.txt");
-  ASSERT_EQ(deferred.size(), 1U);
-  complete_latest("build 1");
   EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
   EXPECT_EQ(runs, 1);
+  ASSERT_TRUE(deferred.empty());
 
   // An input change starts eager rebuild #2 (in flight, not yet reported).
   source.write_file("input.txt", "v2");
   EXPECT_EQ(runs, 2);
-  ASSERT_EQ(deferred.size(), 2U);
+  ASSERT_EQ(deferred.size(), 1U);
 
   // A second change while #2 is in flight starts no new build yet.
   source.write_file("input.txt", "v3");
   EXPECT_EQ(runs, 2);
-  ASSERT_EQ(deferred.size(), 2U);
+  ASSERT_EQ(deferred.size(), 1U);
 
   // Completing #2 sees the output went stale mid-build and kicks off #3.
   complete_latest("build 2");
   EXPECT_EQ(runs, 3);
-  ASSERT_EQ(deferred.size(), 3U);
+  ASSERT_EQ(deferred.size(), 2U);
 
   // #3 settles it: no further change arrived, so no rebuild #4.
   complete_latest("build 3");
   EXPECT_EQ(read_output(tree, "output.txt"), "build 3");
   EXPECT_EQ(runs, 3);
+}
+
+// Opening a dirty output waits for its rebuild; status() meanwhile reports the
+// previous build's size.
+TEST_F(BuildDirectoryTreeTest, OpeningADirtyOutputWaitsForItsRebuild) {
+  source.write_file("input.txt", "v1");
+  write_manifest("@/output.txt <- build %out\n");
+
+  const DeferredRunner builds;
+  const BuildDirectoryTree tree(source, builds.runner());
+  const auto result = [](std::string bytes) {
+    return BuildDirectoryTree::BuildOutput{.bytes = std::move(bytes),
+                                           .inputs = {"input.txt"}};
+  };
+
+  std::thread first([&] { EXPECT_EQ(read_output(tree, "output.txt"), "v1"); });
+  ASSERT_TRUE(builds.wait_for_runs(1));
+  builds.complete(result("v1"));
+  first.join();
+
+  // Starts an eager rebuild, held in flight.
+  source.write_file("input.txt", "v2 is longer");
+  ASSERT_TRUE(builds.wait_for_runs(2));
+  EXPECT_EQ(output_size(tree, "output.txt"), 2U);
+
+  std::atomic<bool> returned = false;
+  std::string content;
+  std::thread reader([&] {
+    content = read_output(tree, "output.txt");
+    returned = true;
+  });
+  // Its rebuild is still pending.
+  EXPECT_FALSE(returned);
+
+  builds.complete(result("v2 is longer"));
+  reader.join();
+  EXPECT_EQ(content, "v2 is longer");
+  EXPECT_EQ(builds.runs(), 2);
 }
 
 #if defined(_WIN32) || defined(__linux__)

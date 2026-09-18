@@ -123,9 +123,25 @@ class DirectoryTree {
   [[nodiscard]] virtual std::expected<std::vector<TreeEntry>, std::error_code>
   ls(const std::filesystem::path& path) const = 0;
 
+  /// Blocks until the file at @a path is final and returns its info, or an
+  /// error_code (`is_a_directory` for a directory). Unlike @link status, which
+  /// never blocks. The default reports @link status for a file.
+  [[nodiscard]] virtual std::expected<FileInfo, std::error_code> open(
+      const std::filesystem::path& path) const {
+    const std::expected<EntryInfo, std::error_code> info = status(path);
+    if (!info.has_value()) {
+      return std::unexpected(info.error());
+    }
+    if (const auto* file = std::get_if<FileInfo>(&*info)) {
+      return *file;
+    }
+    return std::unexpected(std::make_error_code(std::errc::is_a_directory));
+  }
+
   /// Returns up to @a size bytes of @a path starting at @a offset, or an
   /// error_code on failure. A result shorter than @a size means end of file. A
-  /// @a size of 0 succeeds with an empty result without opening @a path.
+  /// @a size of 0 succeeds with an empty result without opening @a path. Never
+  /// blocks; call @link open first for final contents.
   [[nodiscard]] virtual std::expected<std::string, std::error_code> read(
       const std::filesystem::path& path,
       Offset offset,
