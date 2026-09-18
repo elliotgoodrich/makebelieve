@@ -3,152 +3,259 @@
 
 #include "directorytree.hpp"
 
+#include <windows.h>
+
+#include <bcrypt.h>  // PNTSTATUS
+
+#include <winfsp/winfsp.h>
+
+#include <sddl.h>
+
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <expected>
 #include <filesystem>
 #include <functional>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include <objbase.h>
-#include <projectedfslib.h>
-#include <windows.h>
 
 namespace makebelieve {
 
 namespace {
 
-// Upper bound on one PrjAllocateAlignedBuffer allocation.
-constexpr UINT32 k_write_chunk_bytes = 1U << 20;
+// A nominal capacity to report for the volume. Nothing is ever written here,
+// so this only exists to keep tools that divide by it happy.
+constexpr UINT64 k_volume_size = UINT64{1} << 30;
 
-// PrjUpdateFileIfNeeded fails with ERROR_SHARING_VIOLATION when Windows is
-// still holding the cached section for a read that just completed.  So we
-// retry for a few times afterwards.
-constexpr int k_update_attempts = 5;
-constexpr std::chrono::milliseconds k_update_retry_delay{50};
+// The unit WinFsp's samples use for sector size and allocation rounding.
+constexpr UINT16 k_allocation_unit = 4096;
 
-// Flags shared by every update and delete issued here. Placeholders are
-// created read-only.
-constexpr PRJ_UPDATE_TYPES k_update_flags = static_cast<PRJ_UPDATE_TYPES>(
-    PRJ_UPDATE_ALLOW_DIRTY_METADATA | PRJ_UPDATE_ALLOW_READ_ONLY);
+// The longest name this filesystem will hand out, and the bound on the
+// over-allocated buffers below that carry one.
+constexpr UINT16 k_max_component_length = 255;
 
-struct GuidHash {
-  std::size_t operator()(const GUID& guid) const {
-    return std::hash<std::string_view>{}(
-        std::string_view(reinterpret_cast<const char*>(&guid), sizeof(guid)));
+// FspFileSystemNotifyBegin blocks concurrent renames, so it fails with
+// STATUS_CANT_WAIT while one is in flight. Renames cannot happen on a
+// read-only volume, but a retry is still cheaper than dropping the batch.
+constexpr ULONG k_notify_timeout_ms = 500;
+constexpr int k_notify_attempts = 5;
+constexpr std::chrono::milliseconds k_notify_retry_delay{50};
+
+// Full access for everyone, which is not the contradiction it looks like:
+// ReadOnlyVolume below is what actually makes the projection read-only, at the
+// volume level, and it does so whatever this says. Narrowing this instead
+// would only add a second, subtler way for a legitimate read to be refused.
+// This is the descriptor WinFsp's own samples use.
+constexpr wchar_t k_security_descriptor[] =
+    L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
+
+// Storage for one variable-length WinFsp record. Both FSP_FSCTL_DIR_INFO and
+// FSP_FSCTL_NOTIFY_INFO end in a flexible array member holding a name, so they
+// have to be over-allocated - and C++, unlike C, refuses to declare an object
+// of such a type at all. Reserving the bytes and laying the record over them
+// is how WinFsp's own C++ sample gets around that.
+template <typename Record, std::size_t NameChars>
+class RecordBuffer {
+  static constexpr std::size_t k_size =
+      sizeof(Record) + (NameChars * sizeof(WCHAR));
+
+  alignas(Record) std::array<unsigned char, k_size> m_storage{};
+
+ public:
+  // The name is written through here, so the caller needs the room it has.
+  static constexpr std::size_t max_name_chars = NameChars;
+
+  [[nodiscard]] Record* get() {
+    return reinterpret_cast<Record*>(m_storage.data());
   }
 };
 
-[[noreturn]] void throw_hresult(HRESULT hr, const char* what) {
-  throw std::system_error(static_cast<int>(hr), std::system_category(), what);
+// sizeof() is the offset of the trailing name in both records - the flexible
+// array member adds nothing to the size - which is what makes it the right
+// base for the Size field each one carries.
+static_assert(sizeof(FSP_FSCTL_DIR_INFO) ==
+              FIELD_OFFSET(FSP_FSCTL_DIR_INFO, FileNameBuf));
+static_assert(sizeof(FSP_FSCTL_NOTIFY_INFO) ==
+              FIELD_OFFSET(FSP_FSCTL_NOTIFY_INFO, FileNameBuf));
+
+using DirEntryBuffer = RecordBuffer<FSP_FSCTL_DIR_INFO, k_max_component_length>;
+using NotifyBuffer = RecordBuffer<FSP_FSCTL_NOTIFY_INFO, MAX_PATH>;
+
+[[noreturn]] void throw_status(NTSTATUS status, const char* what) {
+  // The tree, the standard library and every caller above us deal in Win32
+  // codes, so an NTSTATUS is translated here rather than leaking outwards.
+  throw std::system_error(static_cast<int>(FspWin32FromNtStatus(status)),
+                          std::system_category(), what);
 }
 
-// ProjFS names paths relative to the virtualization root with backslashes and
-// no leading separator, which is how the root itself becomes the empty
-// string.
-std::wstring to_projfs_path(std::filesystem::path path) {
+// WinFsp names paths from the volume root with backslashes and a leading
+// separator, which is how the root itself arrives as "\". A DirectoryTree
+// wants them relative to its own root, with the root as the empty path.
+std::filesystem::path to_tree_path(PWSTR name) {
+  std::wstring_view view(name);
+  if (!view.empty() && view.front() == L'\\') {
+    view.remove_prefix(1);
+  }
+  return {view};
+}
+
+// The reverse, for naming a path in a change notification.
+std::wstring to_volume_path(std::filesystem::path path) {
   path.make_preferred();
-  return path.wstring();
+  return L"\\" + path.wstring();
 }
 
 // MSVC's file_clock already counts 100ns ticks from the Windows epoch, which
-// is precisely what FILETIME and LARGE_INTEGER timestamps want.
-std::int64_t to_filetime(std::chrono::file_clock::time_point time) {
-  return time.time_since_epoch().count();
+// is precisely what every timestamp in FSP_FSCTL_FILE_INFO wants.
+UINT64 to_filetime(std::chrono::file_clock::time_point time) {
+  return static_cast<UINT64>(time.time_since_epoch().count());
 }
 
-// Packs size and mtime into the placeholder's ContentID.
-PRJ_PLACEHOLDER_VERSION_INFO make_version_info(std::int64_t size,
-                                               std::int64_t filetime) {
-  PRJ_PLACEHOLDER_VERSION_INFO version_info{};
-  static_assert(sizeof(version_info.ContentID) >= 2 * sizeof(std::int64_t));
-  std::memcpy(version_info.ContentID, &size, sizeof(size));
-  std::memcpy(version_info.ContentID + sizeof(size), &filetime,
-              sizeof(filetime));
-  return version_info;
+// The attributes a tree entry is projected with. No FILE_ATTRIBUTE_READONLY on
+// a directory, unlike a file: on a directory that flag does not mean "cannot
+// be modified" - Windows uses it to mark customised folders.
+UINT32 to_attributes(const EntryInfo& status) {
+  return std::holds_alternative<FileInfo>(status) ? FILE_ATTRIBUTE_READONLY
+                                                  : FILE_ATTRIBUTE_DIRECTORY;
 }
 
-// Describes a tree entry to ProjFS.
-PRJ_PLACEHOLDER_INFO make_placeholder_info(const EntryInfo& status) {
-  if (const auto* file = std::get_if<FileInfo>(&status)) {
-    const std::int64_t filetime = to_filetime(file->mtime);
-    const auto size = static_cast<std::int64_t>(file->size);
-    return {
-        .FileBasicInfo =
-            {
-                .IsDirectory = FALSE,
-                .FileSize = size,
-                .CreationTime = {.QuadPart = filetime},
-                .LastAccessTime = {.QuadPart = filetime},
-                .LastWriteTime = {.QuadPart = filetime},
-                .ChangeTime = {.QuadPart = filetime},
-                .FileAttributes = FILE_ATTRIBUTE_READONLY,
-            },
-        .VersionInfo = make_version_info(size, filetime),
-    };
-  }
-
-  const auto& directory = std::get<DirectoryInfo>(status);
-  const std::int64_t filetime = to_filetime(directory.mtime);
-
-  // No FILE_ATTRIBUTE_READONLY here, unlike files. On a directory that flag
-  // does not mean "cannot be modified" - Windows uses it to mark customised
-  // folders.
+// Describes a tree entry to WinFsp.
+FSP_FSCTL_FILE_INFO make_file_info(const EntryInfo& status) {
+  const auto* file = std::get_if<FileInfo>(&status);
+  const UINT64 size = file != nullptr ? file->size : 0;
+  const UINT64 time = to_filetime(
+      file != nullptr ? file->mtime : std::get<DirectoryInfo>(status).mtime);
   return {
-      .FileBasicInfo =
-          {
-              .IsDirectory = TRUE,
-              .FileSize = 0,
-              .CreationTime = {.QuadPart = filetime},
-              .LastAccessTime = {.QuadPart = filetime},
-              .LastWriteTime = {.QuadPart = filetime},
-              .ChangeTime = {.QuadPart = filetime},
-              .FileAttributes = FILE_ATTRIBUTE_DIRECTORY,
-          },
-      .VersionInfo = make_version_info(0, filetime),
+      .FileAttributes = to_attributes(status),
+      .AllocationSize = (size + k_allocation_unit - 1) / k_allocation_unit *
+                        k_allocation_unit,
+      .FileSize = size,
+      .CreationTime = time,
+      .LastAccessTime = time,
+      .LastWriteTime = time,
+      .ChangeTime = time,
   };
 }
 
-// Frees a PrjAllocateAlignedBuffer allocation on scope exit. PrjWriteFileData
-// requires the storage device's alignment, which is why the buffer cannot
-// simply come from the allocator.
-class AlignedBuffer {
-  PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT m_context;
-  void* m_buffer;
-
- public:
-  AlignedBuffer(PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT context, UINT32 size)
-      : m_context(context), m_buffer(PrjAllocateAlignedBuffer(context, size)) {}
-
-  ~AlignedBuffer() {
-    if (m_buffer != nullptr) {
-      PrjFreeAlignedBuffer(m_buffer);
-    }
-  }
-
-  AlignedBuffer(const AlignedBuffer&) = delete;
-  AlignedBuffer& operator=(const AlignedBuffer&) = delete;
-  AlignedBuffer(AlignedBuffer&&) = delete;
-  AlignedBuffer& operator=(AlignedBuffer&&) = delete;
-
-  [[nodiscard]] void* get() const { return m_buffer; }
+// The NTSTATUS each portable error condition surfaces as. Windows has no
+// errno-to-NTSTATUS translation of its own, so this is the one place that
+// spells it out.
+struct ErrcStatus {
+  std::errc condition;
+  NTSTATUS status;
 };
 
-// Readies `mountpoint` to be virtualized over: creates it (parents included)
-// if absent, accepts it if it is an existing empty directory, and refuses
-// anything else.
+constexpr std::array k_errc_statuses{
+    ErrcStatus{.condition = std::errc::no_such_file_or_directory,
+               .status = STATUS_OBJECT_NAME_NOT_FOUND},
+    ErrcStatus{.condition = std::errc::permission_denied,
+               .status = STATUS_ACCESS_DENIED},
+    ErrcStatus{.condition = std::errc::operation_not_permitted,
+               .status = STATUS_ACCESS_DENIED},
+    ErrcStatus{.condition = std::errc::is_a_directory,
+               .status = STATUS_FILE_IS_A_DIRECTORY},
+    ErrcStatus{.condition = std::errc::not_a_directory,
+               .status = STATUS_NOT_A_DIRECTORY},
+    ErrcStatus{.condition = std::errc::invalid_argument,
+               .status = STATUS_INVALID_PARAMETER},
+    ErrcStatus{.condition = std::errc::file_exists,
+               .status = STATUS_OBJECT_NAME_COLLISION},
+    ErrcStatus{.condition = std::errc::directory_not_empty,
+               .status = STATUS_DIRECTORY_NOT_EMPTY},
+    ErrcStatus{.condition = std::errc::filename_too_long,
+               .status = STATUS_NAME_TOO_LONG},
+    ErrcStatus{.condition = std::errc::not_enough_memory,
+               .status = STATUS_INSUFFICIENT_RESOURCES},
+    ErrcStatus{.condition = std::errc::no_space_on_device,
+               .status = STATUS_DISK_FULL},
+    ErrcStatus{.condition = std::errc::read_only_file_system,
+               .status = STATUS_MEDIA_WRITE_PROTECTED},
+    ErrcStatus{.condition = std::errc::device_or_resource_busy,
+               .status = STATUS_DEVICE_BUSY},
+    ErrcStatus{.condition = std::errc::too_many_files_open,
+               .status = STATUS_TOO_MANY_OPENED_FILES},
+    ErrcStatus{.condition = std::errc::operation_canceled,
+               .status = STATUS_CANCELLED},
+    ErrcStatus{.condition = std::errc::timed_out, .status = STATUS_IO_TIMEOUT},
+    ErrcStatus{.condition = std::errc::io_error,
+               .status = STATUS_IO_DEVICE_ERROR},
+    ErrcStatus{.condition = std::errc::function_not_supported,
+               .status = STATUS_NOT_SUPPORTED},
+    ErrcStatus{.condition = std::errc::not_supported,
+               .status = STATUS_NOT_SUPPORTED},
+    ErrcStatus{.condition = std::errc::operation_not_supported,
+               .status = STATUS_NOT_SUPPORTED},
+};
+
+// Translates a tree error into the NTSTATUS WinFsp expects. The two
+// DirectoryTree implementations report from different categories -
+// RealDirectoryTree hands back Win32 codes, the in-memory trees hand back
+// std::errc - so each is translated on its own terms rather than feeding a
+// POSIX errno to a function that expects a Win32 error. Anything else is
+// matched by the portable condition it is equivalent to.
+NTSTATUS to_ntstatus(const std::error_code& error) {
+  if (error.category() == std::system_category()) {
+    return FspNtStatusFromWin32(static_cast<DWORD>(error.value()));
+  }
+  for (const ErrcStatus& entry : k_errc_statuses) {
+    if (error == entry.condition) {
+      return entry.status;
+    }
+  }
+  return STATUS_UNSUCCESSFUL;
+}
+
+// An absolute mountpoint with no trailing separator. `mnt\` names the same
+// directory as `mnt`, but its parent_path() is `mnt` itself - which would have
+// create_mountpoint make the very directory WinFsp needs to create - and WinFsp
+// crashes when handed a mount point spelled with the separator.
+std::filesystem::path normalize_mountpoint(
+    const std::filesystem::path& mountpoint) {
+  std::filesystem::path result =
+      std::filesystem::absolute(mountpoint).lexically_normal();
+  while (!result.has_filename() && result.has_relative_path()) {
+    result = result.parent_path();
+  }
+  return result;
+}
+
+// How a change is announced. An addition dominates a modification when the two
+// coalesce: a watcher that never heard of the new name only makes sense of an
+// "added".
+enum class ChangeKind : std::uint8_t { modified, added };
+
+using Changes = std::map<std::filesystem::path, ChangeKind>;
+
+// Folds @a from into @a into, keeping the dominant kind for a repeated path.
+void merge_changes(Changes& into, const Changes& from) {
+  for (const auto& [path, kind] : from) {
+    const auto [it, inserted] = into.try_emplace(path, kind);
+    if (!inserted && kind == ChangeKind::added) {
+      it->second = ChangeKind::added;
+    }
+  }
+}
+
+// Readies `mountpoint` for WinFsp, which creates the mount directory itself -
+// as a reparse point into the volume - and removes it again on unmount. So
+// unlike a provider that virtualizes an existing directory, this refuses a
+// path that is already there and only makes sure the parent exists for WinFsp
+// to create into.
 void create_mountpoint(const std::filesystem::path& mountpoint) {
   std::error_code error;
   if (std::filesystem::exists(mountpoint, error)) {
@@ -157,86 +264,181 @@ void create_mountpoint(const std::filesystem::path& mountpoint) {
         std::make_error_code(std::errc::file_exists));
   }
 
-  // Call create_directories to create parents as well.
-  std::filesystem::create_directories(mountpoint, error);
+  const std::filesystem::path parent = mountpoint.parent_path();
+  if (parent.empty()) {
+    return;
+  }
+  std::filesystem::create_directories(parent, error);
   if (error) {
     throw std::filesystem::filesystem_error("could not create mountpoint",
                                             mountpoint, error);
   }
 }
 
-// Removes a mountpoint this provider created.
+// Removes whatever is left of the mount directory once the filesystem has
+// stopped. WinFsp normally takes it away with the mount, so this is only here
+// to catch the case where it did not.
 void remove_mountpoint(const std::filesystem::path& mountpoint) noexcept {
   std::error_code error;
-  for (std::filesystem::recursive_directory_iterator it(mountpoint, error), end;
-       it != end; it.increment(error)) {
-    if (error) {
-      break;
-    }
-    std::filesystem::permissions(it->path(),
-                                 std::filesystem::perms::owner_write,
-                                 std::filesystem::perm_options::add, error);
-  }
-  std::filesystem::remove_all(mountpoint, error);
+  std::filesystem::remove(mountpoint, error);
 }
+
+// The single security descriptor every entry in this filesystem reports,
+// built once from SDDL and freed on destruction.
+class SecurityDescriptor {
+  PSECURITY_DESCRIPTOR m_descriptor = nullptr;
+  ULONG m_size = 0;
+
+ public:
+  SecurityDescriptor() {
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            k_security_descriptor, SDDL_REVISION_1, &m_descriptor, &m_size)) {
+      throw std::system_error(static_cast<int>(GetLastError()),
+                              std::system_category(),
+                              "ConvertStringSecurityDescriptorToSecurityDescri"
+                              "ptorW failed");
+    }
+  }
+
+  ~SecurityDescriptor() {
+    if (m_descriptor != nullptr) {
+      LocalFree(m_descriptor);
+    }
+  }
+
+  SecurityDescriptor(const SecurityDescriptor&) = delete;
+  SecurityDescriptor& operator=(const SecurityDescriptor&) = delete;
+  SecurityDescriptor(SecurityDescriptor&&) = delete;
+  SecurityDescriptor& operator=(SecurityDescriptor&&) = delete;
+
+  [[nodiscard]] PSECURITY_DESCRIPTOR get() const { return m_descriptor; }
+  [[nodiscard]] SIZE_T size() const { return m_size; }
+};
 
 }  // namespace
 
-// ProjFS provider over a DirectoryTree.
+// WinFsp provider over a DirectoryTree.
 //
-// ProjFS dispatches callbacks on its own pool threads, concurrently, so every
+// WinFsp dispatches operations on its own pool threads, concurrently, so every
 // member here is either immutable after construction or guarded. The tree's
 // own const-means-thread-safe contract is what makes querying it from those
 // threads sound.
 class VirtualFileSystem::Impl {
  public:
+  // Selects the constructor that claims the mountpoint and starts nothing, so
+  // that the one below can delegate to it.
+  struct Unstarted {};
+
+  // Delegates first, so that once the mountpoint is claimed the object counts
+  // as constructed: anything below that throws still runs ~Impl, which tears
+  // down exactly the parts that got started.
   Impl(const DirectoryTree& tree, const std::filesystem::path& mountpoint)
-      : m_tree(tree), m_root(to_projfs_path(mountpoint)) {
-    // Create the mountpoint fresh, failing if it already exists - see
-    // create_mountpoint. Because we always create it, teardown can always
-    // remove it.
-    create_mountpoint(mountpoint);
-
-    GUID instance_id;
-    if (const HRESULT hr = ::CoCreateGuid(&instance_id); FAILED(hr)) {
-      throw_hresult(hr, "CoCreateGuid");
-    }
-    if (const HRESULT hr = PrjMarkDirectoryAsPlaceholder(
-            m_root.c_str(), nullptr, nullptr, &instance_id);
-        FAILED(hr)) {
-      throw_hresult(hr, "PrjMarkDirectoryAsPlaceholder");
+      : Impl(tree, mountpoint, Unstarted{}) {
+    // WinFsp's DLL lives in its own install directory rather than anywhere the
+    // loader searches, so the import library is delay-loaded and this is what
+    // resolves it. It has to run before any other WinFsp call, and it is what
+    // turns "WinFsp is not installed" into a diagnosable error rather than a
+    // loader failure before main().
+    if (const NTSTATUS status = FspLoad(nullptr); !NT_SUCCESS(status)) {
+      throw_status(status, "FspLoad failed; is WinFsp installed?");
     }
 
-    const PRJ_CALLBACKS callbacks = {
-        .StartDirectoryEnumerationCallback = trampoline<&Impl::start_enum>,
-        .EndDirectoryEnumerationCallback = trampoline<&Impl::end_enum>,
-        .GetDirectoryEnumerationCallback = trampoline<&Impl::get_enum>,
-        .GetPlaceholderInfoCallback = trampoline<&Impl::get_placeholder_info>,
-        .GetFileDataCallback = trampoline<&Impl::get_file_data>,
+    const UINT64 created = to_filetime(std::chrono::file_clock::now());
+    const FSP_FSCTL_VOLUME_PARAMS params = {
+        .SectorSize = k_allocation_unit,
+        .SectorsPerAllocationUnit = 1,
+        .MaxComponentLength = k_max_component_length,
+        .VolumeCreationTime = created,
+        .VolumeSerialNumber = static_cast<UINT32>(created >> 16U),
+        // No metadata caching at all: every stat and every read reaches the
+        // tree, which is what lets a lazily built output be correct the moment
+        // it is asked for rather than whenever an invalidation catches up.
+        .FileInfoTimeout = 0,
+        // Case-sensitive, because the tree is: a lookup reaches it with the
+        // case the caller typed and it matches exactly. Declaring otherwise
+        // has Windows promise case-insensitive lookups the tree cannot keep,
+        // and also changes what FspFileSystemNotify expects names to look like
+        // - a case-insensitive volume that does not normalize names must
+        // announce them upper-cased, and anything else below the root is
+        // silently dropped.
+        .CaseSensitiveSearch = 1,
+        .CasePreservedNames = 1,
+        .UnicodeOnDisk = 1,
+        .PersistentAcls = 0,
+        // The whole projection is read-only; this is what enforces it, so no
+        // operation below has to check.
+        .ReadOnlyVolume = 1,
+        // Every Cleanup reaches user mode, not only those for modified files:
+        // the last handle closing is what releases notifications held back
+        // for an open file (see cleanup()).
+        .PostCleanupWhenModifiedOnly = 0,
+        // The context open() hands back is one OpenFile per handle, not one
+        // per file. By default WinFsp assumes the latter - every open of a
+        // name must return the same pointer while any handle to it is live -
+        // and it keeps just one of them per file, closing that one pointer
+        // once per handle. Handing it a fresh OpenFile each time then
+        // double-frees whenever two handles to one file overlap. This flag
+        // makes the context per-handle, which is what OpenFile, its directory
+        // buffer and m_open_counts assume.
+        .UmFileContextIsUserContext2 = 1,
+        .FileSystemName = L"makebelieve",
     };
 
-    if (const HRESULT hr = PrjStartVirtualizing(m_root.c_str(), &callbacks,
-                                                this, nullptr, &m_context);
-        FAILED(hr)) {
-      throw_hresult(hr, "PrjStartVirtualizing");
+    // FspFileSystemCreate takes a mutable pointer it never writes through, so
+    // the name is spelled as a string rather than cast from a literal.
+    std::wstring device(L"" FSP_FSCTL_DISK_DEVICE_NAME);
+    if (const NTSTATUS status = FspFileSystemCreate(
+            device.data(), &params, &interface_table(), &m_filesystem);
+        !NT_SUCCESS(status)) {
+      throw_status(status, "FspFileSystemCreate failed");
     }
+    m_filesystem->UserContext = this;
+
+    if (const NTSTATUS status =
+            FspFileSystemSetMountPoint(m_filesystem, m_root.data());
+        !NT_SUCCESS(status)) {
+      throw_status(status, "FspFileSystemSetMountPoint failed");
+    }
+    m_mounted = true;
+
+    // 0 asks for WinFsp's default thread count, which is what every sample
+    // uses and scales with the machine.
+    if (const NTSTATUS status = FspFileSystemStartDispatcher(m_filesystem, 0);
+        !NT_SUCCESS(status)) {
+      throw_status(status, "FspFileSystemStartDispatcher failed");
+    }
+    m_dispatching = true;
 
     // The notifier has to be running before a change can be queued for it, and
-    // the subscription is taken last so no notification can arrive before there
-    // is a context to service it with.
+    // the subscription is taken last so no notification can arrive before
+    // there is a filesystem to announce it through.
     m_notifier = std::thread([this]() { notify_loop(); });
     m_subscription.emplace(m_tree.subscribe_to_changes(
         [this](const DirectoryTreeDiff& diff) { on_tree_changed(diff); }));
   }
 
+  // Absolute, because WinFsp holds the mount point for as long as the
+  // filesystem lives, by which time the process's working directory may have
+  // moved on from whatever made a relative path meaningful. Fails unless it
+  // can claim the path fresh - see create_mountpoint - so teardown only ever
+  // removes what this object brought into being.
+  Impl(const DirectoryTree& tree,
+       const std::filesystem::path& mountpoint,
+       Unstarted)
+      : m_tree(tree),
+        m_mountpoint(normalize_mountpoint(mountpoint)),
+        m_root(m_mountpoint.wstring()) {
+    create_mountpoint(m_mountpoint);
+  }
+
   ~Impl() {
-    // Unsubscribe first: a notification landing after PrjStopVirtualizing
-    // would call into a torn-down context.
+    // Unsubscribe first: a notification landing after the dispatcher stops
+    // would call into a torn-down filesystem.
     m_subscription.reset();
 
-    // Then stop the notifier and wait for it to drain. It calls
-    // PrjUpdateFileIfNeeded/PrjDeleteFile against m_context, so it has to be
-    // gone before PrjStopVirtualizing tears that context down.
+    // Then stop the notifier and wait for it to drain. It issues
+    // FspFileSystemNotify against m_filesystem, so it has to be gone before
+    // that object is deleted.
     {
       const std::lock_guard<std::mutex> lock(m_notify_mutex);
       m_stopping = true;
@@ -246,15 +448,24 @@ class VirtualFileSystem::Impl {
       m_notifier.join();
     }
 
-    if (m_context != nullptr) {
-      PrjStopVirtualizing(m_context);
+    if (m_filesystem != nullptr) {
+      if (m_dispatching) {
+        FspFileSystemStopDispatcher(m_filesystem);
+      }
+      if (m_mounted) {
+        // Takes the mount directory with it. Done before the delete below so
+        // that reaching the end of this destructor really does mean the mount
+        // is gone, which is what this class promises.
+        FspFileSystemRemoveMountPoint(m_filesystem);
+      }
+      FspFileSystemDelete(m_filesystem);
     }
-    // Remove the mountpoint we created. Symmetric with the constructor, which
-    // fails unless it created the directory fresh, so this always deletes only
-    // what this provider made. It runs after PrjStopVirtualizing, since the
-    // placeholders become ordinary, deletable files only once virtualization
-    // has stopped.
-    remove_mountpoint(std::filesystem::path(m_root));
+
+    // Only once WinFsp has had the path: before that nothing here created it,
+    // and whatever is there is not ours to remove.
+    if (m_mounted) {
+      remove_mountpoint(m_mountpoint);
+    }
   }
 
   Impl(const Impl&) = delete;
@@ -262,192 +473,54 @@ class VirtualFileSystem::Impl {
   Impl(Impl&&) = delete;
   Impl& operator=(Impl&&) = delete;
 
-  // Snapshots the directory being enumerated.
-  //
-  // The snapshot is taken once here rather than re-queried per batch: ProjFS
-  // drives one enumeration across as many GetDirectoryEnumeration calls as it
-  // takes to drain, and a listing that shifted underneath those calls could
-  // duplicate or skip entries.
-  HRESULT start_enum(const PRJ_CALLBACK_DATA* data,
-                     const GUID* enumeration_id) {
-    std::expected<std::vector<TreeEntry>, std::error_code> entries =
-        m_tree.ls(std::filesystem::path(data->FilePathName));
-    if (!entries.has_value()) {
-      return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
-    }
-
-    Enumeration session;
-    session.entries = std::move(*entries);
-
-    // ProjFS requires entries in PrjFileNameCompare order, and a provider that
-    // returns them in any other order gets silently wrong directory listings.
-    std::sort(session.entries.begin(), session.entries.end(),
-              [](const TreeEntry& left, const TreeEntry& right) {
-                return PrjFileNameCompare(left.name.c_str(),
-                                          right.name.c_str()) < 0;
-              });
-
-    const std::lock_guard<std::mutex> lock(m_enum_mutex);
-    m_enumerations[*enumeration_id] = std::move(session);
-    return S_OK;
-  }
-
-  HRESULT end_enum(const PRJ_CALLBACK_DATA*, const GUID* enumeration_id) {
-    const std::lock_guard<std::mutex> lock(m_enum_mutex);
-    m_enumerations.erase(*enumeration_id);
-    return S_OK;
-  }
-
-  // Fills one batch of entries, resuming where the previous call stopped.
-  HRESULT get_enum(const PRJ_CALLBACK_DATA* data,
-                   const GUID* enumeration_id,
-                   PCWSTR search_expression,
-                   PRJ_DIR_ENTRY_BUFFER_HANDLE buffer) {
-    const std::lock_guard<std::mutex> lock(m_enum_mutex);
-    const auto it = m_enumerations.find(*enumeration_id);
-    if (it == m_enumerations.end()) {
-      return E_INVALIDARG;
-    }
-    Enumeration& session = it->second;
-
-    // Starting and restarting are the same operation - rewind the cursor and
-    // take the filter - so they share a branch. A restart carrying no
-    // expression is an unfiltered restart rather than a request to keep the
-    // previous one, matching the NtQueryDirectoryFile RestartScan semantics
-    // this callback sits on top of.
-    const bool restart =
-        (data->Flags & PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN) != 0;
-    if (restart || !session.next.has_value()) {
-      session.next = 0;
-      session.search = search_expression != nullptr
-                           ? std::optional<std::wstring>(search_expression)
-                           : std::nullopt;
-    }
-
-    std::size_t& next = *session.next;
-    while (next < session.entries.size()) {
-      const TreeEntry& entry = session.entries[next];
-      const std::wstring name = entry.name.filename().wstring();
-
-      // Deliberately the captured filter, never the parameter - see
-      // Enumeration::search.
-      if (session.search.has_value() &&
-          !PrjFileNameMatch(name.c_str(), session.search->c_str())) {
-        ++next;
-        continue;
-      }
-
-      PRJ_PLACEHOLDER_INFO info = make_placeholder_info(entry.info);
-      if (FAILED(PrjFillDirEntryBuffer(name.c_str(), &info.FileBasicInfo,
-                                       buffer))) {
-        // The buffer is full. Returning success without advancing leaves this
-        // entry as the first one the next call emits.
-        return S_OK;
-      }
-      ++next;
-    }
-    return S_OK;
-  }
-
-  // Reports an entry's metadata so ProjFS can create its placeholder.
-  HRESULT get_placeholder_info(const PRJ_CALLBACK_DATA* data) {
-    const std::filesystem::path path(data->FilePathName);
-    const std::expected<EntryInfo, std::error_code> status =
-        m_tree.status(path);
-    if (!status.has_value()) {
-      return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
-    }
-
-    const PRJ_PLACEHOLDER_INFO info = make_placeholder_info(*status);
-    const HRESULT hr =
-        PrjWritePlaceholderInfo(data->NamespaceVirtualizationContext,
-                                data->FilePathName, &info, sizeof(info));
-    if (SUCCEEDED(hr)) {
-      const std::lock_guard<std::mutex> lock(m_placeholder_mutex);
-      m_placeholders.insert(path);
-    }
-    return hr;
-  }
-
-  // Hydrates a placeholder from the tree.
-  HRESULT get_file_data(const PRJ_CALLBACK_DATA* data,
-                        UINT64 byte_offset,
-                        UINT32 length) {
-    const std::filesystem::path path(data->FilePathName);
-
-    const UINT32 capacity = std::min<UINT32>(length, k_write_chunk_bytes);
-    const AlignedBuffer buffer(data->NamespaceVirtualizationContext, capacity);
-    if (buffer.get() == nullptr) {
-      return E_OUTOFMEMORY;
-    }
-
-    for (UINT32 written = 0; written < length;) {
-      const UINT32 chunk = std::min<UINT32>(capacity, length - written);
-      const UINT64 offset = byte_offset + written;
-
-      const std::expected<std::string, std::error_code> bytes =
-          m_tree.read(path, static_cast<Offset>(offset), chunk);
-      if (!bytes.has_value()) {
-        // read() carries an OS error code; forward it as an HRESULT the same
-        // way the old throwing path did through the trampoline's catch.
-        return HRESULT_FROM_WIN32(static_cast<DWORD>(bytes.error().value()));
-      }
-
-      std::memset(buffer.get(), 0, chunk);
-      if (!bytes->empty()) {
-        std::memcpy(buffer.get(), bytes->data(),
-                    std::min<std::size_t>(bytes->size(), chunk));
-      }
-
-      const HRESULT hr =
-          PrjWriteFileData(data->NamespaceVirtualizationContext,
-                           &data->DataStreamId, buffer.get(), offset, chunk);
-      if (FAILED(hr)) {
-        return hr;
-      }
-      written += chunk;
-    }
-    return S_OK;
-  }
-
  private:
-  // One in-flight directory enumeration.
-  struct Enumeration {
-    std::vector<TreeEntry> entries;
+  // What Open hands back to WinFsp and every later operation on that handle
+  // hands us - one per handle, see UmFileContextIsUserContext2. It holds the
+  // path rather than a snapshot of the entry, so a read through a long-lived
+  // handle sees the tree as it is now rather than as it was when the file was
+  // opened - which is the whole point of a build that fills the file in later.
+  struct OpenFile {
+    std::filesystem::path path;
 
-    // Cursor into `entries`, unset until the first GetDirectoryEnumeration
-    // call for this session. Unset doubles as "the filter below has not been
-    // captured yet" - the two are always set together, so tracking it
-    // separately would only create a state where they could disagree.
-    std::optional<std::size_t> next;
+    // WinFsp's directory buffer: filled on the first ReadDirectory for this
+    // handle, then read back from in sorted, resumable order.
+    PVOID directory_buffer = nullptr;
 
-    // The session's filter, owned rather than borrowed. ProjFS only
-    // guarantees a search expression on the first call for a session and may
-    // pass nullptr on later ones, so it has to be captured; and the string it
-    // points at only lives for the duration of that callback, so it has to be
-    // copied. Empty optional means the session is unfiltered, which is
-    // distinct from a filter that happens to be an empty string.
-    std::optional<std::wstring> search;
+    // Whether this handle is still counted in m_open_counts. Cleared by
+    // whichever of cleanup() and close() gets there first.
+    bool counted = false;
   };
 
-  // Bridges a PRJ_* C callback to a member function, recovering the instance
-  // from PRJ_CALLBACK_DATA::InstanceContext.
+  // Bridges an FSP_FILE_SYSTEM_INTERFACE C callback to a member function,
+  // recovering the instance from FSP_FILE_SYSTEM::UserContext.
   template <auto MemFn>
   struct Bridge;
 
-  template <typename... Args,
-            HRESULT (Impl::*MemFn)(const PRJ_CALLBACK_DATA*, Args...)>
+  template <typename... Args, NTSTATUS (Impl::*MemFn)(Args...)>
   struct Bridge<MemFn> {
-    static HRESULT CALLBACK call(const PRJ_CALLBACK_DATA* data, Args... args) {
+    static NTSTATUS call(FSP_FILE_SYSTEM* filesystem, Args... args) {
       try {
-        auto* self = static_cast<Impl*>(data->InstanceContext);
-        return (self->*MemFn)(data, args...);
+        auto* self = static_cast<Impl*>(filesystem->UserContext);
+        return (self->*MemFn)(args...);
       } catch (const std::bad_alloc&) {
-        return E_OUTOFMEMORY;
+        return STATUS_INSUFFICIENT_RESOURCES;
       } catch (const std::system_error& error) {
-        return HRESULT_FROM_WIN32(static_cast<DWORD>(error.code().value()));
+        return to_ntstatus(error.code());
       } catch (...) {
-        return E_FAIL;
+        return STATUS_UNSUCCESSFUL;
+      }
+    }
+  };
+
+  template <typename... Args, VOID (Impl::*MemFn)(Args...)>
+  struct Bridge<MemFn> {
+    static VOID call(FSP_FILE_SYSTEM* filesystem, Args... args) {
+      try {
+        auto* self = static_cast<Impl*>(filesystem->UserContext);
+        (self->*MemFn)(args...);
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+        // Cleanup and Close are the void operations, and neither has
+        // anywhere to report a failure to.
       }
     }
   };
@@ -455,15 +528,305 @@ class VirtualFileSystem::Impl {
   template <auto MemFn>
   static constexpr auto trampoline = Bridge<MemFn>::call;
 
+  // The operations this filesystem implements. Everything left out is
+  // unsupported, which for a read-only projection is most of the interface.
+  // FspFileSystemCreate keeps the pointer rather than copying, so this outlives
+  // every filesystem built from it.
+  static const FSP_FILE_SYSTEM_INTERFACE& interface_table() {
+    static const FSP_FILE_SYSTEM_INTERFACE table = {
+        .GetVolumeInfo = trampoline<&Impl::get_volume_info>,
+        .GetSecurityByName = trampoline<&Impl::get_security_by_name>,
+        .Create = trampoline<&Impl::create>,
+        .Open = trampoline<&Impl::open>,
+        .Overwrite = trampoline<&Impl::overwrite>,
+        .Cleanup = trampoline<&Impl::cleanup>,
+        .Close = trampoline<&Impl::close>,
+        .Read = trampoline<&Impl::read>,
+        .GetFileInfo = trampoline<&Impl::get_file_info>,
+        .CanDelete = trampoline<&Impl::can_delete>,
+        .ReadDirectory = trampoline<&Impl::read_directory>,
+    };
+    return table;
+  }
+
+  NTSTATUS get_volume_info(FSP_FSCTL_VOLUME_INFO* info) {
+    *info = {
+        .TotalSize = k_volume_size,
+        .FreeSize = 0,  // nothing can ever be written here
+        // In bytes, and without the terminator the literal carries.
+        .VolumeLabelLength = sizeof(L"makebelieve") - sizeof(WCHAR),
+        .VolumeLabel = L"makebelieve",
+    };
+    return STATUS_SUCCESS;
+  }
+
+  // Answers "does this path exist, and who may touch it" without opening
+  // anything. WinFsp calls this while resolving a path, so it runs for every
+  // component on the way to a file as well as for the file itself.
+  NTSTATUS get_security_by_name(PWSTR name,
+                                PUINT32 attributes,
+                                PSECURITY_DESCRIPTOR descriptor,
+                                SIZE_T* descriptor_size) {
+    const std::expected<EntryInfo, std::error_code> status =
+        m_tree.status(to_tree_path(name));
+    if (!status.has_value()) {
+      return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
+    if (attributes != nullptr) {
+      *attributes = to_attributes(*status);
+    }
+    if (descriptor_size != nullptr) {
+      if (m_security.size() > *descriptor_size) {
+        // Asks WinFsp to come back with a buffer this big.
+        *descriptor_size = m_security.size();
+        return STATUS_BUFFER_OVERFLOW;
+      }
+      *descriptor_size = m_security.size();
+      if (descriptor != nullptr) {
+        std::memcpy(descriptor, m_security.get(), m_security.size());
+      }
+    }
+    return STATUS_SUCCESS;
+  }
+
+  // Nothing here can be created or truncated, and ReadOnlyVolume means the FSD
+  // turns such a request away before it ever reaches user mode. These two exist
+  // anyway because WinFsp treats Create, Open and Overwrite as one block and
+  // refuses to dispatch a create request at all - a plain FILE_OPEN of an
+  // existing file included - unless all three are wired. Leaving either out
+  // fails every open with STATUS_INVALID_DEVICE_REQUEST.
+  NTSTATUS create(PWSTR,
+                  UINT32,
+                  UINT32,
+                  UINT32,
+                  PSECURITY_DESCRIPTOR,
+                  UINT64,
+                  PVOID*,
+                  FSP_FSCTL_FILE_INFO*) {
+    return STATUS_MEDIA_WRITE_PROTECTED;
+  }
+
+  NTSTATUS overwrite(PVOID, UINT32, BOOLEAN, UINT64, FSP_FSCTL_FILE_INFO*) {
+    return STATUS_MEDIA_WRITE_PROTECTED;
+  }
+
+  NTSTATUS open(PWSTR name,
+                UINT32 create_options,
+                UINT32 /*granted_access*/,
+                PVOID* file_context,
+                FSP_FSCTL_FILE_INFO* file_info) {
+    const std::filesystem::path path = to_tree_path(name);
+    const std::expected<EntryInfo, std::error_code> status =
+        m_tree.status(path);
+    if (!status.has_value()) {
+      return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
+    const bool is_directory = std::holds_alternative<DirectoryInfo>(*status);
+    if (is_directory && (create_options & FILE_NON_DIRECTORY_FILE) != 0) {
+      return STATUS_FILE_IS_A_DIRECTORY;
+    }
+    if (!is_directory && (create_options & FILE_DIRECTORY_FILE) != 0) {
+      return STATUS_NOT_A_DIRECTORY;
+    }
+
+    auto handle = std::make_unique<OpenFile>();
+    handle->path = path;
+    if (!is_directory) {
+      remember(path);
+      const std::lock_guard<std::mutex> lock(m_open_mutex);
+      ++m_open_counts[path];
+      handle->counted = true;
+    }
+
+    *file_info = make_file_info(*status);
+    *file_context = handle.release();
+    return STATUS_SUCCESS;
+  }
+
+  // The handle is gone from the process that held it. The file itself can
+  // outlive this - a memory mapping keeps it referenced, and Close only comes
+  // once the mapping goes too - so this, not close(), is where the handle
+  // stops counting as open.
+  VOID cleanup(PVOID file_context, PWSTR /*name*/, ULONG /*flags*/) {
+    uncount(*static_cast<OpenFile*>(file_context));
+  }
+
+  // Normally leaves the count alone, since cleanup() already dropped it; it
+  // still covers a handle WinFsp closes without cleaning it up first.
+  VOID close(PVOID file_context) {
+    const std::unique_ptr<OpenFile> handle(
+        static_cast<OpenFile*>(file_context));
+    FspFileSystemDeleteDirectoryBuffer(&handle->directory_buffer);
+    uncount(*handle);
+  }
+
+  // Nothing can be deleted. ReadOnlyVolume refuses writes and a file's
+  // read-only attribute refuses its deletion, but neither covers deleting a
+  // directory: without this, that reports success and does nothing.
+  NTSTATUS can_delete(PVOID /*file_context*/, PWSTR /*name*/) {
+    return STATUS_MEDIA_WRITE_PROTECTED;
+  }
+
+  // Drops @a handle from m_open_counts, once, and lets out any notification
+  // held back for its file if it was the last handle on it.
+  void uncount(OpenFile& handle) {
+    bool last = false;
+    {
+      const std::lock_guard<std::mutex> lock(m_open_mutex);
+      if (!std::exchange(handle.counted, false)) {
+        return;
+      }
+      const auto it = m_open_counts.find(handle.path);
+      if (it != m_open_counts.end() && --it->second <= 0) {
+        m_open_counts.erase(it);
+        last = true;
+      }
+    }
+    // Outside m_open_mutex: this runs on a dispatcher thread, and the notifier
+    // takes these two locks the other way round.
+    if (last) {
+      release_deferred(handle.path);
+    }
+  }
+
+  NTSTATUS read(PVOID file_context,
+                PVOID buffer,
+                UINT64 offset,
+                ULONG length,
+                PULONG bytes_transferred) {
+    const auto* handle = static_cast<const OpenFile*>(file_context);
+    const std::expected<std::string, std::error_code> bytes =
+        m_tree.read(handle->path, static_cast<Offset>(offset), length);
+    if (!bytes.has_value()) {
+      return to_ntstatus(bytes.error());
+    }
+    if (bytes->empty()) {
+      // read() promises only "up to size bytes", and nothing at all is how it
+      // spells a read that started at or past the end of the file.
+      return STATUS_END_OF_FILE;
+    }
+
+    const auto count =
+        static_cast<ULONG>(std::min<std::size_t>(length, bytes->size()));
+    std::memcpy(buffer, bytes->data(), count);
+    *bytes_transferred = count;
+    return STATUS_SUCCESS;
+  }
+
+  // Re-queries rather than reporting what Open saw, so a file that was built
+  // while this handle was open reports its real size here. FileInfoTimeout is
+  // 0, so Windows asks every time rather than trusting a cached answer.
+  NTSTATUS get_file_info(PVOID file_context, FSP_FSCTL_FILE_INFO* file_info) {
+    const auto* handle = static_cast<const OpenFile*>(file_context);
+    const std::expected<EntryInfo, std::error_code> status =
+        m_tree.status(handle->path);
+    if (!status.has_value()) {
+      return to_ntstatus(status.error());
+    }
+    *file_info = make_file_info(*status);
+    return STATUS_SUCCESS;
+  }
+
+  // Lists a directory through WinFsp's directory buffer, which is what makes
+  // an unordered ls() usable: it sorts what goes in and resumes from `marker`
+  // on the calls that drain it. The buffer is filled once per handle, so a
+  // listing cannot duplicate or skip entries because the tree shifted halfway
+  // through being read out.
+  NTSTATUS read_directory(PVOID file_context,
+                          PWSTR /*pattern*/,
+                          PWSTR marker,
+                          PVOID buffer,
+                          ULONG length,
+                          PULONG bytes_transferred) {
+    auto* handle = static_cast<OpenFile*>(file_context);
+
+    NTSTATUS result = STATUS_SUCCESS;
+    if (FspFileSystemAcquireDirectoryBuffer(&handle->directory_buffer,
+                                            marker == nullptr, &result)) {
+      fill_directory_buffer(handle, &result);
+      FspFileSystemReleaseDirectoryBuffer(&handle->directory_buffer);
+    }
+    if (!NT_SUCCESS(result)) {
+      return result;
+    }
+
+    FspFileSystemReadDirectoryBuffer(&handle->directory_buffer, marker, buffer,
+                                     length, bytes_transferred);
+    return STATUS_SUCCESS;
+  }
+
+  void fill_directory_buffer(OpenFile* handle, PNTSTATUS result) {
+    const std::expected<std::vector<TreeEntry>, std::error_code> entries =
+        m_tree.ls(handle->path);
+    if (!entries.has_value()) {
+      *result = to_ntstatus(entries.error());
+      return;
+    }
+
+    // Windows expects the dot entries from every directory but the volume
+    // root, where there is no parent to name.
+    if (!handle->path.empty()) {
+      const std::expected<EntryInfo, std::error_code> self =
+          m_tree.status(handle->path);
+      const std::expected<EntryInfo, std::error_code> parent =
+          m_tree.status(handle->path.parent_path());
+      if (self.has_value() && !add_dir_entry(handle, L".", *self, result)) {
+        return;
+      }
+      if (parent.has_value() &&
+          !add_dir_entry(handle, L"..", *parent, result)) {
+        return;
+      }
+    }
+
+    for (const TreeEntry& entry : *entries) {
+      // TreeEntry::name is the leaf name only.
+      if (!add_dir_entry(handle, entry.name.wstring(), entry.info, result)) {
+        return;
+      }
+    }
+  }
+
+  static bool add_dir_entry(OpenFile* handle,
+                            const std::wstring& name,
+                            const EntryInfo& status,
+                            PNTSTATUS result) {
+    if (name.size() > DirEntryBuffer::max_name_chars) {
+      return true;  // unnameable here, so skip it rather than fail the listing
+    }
+
+    // Field by field rather than from a braced initializer: MSVC will not
+    // create even a temporary of a type ending in a flexible array member. The
+    // storage starts zeroed, so the fields left alone are already right.
+    DirEntryBuffer storage;
+    FSP_FSCTL_DIR_INFO* entry = storage.get();
+    entry->Size = static_cast<UINT16>(sizeof(FSP_FSCTL_DIR_INFO) +
+                                      (name.size() * sizeof(WCHAR)));
+    entry->FileInfo = make_file_info(status);
+    std::memcpy(entry->FileNameBuf, name.data(), name.size() * sizeof(WCHAR));
+
+    return FspFileSystemFillDirectoryBuffer(&handle->directory_buffer, entry,
+                                            result);
+  }
+
+  // Records a file something has opened through us, which bounds what an
+  // "everything changed" notification has to announce. It only grows while the
+  // mount lives (minus what notify() finds deleted).
+  void remember(const std::filesystem::path& path) {
+    const std::lock_guard<std::mutex> lock(m_known_mutex);
+    m_known.insert(path);
+  }
+
   // Queues a tree change for the notifier thread.
   //
   // Runs on whichever thread the tree notifies from, so it does no I/O. The
   // first read of a lazily-built output runs the build synchronously inside
-  // get_file_data, and the tree change that build produces is delivered right
-  // there on the ProjFS callback thread; a PrjUpdateFileIfNeeded issued from
-  // that stack would re-enter ProjFS re-entrantly and fail with
-  // ERROR_SHARING_VIOLATION. Handing the poke to the notifier defers it until
-  // get_file_data has returned.
+  // read(), and the tree change that build produces is delivered right there
+  // on a WinFsp dispatcher thread; announcing it from that stack would have
+  // the filesystem call into WinFsp in the middle of servicing a WinFsp
+  // request. Handing it to the notifier defers it until read() has returned.
   void on_tree_changed(const DirectoryTreeDiff& diff) {
     const std::lock_guard<std::mutex> lock(m_notify_mutex);
     if (m_stopping) {
@@ -472,23 +835,25 @@ class VirtualFileSystem::Impl {
     if (diff.everything_dirty) {
       m_everything_dirty = true;
     } else {
-      m_pending.insert(diff.entries_changed.begin(),
-                       diff.entries_changed.end());
+      // An entry whose parent's child list changed in the same diff was added
+      // or removed rather than rewritten; which of the two is settled when it
+      // is announced, by whether it still exists. That is all
+      // child_lists_changed is needed for: a watcher on the parent learns about
+      // a new or missing child from the child's own record.
+      const std::set<std::filesystem::path> parents(
+          diff.child_lists_changed.begin(), diff.child_lists_changed.end());
+      Changes changes;
+      for (const std::filesystem::path& path : diff.entries_changed) {
+        changes.emplace(path, parents.contains(path.parent_path())
+                                  ? ChangeKind::added
+                                  : ChangeKind::modified);
+      }
+      merge_changes(m_pending, changes);
     }
-
-    // child_lists_changed is deliberately not handled beyond what
-    // entries_changed already covers, because ProjFS exposes no primitive for
-    // invalidating a cached directory enumeration. Removals and modifications
-    // arrive as entries_changed entries and are handled below; a *newly added*
-    // file may therefore not appear in a listing of a directory that has
-    // already been enumerated, until something touches it by name and
-    // GetPlaceholderInfoCallback runs.
-    //
-    // TODO: Investigate further.
     m_wake.notify_one();
   }
 
-  // Drains queued changes, invalidating each affected placeholder in turn.
+  // Drains queued changes, announcing each affected path in turn.
   void notify_loop() {
     std::unique_lock<std::mutex> lock(m_notify_mutex);
     while (true) {
@@ -499,82 +864,201 @@ class VirtualFileSystem::Impl {
         break;
       }
 
-      std::set<std::filesystem::path> batch;
+      Changes batch;
       if (m_everything_dirty) {
-        // The tree lost track of what changed, so everything we projected could
-        // be stale. Invalidate the placeholders we know we created rather than
-        // walking the mount: enumerating our own virtualization root would
-        // re-enter the ProjFS callbacks.
+        // The tree lost track of what changed, so everything handed out could
+        // be stale. Announce the paths we know were opened rather than walking
+        // the mount: enumerating our own volume would re-enter the operations
+        // above from here.
         m_everything_dirty = false;
         m_pending.clear();
-        const std::lock_guard<std::mutex> placeholder_lock(m_placeholder_mutex);
-        batch = m_placeholders;
+        const std::lock_guard<std::mutex> known_lock(m_known_mutex);
+        for (const std::filesystem::path& path : m_known) {
+          batch.emplace(path, ChangeKind::modified);
+        }
       } else {
         batch = std::exchange(m_pending, {});
       }
 
-      // Unlocked for the invalidations themselves, so a change arriving
+      // Unlocked for the announcements themselves, so a change arriving
       // mid-batch simply queues up for the next pass.
       lock.unlock();
-      for (const std::filesystem::path& path : batch) {
-        invalidate(path);
-      }
+      send_notifications(std::move(batch));
       lock.lock();
     }
   }
 
-  // Re-pushes or removes one placeholder to match the tree.
-  void invalidate(const std::filesystem::path& path) {
-    {
-      // A path we never projected has nothing cached against it, so there is
-      // nothing to invalidate and no reason to query the tree.
-      const std::lock_guard<std::mutex> lock(m_placeholder_mutex);
-      if (m_placeholders.find(path) == m_placeholders.end()) {
-        return;
+  void send_notifications(Changes batch) {
+    // Windows silently drops a change notification naming a file that has a
+    // handle open on it - FspFileSystemNotify still reports success - so
+    // anything open is set aside here for cleanup() to announce once the reader
+    // has let go. That is exactly the shape of a first build: the read that
+    // triggers it is still holding the file when the build reports back.
+    Changes deferred;
+    for (auto it = batch.begin(); it != batch.end();) {
+      if (is_open(it->first)) {
+        const auto open = it++;
+        deferred.insert(batch.extract(open));
+      } else {
+        ++it;
       }
     }
+    park(deferred);
 
-    const std::wstring name = to_projfs_path(path);
-    const std::expected<EntryInfo, std::error_code> status =
-        m_tree.status(path);
-    PRJ_UPDATE_FAILURE_CAUSES cause{};
-
-    if (!status.has_value()) {
-      PrjDeleteFile(m_context, name.c_str(), k_update_flags, &cause);
-      const std::lock_guard<std::mutex> lock(m_placeholder_mutex);
-      m_placeholders.erase(path);
+    if (batch.empty()) {
       return;
     }
-
-    const PRJ_PLACEHOLDER_INFO info = make_placeholder_info(*status);
-    for (int attempt = 0; attempt < k_update_attempts; ++attempt) {
-      const HRESULT hr = PrjUpdateFileIfNeeded(
-          m_context, name.c_str(), &info, sizeof(info), k_update_flags, &cause);
-      if (hr != HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION)) {
-        break;
+    for (int attempt = 0; attempt < k_notify_attempts; ++attempt) {
+      if (FspFileSystemNotifyBegin(m_filesystem, k_notify_timeout_ms) ==
+          STATUS_SUCCESS) {
+        for (const auto& [path, kind] : batch) {
+          notify(path, kind);
+        }
+        FspFileSystemNotifyEnd(m_filesystem);
+        return;
       }
-      std::this_thread::sleep_for(k_update_retry_delay);
+      std::this_thread::sleep_for(k_notify_retry_delay);
     }
   }
 
+  [[nodiscard]] bool is_open(const std::filesystem::path& path) {
+    const std::lock_guard<std::mutex> lock(m_open_mutex);
+    return m_open_counts.contains(path);
+  }
+
+  // Holds changes to files that are open until cleanup() lets them out.
+  void park(const Changes& changes) {
+    if (changes.empty()) {
+      return;
+    }
+    {
+      const std::lock_guard<std::mutex> lock(m_notify_mutex);
+      if (m_stopping) {
+        return;
+      }
+      merge_changes(m_deferred, changes);
+    }
+    // A file that closed between the is_open() test above and this park missed
+    // its release and would sit here until something changed it again, so
+    // whatever is already closed is taken straight back out.
+    for (const auto& [path, kind] : parked()) {
+      if (!is_open(path)) {
+        release_deferred(path);
+      }
+    }
+  }
+
+  [[nodiscard]] Changes parked() {
+    const std::lock_guard<std::mutex> lock(m_notify_mutex);
+    return m_deferred;
+  }
+
+  // Requeues the change parked against @a path, if there is one.
+  void release_deferred(const std::filesystem::path& path) {
+    {
+      const std::lock_guard<std::mutex> lock(m_notify_mutex);
+      const auto it = m_deferred.find(path);
+      if (m_stopping || it == m_deferred.end()) {
+        return;
+      }
+      merge_changes(m_pending, Changes{*it});
+      m_deferred.erase(it);
+    }
+    m_wake.notify_one();
+  }
+
+  // Announces one changed path, so anything watching the mount with
+  // ReadDirectoryChangesW hears about it.
+  //
+  // This is only ever a message. Nothing about the file itself has to be
+  // pushed anywhere, because FileInfoTimeout is 0 and Windows caches none of
+  // it: a reader that comes back after this reaches the tree and gets whatever
+  // is there now.
+  void notify(const std::filesystem::path& path, ChangeKind kind) {
+    const std::wstring name = to_volume_path(path);
+    if (name.size() > NotifyBuffer::max_name_chars) {
+      return;
+    }
+
+    const std::expected<EntryInfo, std::error_code> status =
+        m_tree.status(path);
+    const bool present = status.has_value();
+    if (!present) {
+      // Gone from the tree. Forget it, so a path that comes back is re-learned
+      // by the open that finds it.
+      const std::lock_guard<std::mutex> lock(m_known_mutex);
+      m_known.erase(path);
+    }
+
+    struct Announcement {
+      UINT32 filter;
+      UINT32 action;
+    };
+    const Announcement announcement = [&]() -> Announcement {
+      if (!present) {
+        // The entry is gone, and with it any record of whether it was a file
+        // or a directory, so both kinds of watcher are told.
+        return {.filter =
+                    FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME,
+                .action = FILE_ACTION_REMOVED};
+      }
+      if (kind == ChangeKind::added) {
+        return {.filter = std::holds_alternative<DirectoryInfo>(*status)
+                              ? UINT32{FILE_NOTIFY_CHANGE_DIR_NAME}
+                              : UINT32{FILE_NOTIFY_CHANGE_FILE_NAME},
+                .action = FILE_ACTION_ADDED};
+      }
+      return {.filter = FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
+              .action = FILE_ACTION_MODIFIED};
+    }();
+
+    // Field by field for the same reason as in add_dir_entry.
+    NotifyBuffer storage;
+    FSP_FSCTL_NOTIFY_INFO* info = storage.get();
+    info->Size = static_cast<UINT16>(sizeof(FSP_FSCTL_NOTIFY_INFO) +
+                                     (name.size() * sizeof(WCHAR)));
+    info->Filter = announcement.filter;
+    info->Action = announcement.action;
+    std::memcpy(info->FileNameBuf, name.data(), name.size() * sizeof(WCHAR));
+
+    FspFileSystemNotify(m_filesystem, info, info->Size);
+  }
+
   const DirectoryTree& m_tree;
-  const std::wstring m_root;
-  PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT m_context = nullptr;
+  const std::filesystem::path m_mountpoint;
 
-  std::mutex m_enum_mutex;
-  std::unordered_map<GUID, Enumeration, GuidHash> m_enumerations;
+  // The mount point as WinFsp wants it: its own buffer, because
+  // FspFileSystemSetMountPoint takes a mutable pointer.
+  std::wstring m_root;
 
-  // Paths we have written placeholders for, and therefore the only paths the
-  // OS could be caching anything about.
-  std::mutex m_placeholder_mutex;
-  std::set<std::filesystem::path> m_placeholders;
+  const SecurityDescriptor m_security;
+
+  FSP_FILE_SYSTEM* m_filesystem = nullptr;
+  bool m_mounted = false;
+  bool m_dispatching = false;
+
+  // Files something has opened through us, and so the candidate set for an
+  // "everything changed" notification.
+  std::mutex m_known_mutex;
+  std::set<std::filesystem::path> m_known;
+
+  // Files with a handle open right now, counted because one file can be open
+  // several times over. Consulted before every notification and drained by
+  // cleanup().
+  std::mutex m_open_mutex;
+  std::map<std::filesystem::path, int> m_open_counts;
 
   // The notifier thread and the queue on_tree_changed hands it. m_pending
-  // coalesces: a path repeated across diffs is invalidated once per pass, and
+  // coalesces: a path repeated across diffs is announced once per pass, and
   // m_everything_dirty supersedes the lot.
   std::mutex m_notify_mutex;
   std::condition_variable m_wake;
-  std::set<std::filesystem::path> m_pending;
+  Changes m_pending;
+
+  // Changes that could not be announced because the file was open, waiting on
+  // the cleanup that lets them through.
+  Changes m_deferred;
+
   bool m_everything_dirty = false;
   bool m_stopping = false;
   std::thread m_notifier;

@@ -3,6 +3,32 @@
 # is selected by the system name so the set stays in lock-step.
 string(TOLOWER "${CMAKE_SYSTEM_NAME}" MAKEBELIEVE_PLATFORM)
 
+# WinFsp backs the Windows virtual filesystem.
+if(WIN32)
+  cmake_host_system_information(RESULT _winfsp_install_dir
+    QUERY WINDOWS_REGISTRY "HKLM/SOFTWARE/WinFsp"
+    VALUE InstallDir VIEW 32)
+  set(WINFSP_ROOT "${_winfsp_install_dir}"
+      CACHE PATH "Root of the WinFsp installation (default: from the registry)")
+
+  # WinFsp names one import library per architecture rather than one common
+  # name, so the right one is chosen here instead of searched for.
+  if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(WINFSP_ARCH x86)
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+    set(WINFSP_ARCH a64)
+  else()
+    set(WINFSP_ARCH x64)
+  endif()
+
+  find_path(WINFSP_INCLUDE_DIR winfsp/winfsp.h HINTS "${WINFSP_ROOT}/inc")
+  find_library(WINFSP_LIBRARY "winfsp-${WINFSP_ARCH}" HINTS "${WINFSP_ROOT}/lib")
+  if(NOT WINFSP_INCLUDE_DIR OR NOT WINFSP_LIBRARY)
+    message(FATAL_ERROR
+      "WinFsp not found. Install it or point -DWINFSP_ROOT at an existing installation.")
+  endif()
+endif()
+
 # Split from the executable so that tests can link the daemon's guts directly
 # rather than driving it through the binary.
 add_library(makebelieve_core STATIC
@@ -21,13 +47,27 @@ add_library(makebelieve_core STATIC
 )
 target_include_directories(makebelieve_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 
+target_include_directories(makebelieve_core SYSTEM PUBLIC
+  $<$<PLATFORM_ID:Windows>:${WINFSP_INCLUDE_DIR}>
+)
+
 # Platform libraries and definitions as generator expressions, in the same
 # spirit as the root CMakeLists selecting compiler flags: the Windows pieces
 # fold in under PLATFORM_ID and evaluate to nothing elsewhere.
 target_link_libraries(makebelieve_core PUBLIC
   Threads::Threads
-  $<$<PLATFORM_ID:Windows>:ProjectedFSLib>   # PrjStartVirtualizing and friends
-  $<$<PLATFORM_ID:Windows>:Ole32>            # CoCreateGuid, for the instance ID
+  $<$<PLATFORM_ID:Windows>:${WINFSP_LIBRARY}>  # FspFileSystemCreate and friends
+  $<$<PLATFORM_ID:Windows>:Advapi32>           # SDDL, and FspLoad's registry read
+  $<$<PLATFORM_ID:Windows>:Delayimp>           # the delay-load helper below
+)
+
+# winfsp-*.dll lives in WinFsp's own install directory, which is not on the
+# loader's search path, so a normally-linked binary would fail to start rather
+# than report that WinFsp is missing. Delay-loading it defers that to the first
+# call, by which time FspLoad() has found and loaded the DLL through the
+# registry.
+target_link_options(makebelieve_core INTERFACE
+  $<$<PLATFORM_ID:Windows>:/DELAYLOAD:winfsp-${WINFSP_ARCH}.dll>
 )
 # WIN32_LEAN_AND_MEAN trims <windows.h>; NOMINMAX drops its min/max macros,
 # which otherwise clash with std::min/std::max. Set here so every TU reaching
@@ -110,6 +150,7 @@ if(BUILD_TESTING)
   makebelieve_add_test(realdirectorytree)
   makebelieve_add_test(inmemorydirectorytree)
   makebelieve_add_test(directorytreeutil)
+  makebelieve_add_test(virtualfilesystem)
 
   add_executable(consoleinterrupthandler_test consoleinterrupthandler.t.cpp)
   target_link_libraries(consoleinterrupthandler_test PRIVATE

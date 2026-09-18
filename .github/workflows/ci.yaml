@@ -36,6 +36,10 @@ jobs:
       if: runner.os == 'Windows'
       shell: powershell
       run: Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart
+    - name: Install WinFsp
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: choco install winfsp -y --no-progress
     - name: Configure CMake
       run: >
         cmake -B build

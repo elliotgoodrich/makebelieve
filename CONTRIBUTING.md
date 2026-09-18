@@ -42,11 +42,38 @@ running `code .` there - the latter still fails intermittently, most
 likely because the `code` wrapper's own current-directory resolution has
 to round-trip through the same fragile path.
 
-### ProjFS / ETW build dependencies
+### WinFsp build dependencies
 
-No Windows experiment has been written yet. When `experiments/ProjFS` or
-`experiments/ETW` show up, this section should grow the equivalent Windows
-10 SDK / optional-feature setup notes.
+The Windows virtual filesystem is built on
+[WinFsp](https://winfsp.dev/), which supplies both the headers and import
+library to build against and the kernel driver the mount actually runs on:
+
+```sh
+choco install winfsp -y
+```
+
+CMake finds it through the `InstallDir` value the installer writes to the
+registry (the same one WinFsp itself uses to locate its DLL) and fails the
+configure step if it is missing; pass `-DWINFSP_ROOT=...` to use a
+different installation. `winfsp-*.dll` is delay-loaded and
+found at runtime through WinFsp's own registry key, so nothing needs to go
+on `PATH`.
+
+Note that WinFsp installs a signed kernel driver, so the install itself
+needs an elevated shell; building and running the tests afterwards does
+not.
+
+### ProjFS / ETW experiment dependencies
+
+`experiments/ProjFS` still uses Windows' own Projected File System, which is
+an optional Windows feature rather than a package:
+
+```powershell
+Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart
+```
+
+`experiments/ETW_tracing` consumes NT Kernel Logger events, which only works
+from an elevated shell; its test reports `SKIP:` otherwise.
 
 ## Building
 
