@@ -611,16 +611,26 @@ class VirtualFileSystem::Impl {
     return STATUS_MEDIA_WRITE_PROTECTED;
   }
 
+  // A handle that can read data blocks in the tree's open() until the file is
+  // final, and reports that size. Stats also open files, but for attributes
+  // only, so they neither wait nor build.
   NTSTATUS open(PWSTR name,
                 UINT32 create_options,
-                UINT32 /*granted_access*/,
+                UINT32 granted_access,
                 PVOID* file_context,
                 FSP_FSCTL_FILE_INFO* file_info) {
     const std::filesystem::path path = to_tree_path(name);
-    const std::expected<EntryInfo, std::error_code> status =
-        m_tree.status(path);
+    std::expected<EntryInfo, std::error_code> status = m_tree.status(path);
     if (!status.has_value()) {
       return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    if (std::holds_alternative<FileInfo>(*status) &&
+        (granted_access & (FILE_READ_DATA | FILE_EXECUTE)) != 0) {
+      const std::expected<FileInfo, std::error_code> opened = m_tree.open(path);
+      if (!opened.has_value()) {
+        return to_ntstatus(opened.error());
+      }
+      status = *opened;
     }
 
     const bool is_directory = std::holds_alternative<DirectoryInfo>(*status);

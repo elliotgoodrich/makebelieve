@@ -20,16 +20,15 @@ namespace makebelieve {
 /// `build.makebelieve` manifest that lives in another `DirectoryTree`.
 ///
 /// On construction it reads the manifest from a @a source tree and presents
-/// one entry per declared `@/output <- command` rule. Each output is built
-/// lazily: until it is first read it appears as a one-byte placeholder holding
-/// a single null byte, and the first read of it hands the command to a
-/// @link CommandRunner. When the runner reports the result, it replaces the
-/// placeholder; later reads are served from that result.
+/// one entry per declared `@/output <- command` rule. `open` builds an output
+/// that is unbuilt or dirty, blocking until its @link CommandRunner reports
+/// back. `status` and `read` never build: an unbuilt output reports size 1,
+/// otherwise the size of its last build.
 ///
 /// It then observes @a source for the rest of its life, recording the inputs
 /// each build reads, so a change to one of those inputs rebuilds the outputs
-/// that depend on it: eagerly for an output already read, lazily on its next
-/// read otherwise. @a source must outlive this tree.
+/// that depend on it: eagerly if opened before, otherwise on the next open.
+/// @a source must outlive this tree.
 ///
 /// A change to `build.makebelieve` itself is not yet handled: the rule set is
 /// fixed for the tree's lifetime.
@@ -95,6 +94,11 @@ class BuildDirectoryTree : public DirectoryTree {
       const std::filesystem::path& path) const override;
 
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
+      const std::filesystem::path& path) const override;
+
+  /// Builds @a path if unbuilt or dirty (or waits for a build under way) and
+  /// returns its info once up to date, or the error of a failed build.
+  [[nodiscard]] std::expected<FileInfo, std::error_code> open(
       const std::filesystem::path& path) const override;
 
   [[nodiscard]] std::expected<std::string, std::error_code> read(

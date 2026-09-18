@@ -5,7 +5,9 @@
 #include "manifest.hpp"
 #include "processutil.hpp"
 
+#include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <fstream>
@@ -36,7 +38,7 @@ constexpr std::string_view k_manifest_name = "build.makebelieve";
 // The placeholder in a command that is replaced with the output's path.
 constexpr std::string_view k_out_placeholder = "%out";
 
-// The content an output holds before it has ever been read: a single null
+// The content an output holds before it has ever been built: a single null
 // byte. Viewing a named char rather than a string literal keeps the length and
 // the storage in step (a `string_view("", 1)` reads as out-of-bounds).
 constexpr char k_null_byte = '\0';
@@ -202,11 +204,17 @@ class BuildDirectoryTree::Impl {
   std::set<std::filesystem::path> m_stale;
 
   // Outputs whose build has started and is awaiting completion, so a second
-  // read or a coincident input change does not launch it again.
+  // open or a coincident input change does not launch it again.
   std::set<std::filesystem::path> m_in_flight;
 
-  // Outputs read at least once. An input change rebuilds one of these eagerly;
-  // an output nobody has read is only marked stale, to build on its next read.
+  // Signalled when a build finishes, waking a waiting open().
+  std::condition_variable m_settled;
+
+  // Builds finished per output, and the last one's error if it failed.
+  std::map<std::filesystem::path, std::uint64_t> m_finished;
+  std::map<std::filesystem::path, std::error_code> m_failed;
+
+  // Outputs opened at least once, which an input change rebuilds eagerly.
   std::set<std::filesystem::path> m_materialized;
 
   // The inputs each built output last read. Kept so a rebuild can refresh
@@ -289,19 +297,43 @@ class BuildDirectoryTree::Impl {
     return m_structure.ls(path);
   }
 
-  // The first read of a declared output triggers its build and marks it read
-  // (so a later input change rebuilds it eagerly); reads before the build
-  // completes see the placeholder.
-  [[nodiscard]] std::expected<std::string, std::error_code>
-  read(const std::filesystem::path& path, Offset offset, std::size_t size) {
-    // A zero-size read or negative offset never yields content, so skip the
-    // build it would otherwise trigger.
-    if (size != 0 && offset >= 0) {
-      const std::filesystem::path output = path.lexically_normal();
-      mark_materialized(output);
-      start_build(output);
-    }
+  [[nodiscard]] std::expected<std::string, std::error_code> read(
+      const std::filesystem::path& path,
+      Offset offset,
+      std::size_t size) const {
     return m_structure.read(path, offset, size);
+  }
+
+  // Builds or waits until a declared output is neither stale nor building.
+  // Returns the error of a build that failed meanwhile rather than retrying.
+  [[nodiscard]] std::error_code build_now(const std::filesystem::path& path) {
+    const std::filesystem::path output = path.lexically_normal();
+    std::unique_lock lock(m_mutex);
+    if (!m_commands.contains(output)) {
+      return {};
+    }
+    m_materialized.insert(output);
+
+    const std::uint64_t finished_before = m_finished[output];
+    while (true) {
+      if (m_in_flight.contains(output)) {
+        m_settled.wait(lock);
+        continue;
+      }
+      if (!m_stale.contains(output)) {
+        return {};
+      }
+      // Stale and idle: report a failure since we started, else build.
+      if (m_finished[output] != finished_before) {
+        if (const auto it = m_failed.find(output); it != m_failed.end()) {
+          return it->second;
+        }
+      }
+      // Unlocked: a synchronous runner calls finish_build from inside.
+      lock.unlock();
+      start_build(output);
+      lock.lock();
+    }
   }
 
   [[nodiscard]] Subscription subscribe_to_changes(
@@ -310,13 +342,6 @@ class BuildDirectoryTree::Impl {
   }
 
  private:
-  void mark_materialized(const std::filesystem::path& output) {
-    const std::lock_guard lock(m_mutex);
-    if (m_commands.contains(output)) {
-      m_materialized.insert(output);
-    }
-  }
-
   void start_build(const std::filesystem::path& output) {
     std::string command;
     {
@@ -336,7 +361,7 @@ class BuildDirectoryTree::Impl {
     // Outside the lock: a synchronous runner re-enters finish_build from within
     // this call.
     m_runner(command, m_stop.get_token(),
-             // A synchronous completion allocates and lets that escape read().
+             // A synchronous completion allocates and lets that escape open().
              // NOLINTNEXTLINE(bugprone-exception-escape)
              [this, output](BuildResult result) {
                finish_build(output, std::move(result));
@@ -344,25 +369,35 @@ class BuildDirectoryTree::Impl {
   }
 
   void finish_build(const std::filesystem::path& output, BuildResult result) {
+    if (result.has_value()) {
+      {
+        const std::lock_guard lock(m_mutex);
+        update_dependents(output, std::move(result->inputs));
+      }
+      // Outside the lock: write_file notifies subscribers, who may read back
+      // through us.
+      m_structure.write_file(output, std::move(result->bytes));
+    }
+
     bool rebuild_again = false;
     {
       const std::lock_guard lock(m_mutex);
+      // Only now the content is in place may a waiting open() be released.
       m_in_flight.erase(output);
-      if (!result.has_value()) {
-        // A failed build stays stale, so a later read or input change retries.
+      ++m_finished[output];
+      if (result.has_value()) {
+        m_failed.erase(output);
+        // An input that changed mid-build left it stale again; rebuild if
+        // watched.
+        rebuild_again =
+            m_stale.contains(output) && m_materialized.contains(output);
+      } else {
+        // A failed build stays stale, so a later open or input change retries.
+        m_failed.insert_or_assign(output, result.error());
         m_stale.insert(output);
-        return;
       }
-      update_dependents(output, std::move(result->inputs));
-      // An input that changed mid-build left it stale again; rebuild if
-      // watched.
-      rebuild_again =
-          m_stale.contains(output) && m_materialized.contains(output);
     }
-
-    // Outside the lock: write_file notifies subscribers, who may read back
-    // through us.
-    m_structure.write_file(output, std::move(result->bytes));
+    m_settled.notify_all();
 
     if (rebuild_again) {
       start_build(output);
@@ -427,8 +462,7 @@ class BuildDirectoryTree::Impl {
         return;
       }
       m_stale.insert(output);
-      // Eager only if read and not already building; an in-flight build re-runs
-      // on completion when it finds it stale.
+      // Eager only if opened and idle; an in-flight build re-runs if stale.
       eager = m_materialized.contains(output) && !m_in_flight.contains(output);
     }
     if (eager) {
@@ -482,6 +516,14 @@ std::expected<EntryInfo, std::error_code> BuildDirectoryTree::status(
 std::expected<std::vector<TreeEntry>, std::error_code> BuildDirectoryTree::ls(
     const std::filesystem::path& path) const {
   return m_impl->ls(path);
+}
+
+std::expected<FileInfo, std::error_code> BuildDirectoryTree::open(
+    const std::filesystem::path& path) const {
+  if (const std::error_code error = m_impl->build_now(path)) {
+    return std::unexpected(error);
+  }
+  return DirectoryTree::open(path);  // status() now reflects the build
 }
 
 std::expected<std::string, std::error_code> BuildDirectoryTree::read(
