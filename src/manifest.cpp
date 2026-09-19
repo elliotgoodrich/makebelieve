@@ -3,8 +3,12 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <format>
+#include <map>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace makebelieve {
 
@@ -23,13 +27,31 @@ std::string_view trim(std::string_view text) {
   return text;
 }
 
+// Normalises @a output, or returns nullopt when it does not name a file inside
+// the output directory: empty, absolute, escaping with `..`, or ending in a
+// separator or `.`.
+std::optional<std::filesystem::path> to_output_path(std::string_view output) {
+  std::filesystem::path path = std::filesystem::path(output).lexically_normal();
+  if (path.empty() || path.has_root_path() || !path.has_filename() ||
+      path.filename() == "." || path.filename() == ".." ||
+      *path.begin() == "..") {
+    return std::nullopt;
+  }
+  return path;
+}
+
 }  // namespace
 
 Manifest Manifest::parse(std::string_view text) {
   Manifest manifest;
 
+  // Where each accepted output, and each directory above one, was declared, so
+  // a later rule cannot reuse a path as both a file and a directory.
+  std::map<std::filesystem::path, std::size_t> files;
+  std::map<std::filesystem::path, std::size_t> directories;
+
   std::size_t start = 0;
-  while (start <= text.size()) {
+  for (std::size_t number = 1; start <= text.size(); ++number) {
     const std::size_t newline = text.find('\n', start);
     const std::size_t end =
         newline == std::string_view::npos ? text.size() : newline;
@@ -40,25 +62,67 @@ Manifest Manifest::parse(std::string_view text) {
       continue;
     }
 
+    const auto reject = [&](std::string message) {
+      manifest.m_errors.push_back(
+          {.line = number, .message = std::move(message)});
+    };
+
     const std::size_t arrow = line.find("<-");
     if (arrow == std::string_view::npos) {
+      reject("expected `@/<output> <- <command>`");
       continue;
     }
 
     const std::string_view left = trim(line.substr(0, arrow));
     const std::string_view command = trim(line.substr(arrow + 2));
-    if (!left.starts_with("@/") || command.empty()) {
+    if (!left.starts_with("@/")) {
+      reject(std::format("output `{}` must start with `@/`", left));
+      continue;
+    }
+    if (command.empty()) {
+      reject(std::format("`{}` has no command", left));
       continue;
     }
 
-    const std::string_view output = left.substr(2);
-    if (output.empty()) {
+    const std::optional<std::filesystem::path> output =
+        to_output_path(left.substr(2));
+    if (!output.has_value()) {
+      reject(std::format("`{}` does not name a file inside `@/`", left));
       continue;
     }
 
+    if (const auto it = files.find(*output); it != files.end()) {
+      reject(
+          std::format("`{}` is already declared on line {}", left, it->second));
+      continue;
+    }
+    if (const auto it = directories.find(*output); it != directories.end()) {
+      reject(
+          std::format("`{}` is a directory of the output declared on line {}",
+                      left, it->second));
+      continue;
+    }
+    std::optional<std::size_t> clash;
+    for (std::filesystem::path parent = output->parent_path(); !parent.empty();
+         parent = parent.parent_path()) {
+      if (const auto it = files.find(parent); it != files.end()) {
+        clash = it->second;
+        break;
+      }
+    }
+    if (clash.has_value()) {
+      reject(std::format("`{}` is inside the output declared on line {}", left,
+                         *clash));
+      continue;
+    }
+
+    files.emplace(*output, number);
+    for (std::filesystem::path parent = output->parent_path(); !parent.empty();
+         parent = parent.parent_path()) {
+      directories.emplace(parent, number);
+    }
     manifest.m_rules.push_back(
-        {.output = std::filesystem::path(output).lexically_normal(),
-         .command = std::string(command)});
+        {.output = *output, .command = std::string(command)});
   }
 
   return manifest;

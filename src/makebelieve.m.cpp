@@ -61,9 +61,18 @@ int mount(const char* mountpoint_arg) {
   // Presents the manifest's declared outputs, building each lazily through
   // the shell. The runner's working directory is the source root, so the
   // inputs it traces line up with the source's own change notifications.
-  // TODO: reparse the manifest when build.makebelieve changes.
-  const BuildDirectoryTree build_tree(tree,
-                                      BuildDirectoryTree::shell_runner(source));
+  const BuildDirectoryTree build_tree(
+      tree, BuildDirectoryTree::shell_runner(source),
+      [](const std::string& problems) {
+        // Best-effort, as this runs on the source's watcher thread.
+        try {
+          std::println(stderr,
+                       "makebelieve: ignoring the change to build.makebelieve "
+                       "until it is fixed:\n{}",
+                       problems);
+        } catch (...) {  // NOLINT(bugprone-empty-catch)
+        }
+      });
 
   const VirtualFileSystem vfs(build_tree, mountpoint_arg);
 

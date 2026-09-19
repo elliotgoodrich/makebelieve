@@ -16,12 +16,13 @@ struct ExpectedRule {
   std::string_view command;
 };
 
-// One parsing case: a manifest, the rules it should yield, and an identifier
-// that names the case in the test output.
+// One parsing case: a manifest, the rules it should yield, the lines it should
+// reject, and an identifier that names the case in the test output.
 struct ParseCase {
   std::string_view name;
   std::string_view input;
   std::vector<ExpectedRule> expected;
+  std::vector<std::size_t> error_lines = {};
 };
 
 class ManifestParse : public ::testing::TestWithParam<ParseCase> {};
@@ -35,6 +36,13 @@ TEST_P(ManifestParse, YieldsExpectedRules) {
     EXPECT_EQ(manifest.rules()[i].output, c.expected[i].output);
     EXPECT_EQ(manifest.rules()[i].command, c.expected[i].command);
   }
+
+  std::vector<std::size_t> error_lines;
+  for (const makebelieve::Manifest::Error& error : manifest.errors()) {
+    error_lines.push_back(error.line);
+    EXPECT_FALSE(error.message.empty());
+  }
+  EXPECT_EQ(error_lines, c.error_lines);
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -65,16 +73,53 @@ INSTANTIATE_TEST_SUITE_P(
                            "# trailing comment\n",
                   .expected = {{"output.txt", "cp input.txt %out"}}},
         // A path without the `@/` prefix is outside the output namespace, and a
-        // line with no `<-` is not a rule at all; both are skipped.
-        ParseCase{.name = "skips_lines_outside_the_output_namespace",
+        // line with no `<-` is not a rule at all; both are rejected.
+        ParseCase{.name = "rejects_lines_outside_the_output_namespace",
                   .input = "plain.txt <- cp input.txt %out\n"
                            "just some words\n"
                            "@/kept.txt <- cp input.txt %out\n",
-                  .expected = {{"kept.txt", "cp input.txt %out"}}},
-        ParseCase{.name = "skips_empty_output_or_command",
+                  .expected = {{"kept.txt", "cp input.txt %out"}},
+                  .error_lines = {1, 2}},
+        ParseCase{.name = "rejects_empty_output_or_command",
                   .input = "@/ <- cp input.txt %out\n"
                            "@/output.txt <-\n",
-                  .expected = {}},
+                  .expected = {},
+                  .error_lines = {1, 2}},
+        // Syntax the manifest format documents but the parser does not handle
+        // yet is rejected rather than misread.
+        ParseCase{.name = "rejects_unsupported_syntax",
+                  .input = "flags = -O2\n"
+                           "rule cc = clang++ -c %in -o %out\n",
+                  .expected = {},
+                  .error_lines = {1, 2}},
+        ParseCase{.name = "rejects_outputs_outside_the_output_directory",
+                  .input = "@/../escape.txt <- a\n"
+                           "@/dir/ <- b\n"
+                           "@/. <- c\n"
+                           "@/a/.. <- d\n",
+                  .expected = {},
+                  .error_lines = {1, 2, 3, 4}},
+        ParseCase{.name = "normalises_outputs",
+                  .input = "@/a/./b/../c.txt <- a\n",
+                  .expected = {{"a/c.txt", "a"}}},
+        ParseCase{.name = "rejects_an_output_declared_twice",
+                  .input = "@/output.txt <- a\n"
+                           "@/output.txt <- b\n",
+                  .expected = {{"output.txt", "a"}},
+                  .error_lines = {2}},
+        // One path cannot be both a file and a directory, in either order.
+        ParseCase{.name = "rejects_an_output_inside_another",
+                  .input = "@/out <- a\n"
+                           "@/out/file.txt <- b\n",
+                  .expected = {{"out", "a"}},
+                  .error_lines = {2}},
+        ParseCase{
+            .name = "rejects_an_output_that_is_a_directory_of_another",
+            .input = "@/out/deep/file.txt <- a\n"
+                     "@/out/deep <- b\n"
+                     "@/out/other.txt <- c\n",
+            .expected = {{"out/deep/file.txt", "a"}, {"out/other.txt", "c"}},
+            .error_lines = {2}},
         ParseCase{.name = "handles_a_final_line_without_a_newline",
                   .input = "@/output.txt <- cp input.txt %out",
                   .expected = {{"output.txt", "cp input.txt %out"}}}),
