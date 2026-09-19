@@ -79,10 +79,11 @@ void create_mountpoint(const std::filesystem::path& mountpoint) {
 }
 
 // Removes a mountpoint this provider created, once the filesystem is unmounted.
-// Don't throw as this is called from our destructors.
+// Not recursive: if the unmount silently failed we must not delete through the
+// live mount. Don't throw as this is called from our destructors.
 void remove_mountpoint(const std::filesystem::path& mountpoint) noexcept {
   std::error_code error;
-  std::filesystem::remove_all(mountpoint, error);
+  std::filesystem::remove(mountpoint, error);
 }
 
 constexpr std::string_view k_fake_write_contents{"\0", 1};
