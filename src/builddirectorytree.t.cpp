@@ -237,6 +237,25 @@ TEST_F(BuildDirectoryTreeTest, ReadHandsTheRawCommandToTheRunner) {
   EXPECT_EQ(commands[0], "cp input.txt %out");  // %out is the runner's concern
 }
 
+// A `copy` rule reaches the runner as an action and the path it names, with
+// no shell command anywhere in sight.
+TEST_F(BuildDirectoryTreeTest, ReadHandsACopysSourceToTheRunner) {
+  write_manifest("@/output.txt = copy src/input.txt\n");
+
+  std::vector<BuildDirectoryTree::Command> commands;
+  const BuildDirectoryTree tree(
+      source, [&commands](BuildDirectoryTree::Command command, std::stop_token,
+                          BuildDirectoryTree::BuildComplete done) {
+        commands.push_back(std::move(command));
+        done(built("result"));
+      });
+
+  EXPECT_EQ(read_output(tree, "output.txt"), "result");
+  ASSERT_EQ(commands.size(), 1U);
+  EXPECT_EQ(commands[0].action, Manifest::Action::Copy);
+  EXPECT_EQ(commands[0].text, "src/input.txt");
+}
+
 TEST_F(BuildDirectoryTreeTest, BuildsLazilyAndOncePerOutputOnSuccess) {
   write_manifest("@/output.txt = run build %out\n");
 
@@ -418,6 +437,48 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerCapturesStandardOutput) {
 
   EXPECT_EQ(output_size(tree, "output.txt"), 1U);  // unbuilt until opened
   EXPECT_EQ(read_output(tree, "output.txt"), "hello world");
+}
+
+// A `copy` rule runs no command at all: the output is the named file's bytes,
+// read straight out of the working directory, and it stays lazy like any other.
+TEST_F(BuildDirectoryTreeTest, ShellRunnerCopiesAFileWithoutAShell) {
+  write_input("input.txt", "hello world");
+  write_manifest("@/output.txt = copy input.txt\n");
+
+  const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
+
+  EXPECT_EQ(output_size(tree, "output.txt"), 1U);  // unbuilt until opened
+  EXPECT_EQ(read_output(tree, "output.txt"), "hello world");
+  EXPECT_EQ(output_size(tree, "output.txt"), 11U);
+}
+
+// The copied bytes are taken verbatim, so a binary source survives intact.
+TEST_F(BuildDirectoryTreeTest, ShellRunnerCopiesBytesVerbatim) {
+  const std::string binary("a\0b\r\nc", 6);
+  write_input("input.bin", binary);
+  write_manifest("@/output.bin = copy input.bin\n");
+
+  const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
+
+  EXPECT_EQ(read_output(tree, "output.bin"), binary);
+}
+
+// A copy whose source is not there fails the open, with the reason, rather
+// than quietly producing nothing.
+TEST_F(BuildDirectoryTreeTest, ShellRunnerFailsACopyOfAMissingFile) {
+  write_manifest("@/output.txt = copy missing.txt\n");
+
+  const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
+
+  const std::expected<FileInfo, std::error_code> opened =
+      tree.open("output.txt");
+  ASSERT_FALSE(opened.has_value());
+  EXPECT_EQ(opened.error(), std::errc::no_such_file_or_directory);
+
+  // Still unbuilt, so a later open - once the file is there - tries again.
+  EXPECT_EQ(output_size(tree, "output.txt"), 1U);
+  write_input("missing.txt", "here now");
+  EXPECT_EQ(read_output(tree, "output.txt"), "here now");
 }
 
 // ---------------------------------------------------------------------------
@@ -908,6 +969,36 @@ TEST_F(BuildDirectoryTreeTest, RebuildsThroughRealTracingWhenAnInputChanges) {
   std::string content;
   const auto deadline = std::chrono::steady_clock::now() + 10s;
   do {
+    std::this_thread::sleep_for(50ms);
+    content = read_output(tree, "output.txt");
+  } while (content != "v2-changed" &&
+           std::chrono::steady_clock::now() < deadline);
+
+  EXPECT_EQ(content, "v2-changed");
+}
+
+// End to end: a `copy` rule reports the file it names as its input, so the
+// output rebuilds when that file changes - with no command tracing involved.
+TEST_F(BuildDirectoryTreeTest, RebuildsACopyWhenItsSourceChanges) {
+  using namespace std::chrono_literals;
+
+  write_input("input.txt", "v1");
+  std::ofstream(work / "build.makebelieve", std::ios::binary)
+      << "@/output.txt = copy input.txt\n";
+
+  const RealDirectoryTree real_source(work);
+  const BuildDirectoryTree tree(real_source,
+                                BuildDirectoryTree::shell_runner(work));
+
+  EXPECT_EQ(read_output(tree, "output.txt"), "v1");
+
+  // A copy builds in microseconds, so this gets here well before the watcher
+  // has finished arming and a single write could go unseen; keep rewriting the
+  // input until the rebuild it triggers lands.
+  std::string content;
+  const auto deadline = std::chrono::steady_clock::now() + 10s;
+  do {
+    write_input("input.txt", "v2-changed");
     std::this_thread::sleep_for(50ms);
     content = read_output(tree, "output.txt");
   } while (content != "v2-changed" &&

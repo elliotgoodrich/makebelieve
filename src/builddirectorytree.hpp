@@ -21,7 +21,7 @@ namespace makebelieve {
 /// `build.makebelieve` manifest that lives in another `DirectoryTree`.
 ///
 /// On construction it reads the manifest from a @a source tree and presents
-/// one entry per declared `@/output = <action> <command>` rule. `open` builds
+/// one entry per declared `@/output = <action> <argument>` rule. `open` builds
 /// an output that is unbuilt or dirty, blocking until its @link CommandRunner
 /// reports back. `status` and `read` never build: an unbuilt output reports
 /// size 1, otherwise the size of its last build.
@@ -58,12 +58,15 @@ class BuildDirectoryTree : public DirectoryTree {
   /// when it could not be run to completion.
   using BuildResult = std::expected<BuildOutput, std::error_code>;
 
-  /// One rule's right-hand side: the command to run, and the action that says
-  /// where its output comes from - the file `%out` names for
-  /// `Manifest::Action::Run`, its standard output for
-  /// `Manifest::Action::Capture`.
+  /// One rule's right-hand side: the action that says where the output comes
+  /// from - the file `%out` names for `Manifest::Action::Run`, the command's
+  /// standard output for `Manifest::Action::Capture`, a file read as-is for
+  /// `Manifest::Action::Copy` - and the text that action applies to.
   struct Command {
     Manifest::Action action = Manifest::Action::Run;
+
+    /// The command to run for `Run` and `Capture`; for `Copy`, the path of the
+    /// file to read, relative to the source tree's root.
     std::string text;
 
     [[nodiscard]] friend bool operator==(const Command&,
@@ -74,9 +77,10 @@ class BuildDirectoryTree : public DirectoryTree {
   /// can carry move-only state, and single-shot - call it exactly once.
   using BuildComplete = std::move_only_function<void(BuildResult)>;
 
-  /// Runs a command and reports the bytes it produced through the completion
-  /// handler. The runner may call the handler synchronously, before returning,
-  /// or later from another thread; either way it must call it exactly once.
+  /// Carries out one rule and reports the bytes it produced through the
+  /// completion handler. The runner may call the handler synchronously, before
+  /// returning, or later from another thread; either way it must call it
+  /// exactly once.
   /// The `stop_token` is requested when the result is no longer wanted (for
   /// instance when the tree is being destroyed), and a runner that defers work
   /// should honour it and still complete - reporting
@@ -109,11 +113,14 @@ class BuildDirectoryTree : public DirectoryTree {
   BuildDirectoryTree(BuildDirectoryTree&&) = delete;
   BuildDirectoryTree& operator=(BuildDirectoryTree&&) = delete;
 
-  /// Returns a `CommandRunner` that runs the command through the system shell
-  /// with the working directory set to @a working_directory (so relative
+  /// Returns a `CommandRunner` that runs a rule's command through the system
+  /// shell with the working directory set to @a working_directory (so relative
   /// inputs resolve against it). A `Run` command has `%out` substituted with a
   /// scratch file and produces the bytes it wrote there; a `Capture` command
-  /// produces the bytes it wrote to standard output. It runs the command
+  /// produces the bytes it wrote to standard output. A `Copy` rule runs no
+  /// command at all: it produces the bytes of the file it names, read from
+  /// under @a working_directory, and reports that file as its one input, so a
+  /// copy is tracked even where command tracing is unavailable. It works
   /// synchronously, reporting the result before returning. Traced inputs are
   /// reported relative to @a working_directory, so for dependency tracking to
   /// line up it should be the filesystem root that @a source mirrors.

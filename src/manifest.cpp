@@ -45,14 +45,25 @@ std::optional<Manifest::Action> to_action(std::string_view word) {
   if (word == "capture") {
     return Manifest::Action::Capture;
   }
+  if (word == "copy") {
+    return Manifest::Action::Copy;
+  }
   return std::nullopt;
 }
 
-// Normalises @a output, or returns nullopt when it does not name a file inside
-// the output directory: empty, absolute, escaping with `..`, or ending in a
-// separator or `.`.
-std::optional<std::filesystem::path> to_output_path(std::string_view output) {
-  std::filesystem::path path = std::filesystem::path(output).lexically_normal();
+// What @a action takes after its name, for the messages that reject a line.
+std::string_view argument_of(Manifest::Action action) {
+  return action == Manifest::Action::Copy ? "path" : "command";
+}
+
+// Normalises @a relative, or returns nullopt when it does not name a file
+// inside the directory it is relative to: empty, absolute, escaping with `..`,
+// or ending in a separator or `.`. Used for both an output, which must stay
+// inside `@/`, and a `copy` source, which must stay inside the manifest's
+// directory.
+std::optional<std::filesystem::path> to_inside_path(std::string_view relative) {
+  std::filesystem::path path =
+      std::filesystem::path(relative).lexically_normal();
   if (path.empty() || path.has_root_path() || !path.has_filename() ||
       path.filename() == "." || path.filename() == ".." ||
       *path.begin() == "..") {
@@ -101,25 +112,43 @@ Manifest Manifest::parse(std::string_view text) {
       continue;
     }
 
-    // An output is assigned an action and the command it applies to; the rest
-    // of the line after the action is that command, taken verbatim.
+    // An output is assigned an action and what that action applies to; the
+    // rest of the line after the action is that argument.
     const std::string_view word = first_word(value);
     const std::optional<Manifest::Action> action = to_action(word);
     if (!action.has_value()) {
       reject(
-          std::format("`{}` must be assigned `run <command>` or "
-                      "`capture <command>`",
+          std::format("`{}` must be assigned `run <command>`, "
+                      "`capture <command>` or `copy <path>`",
                       left));
       continue;
     }
-    const std::string_view command = trim(value.substr(word.size()));
-    if (command.empty()) {
-      reject(std::format("`{}` has no command", left));
+    const std::string_view argument = trim(value.substr(word.size()));
+    if (argument.empty()) {
+      reject(std::format("`{}` has no {}", left, argument_of(*action)));
       continue;
     }
 
+    // A `run` or `capture` command is taken verbatim. `copy` names a file
+    // instead, held to the same shape as an output - inside the directory, no
+    // escaping - so every copy's source is one the build can watch, and stored
+    // normalised.
+    std::string command(argument);
+    if (*action == Manifest::Action::Copy) {
+      const std::optional<std::filesystem::path> source =
+          to_inside_path(argument);
+      if (!source.has_value()) {
+        reject(
+            std::format("`{}` copies `{}`, which does not name a file "
+                        "inside the manifest's directory",
+                        left, argument));
+        continue;
+      }
+      command = source->generic_string();
+    }
+
     const std::optional<std::filesystem::path> output =
-        to_output_path(left.substr(2));
+        to_inside_path(left.substr(2));
     if (!output.has_value()) {
       reject(std::format("`{}` does not name a file inside `@/`", left));
       continue;
@@ -155,9 +184,8 @@ Manifest Manifest::parse(std::string_view text) {
          parent = parent.parent_path()) {
       directories.emplace(parent, number);
     }
-    manifest.m_rules.push_back({.output = *output,
-                                .action = *action,
-                                .command = std::string(command)});
+    manifest.m_rules.push_back(
+        {.output = *output, .action = *action, .command = std::move(command)});
   }
 
   return manifest;

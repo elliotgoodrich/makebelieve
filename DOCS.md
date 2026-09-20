@@ -21,7 +21,7 @@ Generated files live in the mounted output namespace and use `@/`:
 
 Paths without `@/` refer to the normal filesystem.
 
-An output is assigned an action and the command it applies to. With
+An output is assigned an action and what that action applies to. With
 `run` the command writes the output itself, to the path `%out` stands
 for. With `capture` the command writes nothing, and the bytes it sends
 to standard output are the output:
@@ -29,6 +29,18 @@ to standard output are the output:
 ```mb
 @/version.txt = capture git describe --tags
 ```
+
+`copy` takes a path rather than a command: the output is the bytes of
+that file, read without running anything.
+
+```mb
+@/config.json = copy etc/config.json
+```
+
+The path is relative to the manifest's directory and must stay inside
+it, so the file is always one **makebelieve** can watch - a copy is
+rebuilt when its source changes even where command tracing is
+unavailable.
 
 ## Rules
 
@@ -46,8 +58,8 @@ Invoke them by name, prefixed with `!`:
     flags = -O0 -g
 ```
 
-Without the `!`, the right-hand side is a built-in action (`run` or
-`capture`) and its command.
+Without the `!`, the right-hand side is a built-in action (`run`,
+`capture` or `copy`) and its argument.
 
 ## Directory Expansion
 

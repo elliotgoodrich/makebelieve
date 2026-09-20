@@ -1,6 +1,7 @@
 # Black-box integration test for the makebelieve daemon: spawns it, mounts a
 # build.makebelieve, and checks outputs appear as 1-byte placeholders, emit a
-# change notification when built or rebuilt, and hold the right value.
+# change notification when built or rebuilt, and hold the right value. Both a
+# `run` output and a `copy` output are driven over the same input.
 #
 # Expected -D variables:
 #   MAKEBELIEVE_EXE   the built makebelieve binary
@@ -97,7 +98,7 @@ if(NOT MOUNTED)
   endif()
 else()
   # Before any read, each output is a 1-byte placeholder.
-  foreach(output copy.txt second.txt)
+  foreach(output copy.txt second.txt direct.txt)
     if(EXISTS "${MNT}/${output}")
       file(SIZE "${MNT}/${output}" size)
       if(NOT size EQUAL 1)
@@ -123,6 +124,14 @@ else()
          "copy.txt after first build never settled to '${EXPECTED_INITIAL}' (last read '${built_value}')")
   endif()
 
+  # direct.txt is a `copy` rule over the same input. Reading it builds it, and
+  # records input.txt as its dependency without any command tracing.
+  read_until_equal("${MNT}/direct.txt" "${EXPECTED_INITIAL}" copied_ok copied_value)
+  if(NOT copied_ok)
+    list(APPEND FAILURES
+         "direct.txt after first build never settled to '${EXPECTED_INITIAL}' (last read '${copied_value}')")
+  endif()
+
   # Changing the traced input rebuilds copy.txt: expect a notification, then the
   # new value once it settles.
   execute_process(
@@ -135,6 +144,13 @@ else()
   if(NOT rebuilt_ok)
     list(APPEND FAILURES
          "copy.txt after the input changed never settled to '${EXPECTED_UPDATED}' (last read '${rebuilt_value}')")
+  endif()
+
+  # The same change rebuilds the `copy` rule over that input.
+  read_until_equal("${MNT}/direct.txt" "${EXPECTED_UPDATED}" recopied_ok recopied_value)
+  if(NOT recopied_ok)
+    list(APPEND FAILURES
+         "direct.txt after the input changed never settled to '${EXPECTED_UPDATED}' (last read '${recopied_value}')")
   endif()
 endif()
 
