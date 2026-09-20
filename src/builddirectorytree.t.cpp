@@ -43,7 +43,7 @@ BuildDirectoryTree::BuildResult built(std::string bytes) {
 // its concrete type.
 BuildDirectoryTree::CommandRunner returning(std::string output) {
   return [output = std::move(output)](
-             std::string /*command*/, std::stop_token /*stop*/,
+             BuildDirectoryTree::Command /*command*/, std::stop_token /*stop*/,
              BuildDirectoryTree::BuildComplete on_done) {
     on_done(built(output));
   };
@@ -56,7 +56,7 @@ BuildDirectoryTree::CommandRunner counting_with_inputs(
     int& runs,
     std::vector<std::filesystem::path> inputs) {
   return [&runs, inputs = std::move(inputs)](
-             std::string /*command*/, std::stop_token /*stop*/,
+             BuildDirectoryTree::Command /*command*/, std::stop_token /*stop*/,
              BuildDirectoryTree::BuildComplete on_done) {
     ++runs;
     on_done(BuildDirectoryTree::BuildOutput{
@@ -77,7 +77,8 @@ class DeferredRunner {
 
  public:
   [[nodiscard]] BuildDirectoryTree::CommandRunner runner() const {
-    return [state = m_state](std::string /*command*/, std::stop_token /*stop*/,
+    return [state = m_state](BuildDirectoryTree::Command /*command*/,
+                             std::stop_token /*stop*/,
                              BuildDirectoryTree::BuildComplete on_done) {
       {
         const std::lock_guard lock(state->mutex);
@@ -169,7 +170,7 @@ class BuildDirectoryTreeTest : public ::testing::Test {
 TEST_F(BuildDirectoryTreeTest, NoManifestYieldsAnEmptyTree) {
   int runs = 0;
   const BuildDirectoryTree tree(
-      source, [&runs](std::string, std::stop_token,
+      source, [&runs](BuildDirectoryTree::Command, std::stop_token,
                       BuildDirectoryTree::BuildComplete done) {
         ++runs;
         done(built(std::string{}));
@@ -183,11 +184,11 @@ TEST_F(BuildDirectoryTreeTest, NoManifestYieldsAnEmptyTree) {
 
 // Only open() builds; until then an output reports size 1.
 TEST_F(BuildDirectoryTreeTest, OnlyOpenBuilds) {
-  write_manifest("@/output.txt <- anything %out\n");
+  write_manifest("@/output.txt = run anything %out\n");
 
   int runs = 0;
   const BuildDirectoryTree tree(
-      source, [&runs](std::string, std::stop_token,
+      source, [&runs](BuildDirectoryTree::Command, std::stop_token,
                       BuildDirectoryTree::BuildComplete done) {
         ++runs;
         done(built("built"));
@@ -209,7 +210,7 @@ TEST_F(BuildDirectoryTreeTest, OnlyOpenBuilds) {
 }
 
 TEST_F(BuildDirectoryTreeTest, OpenOfAnythingButAnOutputIsNotABuild) {
-  write_manifest("@/out/file.txt <- anything %out\n");
+  write_manifest("@/out/file.txt = run anything %out\n");
 
   int runs = 0;
   const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
@@ -221,13 +222,13 @@ TEST_F(BuildDirectoryTreeTest, OpenOfAnythingButAnOutputIsNotABuild) {
 }
 
 TEST_F(BuildDirectoryTreeTest, ReadHandsTheRawCommandToTheRunner) {
-  write_manifest("@/output.txt <- cp input.txt %out\n");
+  write_manifest("@/output.txt = run cp input.txt %out\n");
 
   std::vector<std::string> commands;
   const BuildDirectoryTree tree(
-      source, [&commands](std::string command, std::stop_token,
+      source, [&commands](BuildDirectoryTree::Command command, std::stop_token,
                           BuildDirectoryTree::BuildComplete done) {
-        commands.push_back(std::move(command));
+        commands.push_back(std::move(command.text));
         done(built("result"));
       });
 
@@ -237,11 +238,11 @@ TEST_F(BuildDirectoryTreeTest, ReadHandsTheRawCommandToTheRunner) {
 }
 
 TEST_F(BuildDirectoryTreeTest, BuildsLazilyAndOncePerOutputOnSuccess) {
-  write_manifest("@/output.txt <- build %out\n");
+  write_manifest("@/output.txt = run build %out\n");
 
   int runs = 0;
   const BuildDirectoryTree tree(
-      source, [&runs](std::string, std::stop_token,
+      source, [&runs](BuildDirectoryTree::Command, std::stop_token,
                       BuildDirectoryTree::BuildComplete done) {
         ++runs;
         done(built("hello world"));
@@ -256,11 +257,11 @@ TEST_F(BuildDirectoryTreeTest, BuildsLazilyAndOncePerOutputOnSuccess) {
 }
 
 TEST_F(BuildDirectoryTreeTest, RetriesAfterAFailedBuild) {
-  write_manifest("@/output.txt <- build %out\n");
+  write_manifest("@/output.txt = run build %out\n");
 
   int runs = 0;
   const BuildDirectoryTree tree(
-      source, [&runs](std::string, std::stop_token,
+      source, [&runs](BuildDirectoryTree::Command, std::stop_token,
                       BuildDirectoryTree::BuildComplete done) {
         ++runs;
         if (runs == 1) {
@@ -289,7 +290,7 @@ TEST_F(BuildDirectoryTreeTest, OnlyGeneratedOutputsAreVisible) {
   // The source files - the manifest included - are not part of the output
   // namespace; only the declared `@/` outputs are.
   source.write_file("input.txt", "some input");
-  write_manifest("@/output.txt <- build %out\n");
+  write_manifest("@/output.txt = run build %out\n");
 
   const BuildDirectoryTree tree(source, returning("built"));
 
@@ -302,7 +303,7 @@ TEST_F(BuildDirectoryTreeTest, OnlyGeneratedOutputsAreVisible) {
 }
 
 TEST_F(BuildDirectoryTreeTest, CreatesParentDirectoriesForNestedOutputs) {
-  write_manifest("@/out/deep/file.txt <- build %out\n");
+  write_manifest("@/out/deep/file.txt = run build %out\n");
 
   const BuildDirectoryTree tree(source, returning("nested"));
 
@@ -315,18 +316,19 @@ TEST_F(BuildDirectoryTreeTest, CreatesParentDirectoriesForNestedOutputs) {
 // The completion handler can be taken as `auto`, so a runner never has to name
 // BuildComplete.
 TEST_F(BuildDirectoryTreeTest, RunnerCompletionHandlerCanBeGeneric) {
-  write_manifest("@/output.txt <- build %out\n");
+  write_manifest("@/output.txt = run build %out\n");
 
   const BuildDirectoryTree tree(
-      source,
-      [](std::string, std::stop_token, auto done) { done(built("generic")); });
+      source, [](BuildDirectoryTree::Command, std::stop_token, auto done) {
+        done(built("generic"));
+      });
 
   EXPECT_EQ(read_output(tree, "output.txt"), "generic");
 }
 
 // open() waits for the build to report back; status() does not.
 TEST_F(BuildDirectoryTreeTest, OpenBlocksUntilTheBuildReportsBack) {
-  write_manifest("@/output.txt <- build %out\n");
+  write_manifest("@/output.txt = run build %out\n");
 
   const DeferredRunner builds;
   const BuildDirectoryTree tree(source, builds.runner());
@@ -352,7 +354,7 @@ TEST_F(BuildDirectoryTreeTest, OpenBlocksUntilTheBuildReportsBack) {
 
 // Two opens of one unbuilt output share one build.
 TEST_F(BuildDirectoryTreeTest, ConcurrentOpensShareOneBuild) {
-  write_manifest("@/output.txt <- build %out\n");
+  write_manifest("@/output.txt = run build %out\n");
 
   const DeferredRunner builds;
   const BuildDirectoryTree tree(source, builds.runner());
@@ -373,12 +375,12 @@ TEST_F(BuildDirectoryTreeTest, ConcurrentOpensShareOneBuild) {
 
 // Destroying the tree requests a stop on the token handed to in-flight runners.
 TEST_F(BuildDirectoryTreeTest, DestructionRequestsStop) {
-  write_manifest("@/output.txt <- build %out\n");
+  write_manifest("@/output.txt = run build %out\n");
 
   std::stop_token token;
   {
     const BuildDirectoryTree tree(
-        source, [&token](std::string, std::stop_token stop,
+        source, [&token](BuildDirectoryTree::Command, std::stop_token stop,
                          BuildDirectoryTree::BuildComplete done) {
           token = std::move(stop);
           done(built("built"));
@@ -396,13 +398,26 @@ TEST_F(BuildDirectoryTreeTest, DestructionRequestsStop) {
 // wherever ctest is.
 TEST_F(BuildDirectoryTreeTest, ShellRunnerBuildsLazilyThroughTheShell) {
   write_input("input.txt", "hello world");
-  write_manifest("@/output.txt <- cmake -E copy input.txt %out\n");
+  write_manifest("@/output.txt = run cmake -E copy input.txt %out\n");
 
   const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
 
   EXPECT_EQ(output_size(tree, "output.txt"), 1U);  // unbuilt until opened
   EXPECT_EQ(read_output(tree, "output.txt"), "hello world");
   EXPECT_EQ(output_size(tree, "output.txt"), 11U);
+}
+
+// A `capture` rule has no output file: the bytes the command writes to
+// standard output are the output. `cmake -E cat` writes its input there
+// verbatim, under either shell.
+TEST_F(BuildDirectoryTreeTest, ShellRunnerCapturesStandardOutput) {
+  write_input("input.txt", "hello world");
+  write_manifest("@/output.txt = capture cmake -E cat input.txt\n");
+
+  const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
+
+  EXPECT_EQ(output_size(tree, "output.txt"), 1U);  // unbuilt until opened
+  EXPECT_EQ(read_output(tree, "output.txt"), "hello world");
 }
 
 // ---------------------------------------------------------------------------
@@ -413,7 +428,7 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerBuildsLazilyThroughTheShell) {
 // rebuilds it eagerly - the new content is in place before anyone reads again.
 TEST_F(BuildDirectoryTreeTest, RebuildsAReadOutputWhenATracedInputChanges) {
   source.write_file("input.txt", "v1");
-  write_manifest("@/output.txt <- build input.txt %out\n");
+  write_manifest("@/output.txt = run build input.txt %out\n");
 
   int runs = 0;
   const BuildDirectoryTree tree(source,
@@ -436,7 +451,7 @@ TEST_F(BuildDirectoryTreeTest, RebuildsAReadOutputWhenATracedInputChanges) {
 // downstream watcher learns the output changed.
 TEST_F(BuildDirectoryTreeTest, AnEagerRebuildNotifiesSubscribers) {
   source.write_file("input.txt", "v1");
-  write_manifest("@/output.txt <- build input.txt %out\n");
+  write_manifest("@/output.txt = run build input.txt %out\n");
 
   int runs = 0;
   const BuildDirectoryTree tree(source,
@@ -461,7 +476,7 @@ TEST_F(BuildDirectoryTreeTest, AnEagerRebuildNotifiesSubscribers) {
 TEST_F(BuildDirectoryTreeTest, IgnoresChangesToUntrackedFiles) {
   source.write_file("input.txt", "v1");
   source.write_file("other.txt", "x");
-  write_manifest("@/output.txt <- build input.txt %out\n");
+  write_manifest("@/output.txt = run build input.txt %out\n");
 
   int runs = 0;
   const BuildDirectoryTree tree(source,
@@ -477,7 +492,7 @@ TEST_F(BuildDirectoryTreeTest, IgnoresChangesToUntrackedFiles) {
 // no recorded dependencies to react to, and stays lazy until first read.
 TEST_F(BuildDirectoryTreeTest, DoesNotEagerlyBuildAnUnreadOutput) {
   source.write_file("input.txt", "v1");
-  write_manifest("@/output.txt <- build input.txt %out\n");
+  write_manifest("@/output.txt = run build input.txt %out\n");
 
   int runs = 0;
   const BuildDirectoryTree tree(source,
@@ -495,12 +510,12 @@ TEST_F(BuildDirectoryTreeTest, DoesNotEagerlyBuildAnUnreadOutput) {
 TEST_F(BuildDirectoryTreeTest, ARebuildRefreshesTheTrackedInputs) {
   source.write_file("a.txt", "1");
   source.write_file("b.txt", "1");
-  write_manifest("@/output.txt <- build %out\n");
+  write_manifest("@/output.txt = run build %out\n");
 
   int runs = 0;
   // The first build reads a.txt; every rebuild thereafter reads b.txt instead.
   const BuildDirectoryTree tree(
-      source, [&runs](std::string, std::stop_token,
+      source, [&runs](BuildDirectoryTree::Command, std::stop_token,
                       BuildDirectoryTree::BuildComplete on_done) {
         ++runs;
         std::vector<std::filesystem::path> inputs =
@@ -529,13 +544,13 @@ TEST_F(BuildDirectoryTreeTest, ARebuildRefreshesTheTrackedInputs) {
 // went stale and rebuilds once more - coalescing the changes.
 TEST_F(BuildDirectoryTreeTest, CoalescesInputChangesDuringAnInFlightRebuild) {
   source.write_file("input.txt", "v1");
-  write_manifest("@/output.txt <- build %out\n");
+  write_manifest("@/output.txt = run build %out\n");
 
   // Build #1 completes at once; later ones are held in flight.
   std::vector<BuildDirectoryTree::BuildComplete> deferred;
   int runs = 0;
   const BuildDirectoryTree tree(
-      source, [&](std::string, std::stop_token,
+      source, [&](BuildDirectoryTree::Command, std::stop_token,
                   BuildDirectoryTree::BuildComplete on_done) {
         ++runs;
         if (runs == 1) {
@@ -580,7 +595,7 @@ TEST_F(BuildDirectoryTreeTest, CoalescesInputChangesDuringAnInFlightRebuild) {
 // previous build's size.
 TEST_F(BuildDirectoryTreeTest, OpeningADirtyOutputWaitsForItsRebuild) {
   source.write_file("input.txt", "v1");
-  write_manifest("@/output.txt <- build %out\n");
+  write_manifest("@/output.txt = run build %out\n");
 
   const DeferredRunner builds;
   const BuildDirectoryTree tree(source, builds.runner());
@@ -620,11 +635,12 @@ TEST_F(BuildDirectoryTreeTest, OpeningADirtyOutputWaitsForItsRebuild) {
 
 // A runner whose output names the command it ran, recording each command.
 BuildDirectoryTree::CommandRunner echoing(std::vector<std::string>& commands) {
-  return [&commands](std::string command, std::stop_token /*stop*/,
-                     BuildDirectoryTree::BuildComplete on_done) {
-    commands.push_back(command);
-    on_done(built("ran " + command));
-  };
+  return
+      [&commands](BuildDirectoryTree::Command command, std::stop_token /*stop*/,
+                  BuildDirectoryTree::BuildComplete on_done) {
+        commands.push_back(command.text);
+        on_done(built("ran " + command.text));
+      };
 }
 
 TEST_F(BuildDirectoryTreeTest, AManifestWrittenLaterAddsItsOutputs) {
@@ -632,7 +648,7 @@ TEST_F(BuildDirectoryTreeTest, AManifestWrittenLaterAddsItsOutputs) {
   const BuildDirectoryTree tree(source, echoing(commands));
   EXPECT_TRUE(tree.ls("")->empty());
 
-  write_manifest("@/out/file.txt <- first %out\n");
+  write_manifest("@/out/file.txt = run first %out\n");
 
   EXPECT_EQ(output_size(tree, "out/file.txt"), 1U);  // unbuilt
   EXPECT_TRUE(commands.empty());
@@ -640,12 +656,12 @@ TEST_F(BuildDirectoryTreeTest, AManifestWrittenLaterAddsItsOutputs) {
 }
 
 TEST_F(BuildDirectoryTreeTest, AddingARuleLeavesTheOthersBuilt) {
-  write_manifest("@/a.txt <- a %out\n");
+  write_manifest("@/a.txt = run a %out\n");
   std::vector<std::string> commands;
   const BuildDirectoryTree tree(source, echoing(commands));
   EXPECT_EQ(read_output(tree, "a.txt"), "ran a %out");
 
-  write_manifest("@/a.txt <- a %out\n@/b.txt <- b %out\n");
+  write_manifest("@/a.txt = run a %out\n@/b.txt = run b %out\n");
 
   EXPECT_EQ(output_size(tree, "a.txt"), 10U);  // kept its built content
   EXPECT_EQ(output_size(tree, "b.txt"), 1U);   // new and unbuilt
@@ -655,12 +671,12 @@ TEST_F(BuildDirectoryTreeTest, AddingARuleLeavesTheOthersBuilt) {
 
 TEST_F(BuildDirectoryTreeTest, RemovingARuleRemovesItsOutputAndEmptyParents) {
   write_manifest(
-      "@/keep.txt <- keep %out\n@/gone/deep/file.txt <- gone %out\n");
+      "@/keep.txt = run keep %out\n@/gone/deep/file.txt = run gone %out\n");
   std::vector<std::string> commands;
   const BuildDirectoryTree tree(source, echoing(commands));
   EXPECT_EQ(read_output(tree, "gone/deep/file.txt"), "ran gone %out");
 
-  write_manifest("@/keep.txt <- keep %out\n");
+  write_manifest("@/keep.txt = run keep %out\n");
 
   EXPECT_FALSE(tree.status("gone/deep/file.txt").has_value());
   EXPECT_FALSE(tree.status("gone").has_value());
@@ -673,17 +689,17 @@ TEST_F(BuildDirectoryTreeTest, RemovingARuleRemovesItsOutputAndEmptyParents) {
 }
 
 TEST_F(BuildDirectoryTreeTest, AnOutputCanReplaceADirectoryOfRemovedOutputs) {
-  write_manifest("@/out/file.txt <- nested %out\n");
+  write_manifest("@/out/file.txt = run nested %out\n");
   std::vector<std::string> commands;
   const BuildDirectoryTree tree(source, echoing(commands));
 
-  write_manifest("@/out <- flat %out\n");
+  write_manifest("@/out = run flat %out\n");
 
   EXPECT_EQ(read_output(tree, "out"), "ran flat %out");
 }
 
 TEST_F(BuildDirectoryTreeTest, DeletingTheManifestRemovesEveryOutput) {
-  write_manifest("@/a.txt <- a %out\n@/dir/b.txt <- b %out\n");
+  write_manifest("@/a.txt = run a %out\n@/dir/b.txt = run b %out\n");
   std::vector<std::string> commands;
   const BuildDirectoryTree tree(source, echoing(commands));
 
@@ -697,13 +713,13 @@ TEST_F(BuildDirectoryTreeTest, DeletingTheManifestRemovesEveryOutput) {
 // A changed command rebuilds an opened output eagerly, like a changed input,
 // and leaves outputs whose rule did not change alone.
 TEST_F(BuildDirectoryTreeTest, ChangingACommandRebuildsAnOpenedOutput) {
-  write_manifest("@/a.txt <- a1 %out\n@/b.txt <- b %out\n");
+  write_manifest("@/a.txt = run a1 %out\n@/b.txt = run b %out\n");
   std::vector<std::string> commands;
   const BuildDirectoryTree tree(source, echoing(commands));
   EXPECT_EQ(read_output(tree, "a.txt"), "ran a1 %out");
   EXPECT_EQ(read_output(tree, "b.txt"), "ran b %out");
 
-  write_manifest("@/a.txt <- a2 %out\n@/b.txt <- b %out\n");
+  write_manifest("@/a.txt = run a2 %out\n@/b.txt = run b %out\n");
 
   ASSERT_EQ(commands.size(), 3U);
   EXPECT_EQ(commands[2], "a2 %out");
@@ -712,11 +728,11 @@ TEST_F(BuildDirectoryTreeTest, ChangingACommandRebuildsAnOpenedOutput) {
 }
 
 TEST_F(BuildDirectoryTreeTest, ChangingACommandLeavesAnUnopenedOutputLazy) {
-  write_manifest("@/a.txt <- a1 %out\n");
+  write_manifest("@/a.txt = run a1 %out\n");
   std::vector<std::string> commands;
   const BuildDirectoryTree tree(source, echoing(commands));
 
-  write_manifest("@/a.txt <- a2 %out\n");
+  write_manifest("@/a.txt = run a2 %out\n");
 
   EXPECT_TRUE(commands.empty());
   EXPECT_EQ(read_output(tree, "a.txt"), "ran a2 %out");
@@ -725,7 +741,7 @@ TEST_F(BuildDirectoryTreeTest, ChangingACommandLeavesAnUnopenedOutputLazy) {
 // A build that finishes after its rule was removed does not bring the output
 // back, and the open waiting on it reports it missing.
 TEST_F(BuildDirectoryTreeTest, ABuildFinishingAfterItsRuleIsRemovedIsDropped) {
-  write_manifest("@/output.txt <- build %out\n");
+  write_manifest("@/output.txt = run build %out\n");
 
   const DeferredRunner builds;
   const BuildDirectoryTree tree(source, builds.runner());
@@ -746,7 +762,7 @@ TEST_F(BuildDirectoryTreeTest, ABuildFinishingAfterItsRuleIsRemovedIsDropped) {
 }
 
 TEST_F(BuildDirectoryTreeTest, ABadManifestAtStartupThrows) {
-  write_manifest("@/ok.txt <- a %out\nnot a rule\n");
+  write_manifest("@/ok.txt = run a %out\nnot a rule\n");
   std::vector<std::string> commands;
   try {
     const BuildDirectoryTree tree(source, echoing(commands));
@@ -761,7 +777,7 @@ TEST_F(BuildDirectoryTreeTest, ABadManifestAtStartupThrows) {
 // A bad edit - a typo, or rules that clash - is reported and ignored, leaving
 // the previous rules and their built outputs in place until it is fixed.
 TEST_F(BuildDirectoryTreeTest, ABadEditKeepsThePreviousRules) {
-  write_manifest("@/a.txt <- a %out\n");
+  write_manifest("@/a.txt = run a %out\n");
   std::vector<std::string> commands;
   std::vector<std::string> problems;
   const BuildDirectoryTree tree(
@@ -769,8 +785,8 @@ TEST_F(BuildDirectoryTreeTest, ABadEditKeepsThePreviousRules) {
       [&problems](const std::string& text) { problems.push_back(text); });
   EXPECT_EQ(read_output(tree, "a.txt"), "ran a %out");
 
-  write_manifest("@/a.txt <- a %out\n@/b.txt < b %out\n");
-  write_manifest("@/a.txt <- a %out\n@/a.txt/b <- b %out\n");
+  write_manifest("@/a.txt = run a %out\n@/b.txt run b %out\n");
+  write_manifest("@/a.txt = run a %out\n@/a.txt/b = run b %out\n");
 
   ASSERT_EQ(problems.size(), 2U);
   EXPECT_TRUE(problems[0].starts_with("build.makebelieve:2: ")) << problems[0];
@@ -778,7 +794,7 @@ TEST_F(BuildDirectoryTreeTest, ABadEditKeepsThePreviousRules) {
   EXPECT_EQ(output_size(tree, "a.txt"), 10U);  // still built
   EXPECT_FALSE(tree.status("b.txt").has_value());
 
-  write_manifest("@/a.txt <- a %out\n@/b.txt <- b %out\n");
+  write_manifest("@/a.txt = run a %out\n@/b.txt = run b %out\n");
   EXPECT_EQ(problems.size(), 2U);
   EXPECT_EQ(output_size(tree, "a.txt"), 10U);
   EXPECT_EQ(read_output(tree, "b.txt"), "ran b %out");
@@ -819,7 +835,7 @@ class FlakyTree : public DirectoryTree {
 // mistaken for an empty one.
 TEST_F(BuildDirectoryTreeTest, AnUnreadableManifestKeepsThePreviousRules) {
   FlakyTree flaky;
-  flaky.inner.write_file("build.makebelieve", "@/a.txt <- a %out\n");
+  flaky.inner.write_file("build.makebelieve", "@/a.txt = run a %out\n");
   std::vector<std::string> commands;
   std::vector<std::string> problems;
   const BuildDirectoryTree tree(
@@ -827,21 +843,21 @@ TEST_F(BuildDirectoryTreeTest, AnUnreadableManifestKeepsThePreviousRules) {
       [&problems](const std::string& text) { problems.push_back(text); });
 
   flaky.fail_reads = true;
-  flaky.inner.write_file("build.makebelieve", "@/b.txt <- b %out\n");
+  flaky.inner.write_file("build.makebelieve", "@/b.txt = run b %out\n");
 
   ASSERT_EQ(problems.size(), 1U);
   EXPECT_TRUE(problems[0].starts_with("build.makebelieve: ")) << problems[0];
   EXPECT_TRUE(tree.status("a.txt").has_value());
 
   flaky.fail_reads = false;
-  flaky.inner.write_file("build.makebelieve", "@/b.txt <- b %out\n");
+  flaky.inner.write_file("build.makebelieve", "@/b.txt = run b %out\n");
   EXPECT_FALSE(tree.status("a.txt").has_value());
   EXPECT_TRUE(tree.status("b.txt").has_value());
 }
 
 TEST_F(BuildDirectoryTreeTest, AnUnreadableManifestAtStartupThrows) {
   FlakyTree flaky;
-  flaky.inner.write_file("build.makebelieve", "@/a.txt <- a %out\n");
+  flaky.inner.write_file("build.makebelieve", "@/a.txt = run a %out\n");
   flaky.fail_reads = true;
   std::vector<std::string> commands;
   EXPECT_THROW(BuildDirectoryTree(flaky, echoing(commands)),
@@ -852,14 +868,14 @@ TEST_F(BuildDirectoryTreeTest, AnUnreadableManifestAtStartupThrows) {
 // it is declared again.
 TEST_F(BuildDirectoryTreeTest, ARemovedRuleForgetsItsDependencies) {
   source.write_file("input.txt", "v1");
-  write_manifest("@/output.txt <- build %out\n");
+  write_manifest("@/output.txt = run build %out\n");
   int runs = 0;
   const BuildDirectoryTree tree(source,
                                 counting_with_inputs(runs, {"input.txt"}));
   EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
 
   write_manifest("");
-  write_manifest("@/output.txt <- build %out\n");
+  write_manifest("@/output.txt = run build %out\n");
   source.write_file("input.txt", "v2");
 
   EXPECT_EQ(runs, 1);  // re-declared unbuilt, so nothing to rebuild eagerly
@@ -876,7 +892,7 @@ TEST_F(BuildDirectoryTreeTest, RebuildsThroughRealTracingWhenAnInputChanges) {
   write_input("input.txt", "v1");
   // `cmake -E copy` reads input.txt (which the tracer sees) into %out.
   std::ofstream(work / "build.makebelieve", std::ios::binary)
-      << "@/output.txt <- cmake -E copy input.txt %out\n";
+      << "@/output.txt = run cmake -E copy input.txt %out\n";
 
   const RealDirectoryTree real_source(work);
   const BuildDirectoryTree tree(real_source,
@@ -905,7 +921,7 @@ TEST_F(BuildDirectoryTreeTest, ReloadsTheManifestWhenItChangesOnDisk) {
   using namespace std::chrono_literals;
 
   std::ofstream(work / "build.makebelieve", std::ios::binary)
-      << "@/old.txt <- cmake -E echo_append old > %out\n";
+      << "@/old.txt = run cmake -E echo_append old > %out\n";
 
   const RealDirectoryTree real_source(work);
   const BuildDirectoryTree tree(real_source,
@@ -919,7 +935,7 @@ TEST_F(BuildDirectoryTreeTest, ReloadsTheManifestWhenItChangesOnDisk) {
           !tree.status("new.txt").has_value()) &&
          std::chrono::steady_clock::now() < deadline) {
     std::ofstream(work / "build.makebelieve", std::ios::binary)
-        << "@/new.txt <- cmake -E echo_append new > %out\n";
+        << "@/new.txt = run cmake -E echo_append new > %out\n";
     std::this_thread::sleep_for(100ms);
   }
 

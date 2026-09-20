@@ -2,6 +2,7 @@
 #pragma once
 
 #include "directorytree.hpp"
+#include "manifest.hpp"
 
 #include <cstddef>
 #include <expected>
@@ -20,10 +21,10 @@ namespace makebelieve {
 /// `build.makebelieve` manifest that lives in another `DirectoryTree`.
 ///
 /// On construction it reads the manifest from a @a source tree and presents
-/// one entry per declared `@/output <- command` rule. `open` builds an output
-/// that is unbuilt or dirty, blocking until its @link CommandRunner reports
-/// back. `status` and `read` never build: an unbuilt output reports size 1,
-/// otherwise the size of its last build.
+/// one entry per declared `@/output = <action> <command>` rule. `open` builds
+/// an output that is unbuilt or dirty, blocking until its @link CommandRunner
+/// reports back. `status` and `read` never build: an unbuilt output reports
+/// size 1, otherwise the size of its last build.
 ///
 /// It then observes @a source for the rest of its life, recording the inputs
 /// each build reads, so a change to one of those inputs rebuilds the outputs
@@ -57,6 +58,18 @@ class BuildDirectoryTree : public DirectoryTree {
   /// when it could not be run to completion.
   using BuildResult = std::expected<BuildOutput, std::error_code>;
 
+  /// One rule's right-hand side: the command to run, and the action that says
+  /// where its output comes from - the file `%out` names for
+  /// `Manifest::Action::Run`, its standard output for
+  /// `Manifest::Action::Capture`.
+  struct Command {
+    Manifest::Action action = Manifest::Action::Run;
+    std::string text;
+
+    [[nodiscard]] friend bool operator==(const Command&,
+                                         const Command&) = default;
+  };
+
   /// Reports the outcome of a single command back to the tree. Move-only so it
   /// can carry move-only state, and single-shot - call it exactly once.
   using BuildComplete = std::move_only_function<void(BuildResult)>;
@@ -71,7 +84,7 @@ class BuildDirectoryTree : public DirectoryTree {
   /// cancellation can simply leave the `stop_token` parameter unnamed.
   /// @pre A deferred completion does not outlive this `BuildDirectoryTree`.
   using CommandRunner = std::function<
-      void(std::string command, std::stop_token stop, BuildComplete on_done)>;
+      void(Command command, std::stop_token stop, BuildComplete on_done)>;
 
   /// Told why a changed manifest was rejected, one problem per line (such as
   /// `build.makebelieve:3: expected ...`). Called on the source's watcher
@@ -96,10 +109,11 @@ class BuildDirectoryTree : public DirectoryTree {
   BuildDirectoryTree(BuildDirectoryTree&&) = delete;
   BuildDirectoryTree& operator=(BuildDirectoryTree&&) = delete;
 
-  /// Returns a `CommandRunner` that substitutes `%out` with a scratch file,
-  /// runs the command through the system shell with the working directory set
-  /// to @a working_directory (so relative inputs resolve against it), and
-  /// reports the bytes the command wrote to that file. It runs the command
+  /// Returns a `CommandRunner` that runs the command through the system shell
+  /// with the working directory set to @a working_directory (so relative
+  /// inputs resolve against it). A `Run` command has `%out` substituted with a
+  /// scratch file and produces the bytes it wrote there; a `Capture` command
+  /// produces the bytes it wrote to standard output. It runs the command
   /// synchronously, reporting the result before returning. Traced inputs are
   /// reported relative to @a working_directory, so for dependency tracking to
   /// line up it should be the filesystem root that @a source mirrors.

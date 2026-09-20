@@ -14,10 +14,11 @@ namespace makebelieve {
 
 namespace {
 
+bool is_space(char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
 std::string_view trim(std::string_view text) {
-  const auto is_space = [](char c) {
-    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
-  };
   while (!text.empty() && is_space(text.front())) {
     text.remove_prefix(1);
   }
@@ -25,6 +26,26 @@ std::string_view trim(std::string_view text) {
     text.remove_suffix(1);
   }
   return text;
+}
+
+// The leading whitespace-delimited word of @a text, which is already trimmed.
+std::string_view first_word(std::string_view text) {
+  std::size_t end = 0;
+  while (end < text.size() && !is_space(text[end])) {
+    ++end;
+  }
+  return text.substr(0, end);
+}
+
+// The action @a word names, or nullopt when it names none.
+std::optional<Manifest::Action> to_action(std::string_view word) {
+  if (word == "run") {
+    return Manifest::Action::Run;
+  }
+  if (word == "capture") {
+    return Manifest::Action::Capture;
+  }
+  return std::nullopt;
 }
 
 // Normalises @a output, or returns nullopt when it does not name a file inside
@@ -67,18 +88,31 @@ Manifest Manifest::parse(std::string_view text) {
           {.line = number, .message = std::move(message)});
     };
 
-    const std::size_t arrow = line.find("<-");
-    if (arrow == std::string_view::npos) {
-      reject("expected `@/<output> <- <command>`");
+    const std::size_t equals = line.find('=');
+    if (equals == std::string_view::npos) {
+      reject("expected `@/<output> = <action> <command>`");
       continue;
     }
 
-    const std::string_view left = trim(line.substr(0, arrow));
-    const std::string_view command = trim(line.substr(arrow + 2));
+    const std::string_view left = trim(line.substr(0, equals));
+    const std::string_view value = trim(line.substr(equals + 1));
     if (!left.starts_with("@/")) {
       reject(std::format("output `{}` must start with `@/`", left));
       continue;
     }
+
+    // An output is assigned an action and the command it applies to; the rest
+    // of the line after the action is that command, taken verbatim.
+    const std::string_view word = first_word(value);
+    const std::optional<Manifest::Action> action = to_action(word);
+    if (!action.has_value()) {
+      reject(
+          std::format("`{}` must be assigned `run <command>` or "
+                      "`capture <command>`",
+                      left));
+      continue;
+    }
+    const std::string_view command = trim(value.substr(word.size()));
     if (command.empty()) {
       reject(std::format("`{}` has no command", left));
       continue;
@@ -121,8 +155,9 @@ Manifest Manifest::parse(std::string_view text) {
          parent = parent.parent_path()) {
       directories.emplace(parent, number);
     }
-    manifest.m_rules.push_back(
-        {.output = *output, .command = std::string(command)});
+    manifest.m_rules.push_back({.output = *output,
+                                .action = *action,
+                                .command = std::string(command)});
   }
 
   return manifest;
