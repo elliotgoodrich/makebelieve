@@ -1,16 +1,20 @@
-# MakeBelieve
+# makebelieve
 
-**MakeBelieve** is a demand-driven build system exposed as a filesystem.
+**makebelieve** is a demand-driven build system exposed as a filesystem.
 
-Declare `output <- command` rules in a `build.makebelieve` file,
+Declare `output = action command` rules in a `build.makebelieve` file,
 
 ```text
 # build.makebelieve
-@/hello.txt <- /bin/sh -c 'printf "hello world\n" > %out'
-@/copied.txt <- cp source.txt %out
+@/hello.txt = capture printf "hello world\n"
+@/copied.txt = run cp source.txt %out
 ```
 
-Then **Makebelieve** will instantly manifest this as a folder,
+With `run` the command writes the output itself, to the path `%out`
+stands for; with `capture` the bytes the command writes to standard
+output are the output.
+
+Then **makebelieve** will instantly manifest this as a folder,
 
 ```sh
 $ makebelieve mount ../output
@@ -47,7 +51,7 @@ $ makebelieve unmount ../output
 which asks the running instance to unmount and blocks until it has torn
 down.
 
-If one of the dependencies changes, **MakeBelieve** will rerun the
+If one of the dependencies changes, **makebelieve** will rerun the
 command and regenerate the output, and opening the file while that is
 under way waits for it.
 

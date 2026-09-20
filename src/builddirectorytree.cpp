@@ -206,11 +206,14 @@ void remove_with_empty_parents(InMemoryDirectoryTree& tree,
   }
 }
 
+// One output's command, as the runner receives it.
+using Command = BuildDirectoryTree::Command;
+
 // Reads the rules of the manifest in @a source, mapping each output to its
 // command, or describes - one problem per line - why the manifest could not be
 // read or has lines it cannot accept. No manifest at all means no rules.
-std::expected<std::map<std::filesystem::path, std::string>, std::string>
-read_rules(const DirectoryTree& source) {
+std::expected<std::map<std::filesystem::path, Command>, std::string> read_rules(
+    const DirectoryTree& source) {
   const std::expected<std::string, std::error_code> manifest =
       read_all(source, k_manifest_name);
   if (!manifest.has_value()) {
@@ -234,9 +237,10 @@ read_rules(const DirectoryTree& source) {
     return std::unexpected(std::move(problems));
   }
 
-  std::map<std::filesystem::path, std::string> commands;
+  std::map<std::filesystem::path, Command> commands;
   for (const Manifest::Rule& rule : parsed.rules()) {
-    commands.emplace(rule.output, rule.command);
+    commands.emplace(rule.output,
+                     Command{.action = rule.action, .text = rule.command});
   }
   return commands;
 }
@@ -267,7 +271,7 @@ class BuildDirectoryTree::Impl {
 
   // Every declared output mapped to the command that (re)builds it, following
   // the manifest as it changes.
-  std::map<std::filesystem::path, std::string> m_commands;
+  std::map<std::filesystem::path, Command> m_commands;
 
   // Outputs that need (re)building: every output starts stale, a successful
   // build clears it, an input change marks it stale again.
@@ -414,7 +418,7 @@ class BuildDirectoryTree::Impl {
 
  private:
   void start_build(const std::filesystem::path& output) {
-    std::string command;
+    Command command;
     {
       const std::lock_guard lock(m_mutex);
       if (!m_stale.contains(output) || m_in_flight.contains(output)) {
@@ -525,8 +529,7 @@ class BuildDirectoryTree::Impl {
   // appears unbuilt, a removed rule's output disappears, and an output whose
   // command changed goes stale (rebuilt eagerly if opened). Outputs whose rule
   // is unchanged keep their built content.
-  void apply_rules(
-      const std::map<std::filesystem::path, std::string>& commands) {
+  void apply_rules(const std::map<std::filesystem::path, Command>& commands) {
     std::vector<std::filesystem::path> removed;
     std::vector<std::filesystem::path> added;
     std::vector<std::filesystem::path> changed;
@@ -638,26 +641,34 @@ BuildDirectoryTree::~BuildDirectoryTree() = default;
 BuildDirectoryTree::CommandRunner BuildDirectoryTree::shell_runner(
     std::filesystem::path working_directory) {
   return [working_directory = std::move(working_directory)](
-             const std::string& command, const std::stop_token& stop,
+             const Command& command, const std::stop_token& stop,
              BuildComplete on_done) {
-    // Give the command a private file to write its output to and substitute
-    // that path in for %out. The build output is whatever the command left in
+    const bool capture = command.action == Manifest::Action::Capture;
+
+    // A `run` command gets a private file to write its output to, with that
+    // path substituted in for %out. Its build output is whatever it left in
     // that file - not ProcessUtil's captured stdout, which a `> %out` rule
     // leaves empty - so the scratch directory is kept alive (through the
-    // shared_ptr the completion captures) until we have read it back.
-    const auto scratch = std::make_shared<TempDirectory>(make_temp_directory());
-    const std::filesystem::path out_path = scratch->path() / "out";
+    // shared_ptr the completion captures) until we have read it back. A
+    // `capture` command has no output file: its stdout is the output.
+    const std::shared_ptr<TempDirectory> scratch =
+        capture ? nullptr
+                : std::make_shared<TempDirectory>(make_temp_directory());
+    const std::filesystem::path out_path =
+        capture ? std::filesystem::path{} : scratch->path() / "out";
 
     ProcessUtil::run(
-        working_directory, substitute_out(command, out_path), stop,
+        working_directory,
+        capture ? command.text : substitute_out(command.text, out_path), stop,
         // Reading the output allocates; a synchronous ProcessUtil
         // lets that propagate back out to the triggering read().
         // NOLINTNEXTLINE(bugprone-exception-escape)
-        [scratch, out_path, working_directory,
+        [scratch, out_path, capture, working_directory,
          on_done = std::move(on_done)](ProcessUtil::Result result) mutable {
           if (result.has_value()) {
             on_done(BuildOutput{
-                .bytes = read_file(out_path),
+                .bytes = capture ? std::move(result->standard_output)
+                                 : read_file(out_path),
                 .inputs = relativize(result->inputs, working_directory)});
           } else {
             on_done(std::unexpected(result.error()));
