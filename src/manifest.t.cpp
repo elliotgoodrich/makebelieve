@@ -64,6 +64,29 @@ INSTANTIATE_TEST_SUITE_P(
             .name = "single_capture_rule",
             .input = "@/output.txt = capture echo \"foo\"\n",
             .expected = {{"output.txt", Action::Capture, "echo \"foo\""}}},
+        // `copy` names a file instead of a command; the rule keeps it, made
+        // relative and normalised, in the same field.
+        ParseCase{.name = "single_copy_rule",
+                  .input = "@/output.txt = copy src/input.txt\n",
+                  .expected = {{"output.txt", Action::Copy, "src/input.txt"}}},
+        ParseCase{.name = "normalises_a_copy_source",
+                  .input = "@/output.txt = copy ./src/../input.txt\n",
+                  .expected = {{"output.txt", Action::Copy, "input.txt"}}},
+        // A copy source has to name a file inside the manifest's directory,
+        // so every copy has a source the build can watch.
+        ParseCase{.name = "rejects_a_copy_source_outside_the_directory",
+                  .input = "@/a.txt = copy ../outside.txt\n"
+                           "@/b.txt = copy /etc/hosts\n"
+                           "@/c.txt = copy subdir/\n"
+                           "@/d.txt = copy .\n"
+                           "@/e.txt = copy kept.txt\n",
+                  .expected = {{"e.txt", Action::Copy, "kept.txt"}},
+                  .error_lines = {1, 2, 3, 4}},
+        // A copy source is a path, not a command line, so the whole of the
+        // rest of the line is the path - spaces and all.
+        ParseCase{.name = "keeps_spaces_in_a_copy_source",
+                  .input = "@/output.txt = copy my input.txt\n",
+                  .expected = {{"output.txt", Action::Copy, "my input.txt"}}},
         // The `@/` prefix is stripped and surrounding whitespace trimmed from
         // the output, the action and the command.
         ParseCase{.name = "strips_prefix_and_trims_whitespace",
@@ -72,10 +95,12 @@ INSTANTIATE_TEST_SUITE_P(
         ParseCase{.name = "keeps_declaration_order",
                   .input = "@/one.txt = run a\n"
                            "@/two.txt = capture b\n"
-                           "@/three.txt = run c\n",
+                           "@/three.txt = copy c\n"
+                           "@/four.txt = run d\n",
                   .expected = {{"one.txt", Action::Run, "a"},
                                {"two.txt", Action::Capture, "b"},
-                               {"three.txt", Action::Run, "c"}}},
+                               {"three.txt", Action::Copy, "c"},
+                               {"four.txt", Action::Run, "d"}}},
         ParseCase{
             .name = "skips_comments_and_blank_lines",
             .input = "# a comment\n"
@@ -96,18 +121,20 @@ INSTANTIATE_TEST_SUITE_P(
                   .input = "@/ = run cp input.txt %out\n"
                            "@/output.txt = run\n"
                            "@/output.txt = capture\n"
+                           "@/output.txt = copy\n"
                            "@/output.txt =\n",
                   .expected = {},
-                  .error_lines = {1, 2, 3, 4}},
-        // Only `run` and `capture` name an action; anything else - a bare
-        // command, a word that merely starts with one of them, or a rule
+                  .error_lines = {1, 2, 3, 4, 5}},
+        // Only `run`, `capture` and `copy` name an action; anything else - a
+        // bare command, a word that merely starts with one of them, or a rule
         // invocation - is rejected rather than guessed at.
         ParseCase{.name = "rejects_an_unknown_action",
                   .input = "@/output.txt = cp input.txt %out\n"
                            "@/output.txt = running cp input.txt %out\n"
+                           "@/output.txt = copying input.txt\n"
                            "@/foo.o = !cc foo.cpp\n",
                   .expected = {},
-                  .error_lines = {1, 2, 3}},
+                  .error_lines = {1, 2, 3, 4}},
         // Syntax the manifest format documents but the parser does not handle
         // yet is rejected rather than misread.
         ParseCase{.name = "rejects_unsupported_syntax",

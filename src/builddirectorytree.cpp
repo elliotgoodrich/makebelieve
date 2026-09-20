@@ -102,10 +102,26 @@ std::string substitute_out(std::string_view command,
   }
 }
 
-std::string read_file(const std::filesystem::path& path) {
+// Reads the whole of @a path, or the error that stopped it. ifstream does not
+// say why it would not open, so the filesystem is asked instead.
+std::expected<std::string, std::error_code> read_file(
+    const std::filesystem::path& path) {
   const std::ifstream stream(path, std::ios::binary);
   if (!stream) {
-    return {};
+    std::error_code ec;
+    const std::filesystem::file_status status =
+        std::filesystem::status(path, ec);
+    if (ec) {
+      return std::unexpected(ec);
+    }
+    if (!std::filesystem::exists(status)) {
+      return std::unexpected(
+          std::make_error_code(std::errc::no_such_file_or_directory));
+    }
+    if (std::filesystem::is_directory(status)) {
+      return std::unexpected(std::make_error_code(std::errc::is_a_directory));
+    }
+    return std::unexpected(std::make_error_code(std::errc::io_error));
   }
   std::ostringstream buffer;
   buffer << stream.rdbuf();
@@ -206,7 +222,7 @@ void remove_with_empty_parents(InMemoryDirectoryTree& tree,
   }
 }
 
-// One output's command, as the runner receives it.
+// One output's action and its argument, as the runner receives it.
 using Command = BuildDirectoryTree::Command;
 
 // Reads the rules of the manifest in @a source, mapping each output to its
@@ -643,6 +659,23 @@ BuildDirectoryTree::CommandRunner BuildDirectoryTree::shell_runner(
   return [working_directory = std::move(working_directory)](
              const Command& command, const std::stop_token& stop,
              BuildComplete on_done) {
+    // A `copy` rule names a file rather than a command: nothing is run, the
+    // output is that file's bytes, and the file itself is the build's one
+    // input - so a copy tracks its source even on a platform where command
+    // tracing is unavailable. The parser has already held the path to one
+    // inside the working directory.
+    if (command.action == Manifest::Action::Copy) {
+      const std::filesystem::path source = command.text;
+      std::expected<std::string, std::error_code> bytes =
+          read_file(working_directory / source);
+      if (bytes.has_value()) {
+        on_done(BuildOutput{.bytes = std::move(*bytes), .inputs = {source}});
+      } else {
+        on_done(std::unexpected(bytes.error()));
+      }
+      return;
+    }
+
     const bool capture = command.action == Manifest::Action::Capture;
 
     // A `run` command gets a private file to write its output to, with that
@@ -668,7 +701,7 @@ BuildDirectoryTree::CommandRunner BuildDirectoryTree::shell_runner(
           if (result.has_value()) {
             on_done(BuildOutput{
                 .bytes = capture ? std::move(result->standard_output)
-                                 : read_file(out_path),
+                                 : read_file(out_path).value_or(std::string{}),
                 .inputs = relativize(result->inputs, working_directory)});
           } else {
             on_done(std::unexpected(result.error()));

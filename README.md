@@ -2,23 +2,26 @@
 
 **makebelieve** is a demand-driven build system exposed as a filesystem.
 
-Declare `output = action command` rules in a `build.makebelieve` file,
+Declare `output = action argument` rules in a `build.makebelieve` file,
 
 ```text
 # build.makebelieve
 @/hello.txt = capture printf "hello world\n"
-@/copied.txt = run cp source.txt %out
+@/built.txt = run node generate.js --output %out
+@/copied.txt = copy source.txt
 ```
 
 With `run` the command writes the output itself, to the path `%out`
 stands for; with `capture` the bytes the command writes to standard
-output are the output.
+output are the output. `copy` takes a path instead of a command and
+hands back that file's bytes, running nothing.
 
 Then **makebelieve** will instantly manifest this as a folder,
 
 ```sh
 $ makebelieve mount ../output
 $ ls ../output
+../output/built.txt
 ../output/copied.txt
 ../output/hello.txt
 ```

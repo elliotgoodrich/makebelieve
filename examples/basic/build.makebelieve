@@ -2,17 +2,20 @@
 #
 #     @/<output> = run <command>
 #     @/<output> = capture <command>
+#     @/<output> = copy <path>
 #
 # The command runs through the system shell with its working directory set to
 # this folder (so `input.txt` below resolves here). With `run`, `%out` is
 # replaced with the path the command should write its result to; with
 # `capture`, whatever the command writes to standard output is the result.
-# Comments and blank lines are ignored.
+# `copy` runs nothing: it names a file in this folder, and its bytes are the
+# result. Comments and blank lines are ignored.
 #
-# The commands use `cmake -E`, CMake's built-in cross-platform command shim, so
-# the same manifest works whether the shell is sh or cmd.exe (cmake just needs
-# to be on PATH).
+# The `run` and `capture` commands use `cmake -E`, CMake's built-in
+# cross-platform command shim, so the same manifest works whether the shell is
+# sh or cmd.exe (cmake just needs to be on PATH). `copy` runs no command at
+# all, so it needs nothing on PATH.
 
 @/hello.txt    = run cmake -E echo "hello, makebelieve" > %out
-@/greeting.txt = run cmake -E copy input.txt %out
+@/greeting.txt = copy input.txt
 @/echoed.txt   = capture cmake -E echo "captured from stdout"
