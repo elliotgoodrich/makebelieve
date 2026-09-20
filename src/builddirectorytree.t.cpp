@@ -17,6 +17,7 @@
 #include <ios>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -613,6 +614,258 @@ TEST_F(BuildDirectoryTreeTest, OpeningADirtyOutputWaitsForItsRebuild) {
   EXPECT_EQ(builds.runs(), 2);
 }
 
+// ---------------------------------------------------------------------------
+// Reloading the rules when build.makebelieve changes.
+// ---------------------------------------------------------------------------
+
+// A runner whose output names the command it ran, recording each command.
+BuildDirectoryTree::CommandRunner echoing(std::vector<std::string>& commands) {
+  return [&commands](std::string command, std::stop_token /*stop*/,
+                     BuildDirectoryTree::BuildComplete on_done) {
+    commands.push_back(command);
+    on_done(built("ran " + command));
+  };
+}
+
+TEST_F(BuildDirectoryTreeTest, AManifestWrittenLaterAddsItsOutputs) {
+  std::vector<std::string> commands;
+  const BuildDirectoryTree tree(source, echoing(commands));
+  EXPECT_TRUE(tree.ls("")->empty());
+
+  write_manifest("@/out/file.txt <- first %out\n");
+
+  EXPECT_EQ(output_size(tree, "out/file.txt"), 1U);  // unbuilt
+  EXPECT_TRUE(commands.empty());
+  EXPECT_EQ(read_output(tree, "out/file.txt"), "ran first %out");
+}
+
+TEST_F(BuildDirectoryTreeTest, AddingARuleLeavesTheOthersBuilt) {
+  write_manifest("@/a.txt <- a %out\n");
+  std::vector<std::string> commands;
+  const BuildDirectoryTree tree(source, echoing(commands));
+  EXPECT_EQ(read_output(tree, "a.txt"), "ran a %out");
+
+  write_manifest("@/a.txt <- a %out\n@/b.txt <- b %out\n");
+
+  EXPECT_EQ(output_size(tree, "a.txt"), 10U);  // kept its built content
+  EXPECT_EQ(output_size(tree, "b.txt"), 1U);   // new and unbuilt
+  EXPECT_EQ(commands.size(), 1U);
+  EXPECT_EQ(read_output(tree, "b.txt"), "ran b %out");
+}
+
+TEST_F(BuildDirectoryTreeTest, RemovingARuleRemovesItsOutputAndEmptyParents) {
+  write_manifest(
+      "@/keep.txt <- keep %out\n@/gone/deep/file.txt <- gone %out\n");
+  std::vector<std::string> commands;
+  const BuildDirectoryTree tree(source, echoing(commands));
+  EXPECT_EQ(read_output(tree, "gone/deep/file.txt"), "ran gone %out");
+
+  write_manifest("@/keep.txt <- keep %out\n");
+
+  EXPECT_FALSE(tree.status("gone/deep/file.txt").has_value());
+  EXPECT_FALSE(tree.status("gone").has_value());
+  EXPECT_EQ(tree.open("gone/deep/file.txt").error(),
+            std::errc::no_such_file_or_directory);
+  const auto root = tree.ls("");
+  ASSERT_TRUE(root.has_value());
+  ASSERT_EQ(root->size(), 1U);
+  EXPECT_EQ((*root)[0].name, "keep.txt");
+}
+
+TEST_F(BuildDirectoryTreeTest, AnOutputCanReplaceADirectoryOfRemovedOutputs) {
+  write_manifest("@/out/file.txt <- nested %out\n");
+  std::vector<std::string> commands;
+  const BuildDirectoryTree tree(source, echoing(commands));
+
+  write_manifest("@/out <- flat %out\n");
+
+  EXPECT_EQ(read_output(tree, "out"), "ran flat %out");
+}
+
+TEST_F(BuildDirectoryTreeTest, DeletingTheManifestRemovesEveryOutput) {
+  write_manifest("@/a.txt <- a %out\n@/dir/b.txt <- b %out\n");
+  std::vector<std::string> commands;
+  const BuildDirectoryTree tree(source, echoing(commands));
+
+  source.remove("build.makebelieve");
+
+  const auto root = tree.ls("");
+  ASSERT_TRUE(root.has_value());
+  EXPECT_TRUE(root->empty());
+}
+
+// A changed command rebuilds an opened output eagerly, like a changed input,
+// and leaves outputs whose rule did not change alone.
+TEST_F(BuildDirectoryTreeTest, ChangingACommandRebuildsAnOpenedOutput) {
+  write_manifest("@/a.txt <- a1 %out\n@/b.txt <- b %out\n");
+  std::vector<std::string> commands;
+  const BuildDirectoryTree tree(source, echoing(commands));
+  EXPECT_EQ(read_output(tree, "a.txt"), "ran a1 %out");
+  EXPECT_EQ(read_output(tree, "b.txt"), "ran b %out");
+
+  write_manifest("@/a.txt <- a2 %out\n@/b.txt <- b %out\n");
+
+  ASSERT_EQ(commands.size(), 3U);
+  EXPECT_EQ(commands[2], "a2 %out");
+  EXPECT_EQ(read_output(tree, "a.txt"), "ran a2 %out");
+  EXPECT_EQ(commands.size(), 3U);
+}
+
+TEST_F(BuildDirectoryTreeTest, ChangingACommandLeavesAnUnopenedOutputLazy) {
+  write_manifest("@/a.txt <- a1 %out\n");
+  std::vector<std::string> commands;
+  const BuildDirectoryTree tree(source, echoing(commands));
+
+  write_manifest("@/a.txt <- a2 %out\n");
+
+  EXPECT_TRUE(commands.empty());
+  EXPECT_EQ(read_output(tree, "a.txt"), "ran a2 %out");
+}
+
+// A build that finishes after its rule was removed does not bring the output
+// back, and the open waiting on it reports it missing.
+TEST_F(BuildDirectoryTreeTest, ABuildFinishingAfterItsRuleIsRemovedIsDropped) {
+  write_manifest("@/output.txt <- build %out\n");
+
+  const DeferredRunner builds;
+  const BuildDirectoryTree tree(source, builds.runner());
+
+  std::expected<FileInfo, std::error_code> opened;
+  std::thread reader([&] { opened = tree.open("output.txt"); });
+  ASSERT_TRUE(builds.wait_for_runs(1));
+
+  write_manifest("");
+  EXPECT_FALSE(tree.status("output.txt").has_value());
+
+  builds.complete(built("too late"));
+  reader.join();
+  ASSERT_FALSE(opened.has_value());
+  EXPECT_EQ(opened.error(), std::errc::no_such_file_or_directory);
+  EXPECT_FALSE(tree.status("output.txt").has_value());
+  EXPECT_EQ(builds.runs(), 1);
+}
+
+TEST_F(BuildDirectoryTreeTest, ABadManifestAtStartupThrows) {
+  write_manifest("@/ok.txt <- a %out\nnot a rule\n");
+  std::vector<std::string> commands;
+  try {
+    const BuildDirectoryTree tree(source, echoing(commands));
+    ADD_FAILURE() << "expected the manifest to be rejected";
+  } catch (const std::runtime_error& error) {
+    EXPECT_TRUE(
+        std::string_view(error.what()).starts_with("build.makebelieve:2: "))
+        << error.what();
+  }
+}
+
+// A bad edit - a typo, or rules that clash - is reported and ignored, leaving
+// the previous rules and their built outputs in place until it is fixed.
+TEST_F(BuildDirectoryTreeTest, ABadEditKeepsThePreviousRules) {
+  write_manifest("@/a.txt <- a %out\n");
+  std::vector<std::string> commands;
+  std::vector<std::string> problems;
+  const BuildDirectoryTree tree(
+      source, echoing(commands),
+      [&problems](const std::string& text) { problems.push_back(text); });
+  EXPECT_EQ(read_output(tree, "a.txt"), "ran a %out");
+
+  write_manifest("@/a.txt <- a %out\n@/b.txt < b %out\n");
+  write_manifest("@/a.txt <- a %out\n@/a.txt/b <- b %out\n");
+
+  ASSERT_EQ(problems.size(), 2U);
+  EXPECT_TRUE(problems[0].starts_with("build.makebelieve:2: ")) << problems[0];
+  EXPECT_TRUE(problems[1].starts_with("build.makebelieve:2: ")) << problems[1];
+  EXPECT_EQ(output_size(tree, "a.txt"), 10U);  // still built
+  EXPECT_FALSE(tree.status("b.txt").has_value());
+
+  write_manifest("@/a.txt <- a %out\n@/b.txt <- b %out\n");
+  EXPECT_EQ(problems.size(), 2U);
+  EXPECT_EQ(output_size(tree, "a.txt"), 10U);
+  EXPECT_EQ(read_output(tree, "b.txt"), "ran b %out");
+}
+
+// Forwards to an InMemoryDirectoryTree, but can be told to fail every read.
+class FlakyTree : public DirectoryTree {
+ public:
+  InMemoryDirectoryTree inner;
+  std::atomic<bool> fail_reads = false;
+
+  [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
+      const std::filesystem::path& path) const override {
+    return inner.status(path);
+  }
+  [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
+      const std::filesystem::path& path) const override {
+    return inner.ls(path);
+  }
+  [[nodiscard]] std::expected<std::string, std::error_code> read(
+      const std::filesystem::path& path,
+      Offset offset,
+      std::size_t size) const override {
+    if (fail_reads) {
+      return std::unexpected(
+          std::make_error_code(std::errc::permission_denied));
+    }
+    return inner.read(path, offset, size);
+  }
+  [[nodiscard]] Subscription subscribe_to_changes(
+      const std::function<void(const DirectoryTreeDiff&)>& callback)
+      const override {
+    return inner.subscribe_to_changes(callback);
+  }
+};
+
+// A manifest that exists but cannot be read (say, locked by an editor) is not
+// mistaken for an empty one.
+TEST_F(BuildDirectoryTreeTest, AnUnreadableManifestKeepsThePreviousRules) {
+  FlakyTree flaky;
+  flaky.inner.write_file("build.makebelieve", "@/a.txt <- a %out\n");
+  std::vector<std::string> commands;
+  std::vector<std::string> problems;
+  const BuildDirectoryTree tree(
+      flaky, echoing(commands),
+      [&problems](const std::string& text) { problems.push_back(text); });
+
+  flaky.fail_reads = true;
+  flaky.inner.write_file("build.makebelieve", "@/b.txt <- b %out\n");
+
+  ASSERT_EQ(problems.size(), 1U);
+  EXPECT_TRUE(problems[0].starts_with("build.makebelieve: ")) << problems[0];
+  EXPECT_TRUE(tree.status("a.txt").has_value());
+
+  flaky.fail_reads = false;
+  flaky.inner.write_file("build.makebelieve", "@/b.txt <- b %out\n");
+  EXPECT_FALSE(tree.status("a.txt").has_value());
+  EXPECT_TRUE(tree.status("b.txt").has_value());
+}
+
+TEST_F(BuildDirectoryTreeTest, AnUnreadableManifestAtStartupThrows) {
+  FlakyTree flaky;
+  flaky.inner.write_file("build.makebelieve", "@/a.txt <- a %out\n");
+  flaky.fail_reads = true;
+  std::vector<std::string> commands;
+  EXPECT_THROW(BuildDirectoryTree(flaky, echoing(commands)),
+               std::runtime_error);
+}
+
+// Removing a rule forgets its traced inputs, so they no longer rebuild it once
+// it is declared again.
+TEST_F(BuildDirectoryTreeTest, ARemovedRuleForgetsItsDependencies) {
+  source.write_file("input.txt", "v1");
+  write_manifest("@/output.txt <- build %out\n");
+  int runs = 0;
+  const BuildDirectoryTree tree(source,
+                                counting_with_inputs(runs, {"input.txt"}));
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+
+  write_manifest("");
+  write_manifest("@/output.txt <- build %out\n");
+  source.write_file("input.txt", "v2");
+
+  EXPECT_EQ(runs, 1);  // re-declared unbuilt, so nothing to rebuild eagerly
+  EXPECT_EQ(output_size(tree, "output.txt"), 1U);
+}
+
 #if defined(_WIN32) || defined(__linux__)
 // End to end: a real watched source, real shell builds, and real tracing.
 // Editing a traced input on disk rebuilds the output that read it, with no one
@@ -645,6 +898,33 @@ TEST_F(BuildDirectoryTreeTest, RebuildsThroughRealTracingWhenAnInputChanges) {
            std::chrono::steady_clock::now() < deadline);
 
   EXPECT_EQ(content, "v2-changed");
+}
+
+// End to end: editing build.makebelieve on disk reloads the rules.
+TEST_F(BuildDirectoryTreeTest, ReloadsTheManifestWhenItChangesOnDisk) {
+  using namespace std::chrono_literals;
+
+  std::ofstream(work / "build.makebelieve", std::ios::binary)
+      << "@/old.txt <- cmake -E echo_append old > %out\n";
+
+  const RealDirectoryTree real_source(work);
+  const BuildDirectoryTree tree(real_source,
+                                BuildDirectoryTree::shell_runner(work));
+  ASSERT_TRUE(tree.status("old.txt").has_value());
+
+  // The watcher arms asynchronously, so a single early write can go unseen;
+  // keep rewriting the manifest until the change is picked up.
+  const auto deadline = std::chrono::steady_clock::now() + 10s;
+  while ((tree.status("old.txt").has_value() ||
+          !tree.status("new.txt").has_value()) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::ofstream(work / "build.makebelieve", std::ios::binary)
+        << "@/new.txt <- cmake -E echo_append new > %out\n";
+    std::this_thread::sleep_for(100ms);
+  }
+
+  EXPECT_FALSE(tree.status("old.txt").has_value());
+  EXPECT_EQ(read_output(tree, "new.txt"), "new");
 }
 #endif
 

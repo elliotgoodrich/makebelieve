@@ -30,8 +30,15 @@ namespace makebelieve {
 /// that depend on it: eagerly if opened before, otherwise on the next open.
 /// @a source must outlive this tree.
 ///
-/// A change to `build.makebelieve` itself is not yet handled: the rule set is
-/// fixed for the tree's lifetime.
+/// A change to `build.makebelieve` itself reloads the rules: a new rule's
+/// output appears unbuilt, a removed rule's output disappears (with any
+/// directories left empty), and an output whose command changed is rebuilt as
+/// if an input had changed. Outputs whose rule is unchanged keep their content.
+/// A manifest that cannot be read, or has any line @link Manifest::parse
+/// rejects, is not applied: the current rules stay in force until it is fixed.
+///
+/// Subscribers are notified while an internal lock is held, so they must not
+/// call `open` from within their callback.
 class BuildDirectoryTree : public DirectoryTree {
   // Pimpl not necessary but kind of nice to keep things rebuilding quickly
   class Impl;
@@ -66,12 +73,21 @@ class BuildDirectoryTree : public DirectoryTree {
   using CommandRunner = std::function<
       void(std::string command, std::stop_token stop, BuildComplete on_done)>;
 
+  /// Told why a changed manifest was rejected, one problem per line (such as
+  /// `build.makebelieve:3: expected ...`). Called on the source's watcher
+  /// thread.
+  using ManifestErrorHandler = std::function<void(const std::string& problems)>;
+
   /// Builds the outputs declared in the `build.makebelieve` file of @a source,
   /// delegating each command to @a runner - any callable convertible to a
   /// @link CommandRunner. A @a source without a `build.makebelieve` file
-  /// yields an empty tree.
+  /// yields an empty tree. Throws `std::runtime_error` describing the problems
+  /// if the manifest cannot be read or has lines it cannot accept; later
+  /// problems of that kind go to @a on_manifest_error, if given.
   /// @pre @a source outlives this tree; it is observed for its whole life.
-  BuildDirectoryTree(const DirectoryTree& source, CommandRunner runner);
+  BuildDirectoryTree(const DirectoryTree& source,
+                     CommandRunner runner,
+                     ManifestErrorHandler on_manifest_error = {});
 
   ~BuildDirectoryTree() override;
 

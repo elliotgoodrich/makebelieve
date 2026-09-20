@@ -5,11 +5,13 @@
 #include "manifest.hpp"
 #include "processutil.hpp"
 
+#include <algorithm>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <functional>
 #include <ios>
@@ -20,6 +22,7 @@
 #include <random>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -109,14 +112,18 @@ std::string read_file(const std::filesystem::path& path) {
   return buffer.str();
 }
 
-// Reads the whole of @a path out of @a tree, or nullopt when it is not a
-// readable file. read() promises only "up to size bytes" per call, so this
-// loops until a short read signals end of file.
-std::optional<std::string> read_all(const DirectoryTree& tree,
-                                    const std::filesystem::path& path) {
+// Reads the whole of @a path out of @a tree, or the error that stopped it.
+// read() promises only "up to size bytes" per call, so this loops until a
+// short read signals end of file.
+std::expected<std::string, std::error_code> read_all(
+    const DirectoryTree& tree,
+    const std::filesystem::path& path) {
   const std::expected<EntryInfo, std::error_code> info = tree.status(path);
-  if (!info.has_value() || !std::holds_alternative<FileInfo>(*info)) {
-    return std::nullopt;
+  if (!info.has_value()) {
+    return std::unexpected(info.error());
+  }
+  if (!std::holds_alternative<FileInfo>(*info)) {
+    return std::unexpected(std::make_error_code(std::errc::is_a_directory));
   }
 
   constexpr std::size_t k_chunk = std::size_t{64} * 1024;
@@ -125,7 +132,7 @@ std::optional<std::string> read_all(const DirectoryTree& tree,
     const std::expected<std::string, std::error_code> chunk =
         tree.read(path, static_cast<Offset>(content.size()), k_chunk);
     if (!chunk.has_value()) {
-      return std::nullopt;
+      return std::unexpected(chunk.error());
     }
     content += *chunk;
     if (chunk->size() < k_chunk) {
@@ -181,6 +188,59 @@ void ensure_parent_directories(InMemoryDirectoryTree& tree,
   }
 }
 
+// Removes @a output from @a tree along with any directories that removing it
+// leaves empty, undoing ensure_parent_directories().
+void remove_with_empty_parents(InMemoryDirectoryTree& tree,
+                               const std::filesystem::path& output) {
+  if (!tree.status(output).has_value()) {
+    return;
+  }
+  tree.remove(output);
+  for (std::filesystem::path directory = output.parent_path();
+       !directory.empty(); directory = directory.parent_path()) {
+    const auto children = tree.ls(directory);
+    if (!children.has_value() || !children->empty()) {
+      return;
+    }
+    tree.remove(directory);
+  }
+}
+
+// Reads the rules of the manifest in @a source, mapping each output to its
+// command, or describes - one problem per line - why the manifest could not be
+// read or has lines it cannot accept. No manifest at all means no rules.
+std::expected<std::map<std::filesystem::path, std::string>, std::string>
+read_rules(const DirectoryTree& source) {
+  const std::expected<std::string, std::error_code> manifest =
+      read_all(source, k_manifest_name);
+  if (!manifest.has_value()) {
+    if (manifest.error() == std::errc::no_such_file_or_directory) {
+      return {};
+    }
+    return std::unexpected(
+        std::format("{}: {}", k_manifest_name, manifest.error().message()));
+  }
+
+  const Manifest parsed = Manifest::parse(*manifest);
+  if (!parsed.errors().empty()) {
+    std::string problems;
+    for (const Manifest::Error& error : parsed.errors()) {
+      if (!problems.empty()) {
+        problems += '\n';
+      }
+      problems +=
+          std::format("{}:{}: {}", k_manifest_name, error.line, error.message);
+    }
+    return std::unexpected(std::move(problems));
+  }
+
+  std::map<std::filesystem::path, std::string> commands;
+  for (const Manifest::Rule& rule : parsed.rules()) {
+    commands.emplace(rule.output, rule.command);
+  }
+  return commands;
+}
+
 }  // namespace
 
 class BuildDirectoryTree::Impl {
@@ -189,14 +249,24 @@ class BuildDirectoryTree::Impl {
   // succeeds.
   InMemoryDirectoryTree m_structure;
 
+  // The manifest's home, observed for input and manifest changes.
+  const DirectoryTree& m_source;
+
+  // Serialises every write to m_structure (placeholders, removals, build
+  // results) with the change to m_commands behind it, so a build that finishes
+  // just as its rule is removed cannot write the output back. Taken before
+  // m_mutex, and held while m_structure notifies subscribers, so a subscriber
+  // must not open() through us from its callback.
+  std::mutex m_layout_mutex;
+
   // Guards all the build bookkeeping below, which reads (on filesystem threads)
   // and source-change notifications (on the source's watcher thread) race over.
   // Never held across a call to the runner or m_structure, so a synchronous
   // runner or a subscriber reading back through us cannot deadlock on it.
   std::mutex m_mutex;
 
-  // Every declared output mapped to the command that (re)builds it, fixed at
-  // construction.
+  // Every declared output mapped to the command that (re)builds it, following
+  // the manifest as it changes.
   std::map<std::filesystem::path, std::string> m_commands;
 
   // Outputs that need (re)building: every output starts stale, a successful
@@ -228,6 +298,9 @@ class BuildDirectoryTree::Impl {
 
   CommandRunner m_runner;
 
+  // Told why a changed manifest was rejected; may be empty.
+  ManifestErrorHandler m_on_manifest_error;
+
   // Requested on destruction to tell in-flight runners their results are no
   // longer wanted.
   std::stop_source m_stop;
@@ -246,19 +319,17 @@ class BuildDirectoryTree::Impl {
   std::optional<Subscription> m_source_subscription;
 
  public:
-  Impl(const DirectoryTree& source, CommandRunner runner)
-      : m_runner(std::move(runner)) {
-    const std::optional<std::string> manifest =
-        read_all(source, k_manifest_name);
-    if (manifest.has_value()) {
-      const Manifest parsed = Manifest::parse(*manifest);
-      for (const Manifest::Rule& rule : parsed.rules()) {
-        ensure_parent_directories(m_structure, rule.output);
-        m_structure.write_file(rule.output, k_placeholder_content);
-        m_commands.insert_or_assign(rule.output, rule.command);
-        m_stale.insert(rule.output);
-      }
+  Impl(const DirectoryTree& source,
+       CommandRunner runner,
+       ManifestErrorHandler on_manifest_error)
+      : m_source(source),
+        m_runner(std::move(runner)),
+        m_on_manifest_error(std::move(on_manifest_error)) {
+    const auto commands = read_rules(m_source);
+    if (!commands.has_value()) {
+      throw std::runtime_error(commands.error());
     }
+    apply_rules(*commands);
 
     // Subscribe only once the outputs are in place, so the callback cannot race
     // the constructor.
@@ -370,13 +441,21 @@ class BuildDirectoryTree::Impl {
 
   void finish_build(const std::filesystem::path& output, BuildResult result) {
     if (result.has_value()) {
+      const std::lock_guard layout(m_layout_mutex);
+      bool declared = false;
       {
         const std::lock_guard lock(m_mutex);
-        update_dependents(output, std::move(result->inputs));
+        // Its rule may have left the manifest mid-build.
+        declared = m_commands.contains(output);
+        if (declared) {
+          update_dependents(output, std::move(result->inputs));
+        }
       }
-      // Outside the lock: write_file notifies subscribers, who may read back
+      // Outside m_mutex: write_file notifies subscribers, who may read back
       // through us.
-      m_structure.write_file(output, std::move(result->bytes));
+      if (declared) {
+        m_structure.write_file(output, std::move(result->bytes));
+      }
     }
 
     bool rebuild_again = false;
@@ -385,7 +464,9 @@ class BuildDirectoryTree::Impl {
       // Only now the content is in place may a waiting open() be released.
       m_in_flight.erase(output);
       ++m_finished[output];
-      if (result.has_value()) {
+      if (!m_commands.contains(output)) {
+        // Removed mid-build: nothing to record or rebuild.
+      } else if (result.has_value()) {
         m_failed.erase(output);
         // An input that changed mid-build left it stale again; rebuild if
         // watched.
@@ -427,9 +508,83 @@ class BuildDirectoryTree::Impl {
     m_dependencies.insert_or_assign(output, std::move(inputs));
   }
 
-  // Collects the outputs depending on whatever changed, then invalidates each.
-  // Invalidation runs outside the lock, since it may start an eager rebuild.
+  // Rereads the manifest and applies its rules, or reports why it cannot and
+  // keeps serving the current ones.
+  void reload_manifest() {
+    const auto commands = read_rules(m_source);
+    if (!commands.has_value()) {
+      if (m_on_manifest_error) {
+        m_on_manifest_error(commands.error());
+      }
+      return;
+    }
+    apply_rules(*commands);
+  }
+
+  // Brings the declared outputs in line with @a commands: a new rule's output
+  // appears unbuilt, a removed rule's output disappears, and an output whose
+  // command changed goes stale (rebuilt eagerly if opened). Outputs whose rule
+  // is unchanged keep their built content.
+  void apply_rules(
+      const std::map<std::filesystem::path, std::string>& commands) {
+    std::vector<std::filesystem::path> removed;
+    std::vector<std::filesystem::path> added;
+    std::vector<std::filesystem::path> changed;
+    {
+      const std::lock_guard layout(m_layout_mutex);
+      {
+        const std::lock_guard lock(m_mutex);
+        for (const auto& [output, command] : m_commands) {
+          if (!commands.contains(output)) {
+            removed.push_back(output);
+          }
+        }
+        for (const auto& [output, command] : commands) {
+          const auto it = m_commands.find(output);
+          if (it == m_commands.end()) {
+            added.push_back(output);
+            m_stale.insert(output);
+          } else if (it->second != command) {
+            changed.push_back(output);
+          }
+        }
+        for (const std::filesystem::path& output : removed) {
+          m_stale.erase(output);
+          m_materialized.erase(output);
+          m_failed.erase(output);
+          update_dependents(output, {});
+          m_dependencies.erase(output);
+        }
+        m_commands = commands;
+      }
+
+      // Removals first, so a new output can take the place of a directory that
+      // only removed outputs occupied.
+      for (const std::filesystem::path& output : removed) {
+        remove_with_empty_parents(m_structure, output);
+      }
+      for (const std::filesystem::path& output : added) {
+        ensure_parent_directories(m_structure, output);
+        m_structure.write_file(output, k_placeholder_content);
+      }
+    }
+
+    // Outside the layout lock, since an eager rebuild writes its result.
+    for (const std::filesystem::path& output : changed) {
+      invalidate(output);
+    }
+  }
+
+  // Reloads the manifest if it may have changed, then collects the outputs
+  // depending on whatever changed and invalidates each. Invalidation runs
+  // outside the lock, since it may start an eager rebuild.
   void on_source_change(const DirectoryTreeDiff& diff) {
+    if (diff.everything_dirty ||
+        std::ranges::contains(diff.entries_changed,
+                              std::filesystem::path(k_manifest_name))) {
+      reload_manifest();
+    }
+
     std::vector<std::filesystem::path> affected;
     {
       const std::lock_guard lock(m_mutex);
@@ -472,8 +627,11 @@ class BuildDirectoryTree::Impl {
 };
 
 BuildDirectoryTree::BuildDirectoryTree(const DirectoryTree& source,
-                                       CommandRunner runner)
-    : m_impl(std::make_unique<Impl>(source, std::move(runner))) {}
+                                       CommandRunner runner,
+                                       ManifestErrorHandler on_manifest_error)
+    : m_impl(std::make_unique<Impl>(source,
+                                    std::move(runner),
+                                    std::move(on_manifest_error))) {}
 
 BuildDirectoryTree::~BuildDirectoryTree() = default;
 
