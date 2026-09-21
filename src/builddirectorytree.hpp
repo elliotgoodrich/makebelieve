@@ -58,11 +58,18 @@ class BuildDirectoryTree : public DirectoryTree {
   /// when it could not be run to completion.
   using BuildResult = std::expected<BuildOutput, std::error_code>;
 
-  /// One rule's right-hand side: the action that says where the output comes
-  /// from - the file `%out` names for `Manifest::Action::Run`, the command's
-  /// standard output for `Manifest::Action::Capture`, a file read as-is for
+  /// One rule as the runner receives it: the output it builds, the action that
+  /// says where that output comes from - the file `%out` names for
+  /// `Manifest::Action::Run`, the command's standard output for
+  /// `Manifest::Action::Capture`, a file read as-is for
   /// `Manifest::Action::Copy` - and the text that action applies to.
   struct Command {
+    /// The output this rule builds, relative to this tree's root. A runner
+    /// that hands the command a scratch file gives it this one's file name, so
+    /// a tool that picks its format from the extension (pandoc and friends)
+    /// sees the name the finished output will have.
+    std::filesystem::path output;
+
     Manifest::Action action = Manifest::Action::Run;
 
     /// The command to run for `Run` and `Capture`; for `Copy`, the path of the
@@ -116,8 +123,10 @@ class BuildDirectoryTree : public DirectoryTree {
   /// Returns a `CommandRunner` that runs a rule's command through the system
   /// shell with the working directory set to @a working_directory (so relative
   /// inputs resolve against it). A `Run` command has `%out` substituted with a
-  /// scratch file and produces the bytes it wrote there; a `Capture` command
-  /// produces the bytes it wrote to standard output. A `Copy` rule runs no
+  /// scratch file - with the same file name as the output it builds, so a
+  /// tool that chooses its format from the extension needs no extra flag - and
+  /// produces the bytes it wrote there; a `Capture` command produces the bytes
+  /// it wrote to standard output. A `Copy` rule runs no
   /// command at all: it produces the bytes of the file it names, read from
   /// under @a working_directory, and reports that file as its one input, so a
   /// copy is tracked even where command tracing is unavailable. It works

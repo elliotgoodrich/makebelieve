@@ -23,7 +23,15 @@ Paths without `@/` refer to the normal filesystem.
 
 An output is assigned an action and what that action applies to. With
 `run` the command writes the output itself, to the path `%out` stands
-for. With `capture` the command writes nothing, and the bytes it sends
+for. That path is a scratch file with the same name as the output, so
+a tool that picks its format from the extension needs no extra argument
+to say so:
+
+```mb
+@/paper.pdf = run pandoc paper.md -o %out
+```
+
+With `capture` the command writes nothing, and the bytes it sends
 to standard output are the output:
 
 ```mb

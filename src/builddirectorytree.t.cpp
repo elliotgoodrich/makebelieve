@@ -31,6 +31,13 @@ namespace {
 
 using namespace makebelieve;
 
+// The path a command echoed back, without the newline (and, under cmd, the
+// carriage return) that echoing appended.
+std::filesystem::path trimmed_path(std::string_view echoed) {
+  const std::size_t end = echoed.find_last_not_of("\r\n");
+  return echoed.substr(0, end == std::string_view::npos ? 0 : end + 1);
+}
+
 // The tests here care about an output's bytes, not its traced inputs, so wrap a
 // plain string as a successful BuildResult carrying no inputs.
 BuildDirectoryTree::BuildResult built(std::string bytes) {
@@ -256,6 +263,24 @@ TEST_F(BuildDirectoryTreeTest, ReadHandsACopysSourceToTheRunner) {
   EXPECT_EQ(commands[0].text, "src/input.txt");
 }
 
+// A command also names the output it is building, so a runner can give the
+// scratch file it hands to `%out` the same name.
+TEST_F(BuildDirectoryTreeTest, ReadHandsTheOutputBeingBuiltToTheRunner) {
+  write_manifest("@/out/report.pdf = run build %out\n");
+
+  std::vector<BuildDirectoryTree::Command> commands;
+  const BuildDirectoryTree tree(
+      source, [&commands](BuildDirectoryTree::Command command, std::stop_token,
+                          BuildDirectoryTree::BuildComplete done) {
+        commands.push_back(std::move(command));
+        done(built("result"));
+      });
+
+  EXPECT_EQ(read_output(tree, "out/report.pdf"), "result");
+  ASSERT_EQ(commands.size(), 1U);
+  EXPECT_EQ(commands[0].output, std::filesystem::path("out/report.pdf"));
+}
+
 TEST_F(BuildDirectoryTreeTest, BuildsLazilyAndOncePerOutputOnSuccess) {
   write_manifest("@/output.txt = run build %out\n");
 
@@ -424,6 +449,32 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerBuildsLazilyThroughTheShell) {
   EXPECT_EQ(output_size(tree, "output.txt"), 1U);  // unbuilt until opened
   EXPECT_EQ(read_output(tree, "output.txt"), "hello world");
   EXPECT_EQ(output_size(tree, "output.txt"), 11U);
+}
+
+// The scratch file `%out` names has the file name of the output being built,
+// so a tool that picks its format from the extension (pandoc and friends)
+// needs no extra flag. `cmake -E echo` prints the path it was handed under
+// either shell, redirected into that same file so it becomes the output.
+TEST_F(BuildDirectoryTreeTest, ShellRunnerGivesOutTheOutputsName) {
+  write_manifest("@/docs/report.pdf = run cmake -E echo %out > %out\n");
+
+  const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
+
+  const std::filesystem::path scratch =
+      trimmed_path(read_output(tree, "docs/report.pdf"));
+  EXPECT_EQ(scratch.filename(), "report.pdf");
+}
+
+// An output with no extension leaves the scratch file without one either,
+// rather than inventing something for a tool to sniff.
+TEST_F(BuildDirectoryTreeTest, ShellRunnerAddsNoExtensionToABareOutput) {
+  write_manifest("@/report = run cmake -E echo %out > %out\n");
+
+  const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
+
+  const std::filesystem::path scratch =
+      trimmed_path(read_output(tree, "report"));
+  EXPECT_EQ(scratch.filename(), "report");
 }
 
 // A `capture` rule has no output file: the bytes the command writes to
