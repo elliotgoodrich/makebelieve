@@ -222,7 +222,7 @@ void remove_with_empty_parents(InMemoryDirectoryTree& tree,
   }
 }
 
-// One output's action and its argument, as the runner receives it.
+// One output, its action and that action's argument, as the runner receives it.
 using Command = BuildDirectoryTree::Command;
 
 // Reads the rules of the manifest in @a source, mapping each output to its
@@ -255,8 +255,9 @@ std::expected<std::map<std::filesystem::path, Command>, std::string> read_rules(
 
   std::map<std::filesystem::path, Command> commands;
   for (const Manifest::Rule& rule : parsed.rules()) {
-    commands.emplace(rule.output,
-                     Command{.action = rule.action, .text = rule.command});
+    commands.emplace(rule.output, Command{.output = rule.output,
+                                          .action = rule.action,
+                                          .text = rule.command});
   }
   return commands;
 }
@@ -678,17 +679,22 @@ BuildDirectoryTree::CommandRunner BuildDirectoryTree::shell_runner(
 
     const bool capture = command.action == Manifest::Action::Capture;
 
-    // A `run` command gets a private file to write its output to, with that
-    // path substituted in for %out. Its build output is whatever it left in
-    // that file - not ProcessUtil's captured stdout, which a `> %out` rule
-    // leaves empty - so the scratch directory is kept alive (through the
-    // shared_ptr the completion captures) until we have read it back. A
-    // `capture` command has no output file: its stdout is the output.
+    // A `run` command gets a private file to write its output to - with the
+    // output's own file name, since plenty of tools (pandoc and friends) pick
+    // their format from the extension - with that path substituted in for
+    // %out. The directory is fresh per build, so the name cannot collide. Its
+    // build output is
+    // whatever it left in that file - not ProcessUtil's captured stdout,
+    // which a `> %out` rule leaves empty - so the scratch directory is kept
+    // alive (through the shared_ptr the completion captures) until we have
+    // read it back. A `capture` command has no output file: its stdout is the
+    // output.
     const std::shared_ptr<TempDirectory> scratch =
         capture ? nullptr
                 : std::make_shared<TempDirectory>(make_temp_directory());
     const std::filesystem::path out_path =
-        capture ? std::filesystem::path{} : scratch->path() / "out";
+        capture ? std::filesystem::path{}
+                : scratch->path() / command.output.filename();
 
     ProcessUtil::run(
         working_directory,
