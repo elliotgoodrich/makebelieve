@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <functional>
@@ -34,6 +35,13 @@ struct ProcessUtil {
 
   /// Reports the outcome of a single command.
   using Complete = std::move_only_function<void(Result)>;
+
+  /// This process's own id.
+  [[nodiscard]] static std::uint32_t self();
+
+  /// The name of the executable the process @a pid is running, or `unknown`
+  /// where it has exited or this process may not query it.
+  [[nodiscard]] static std::string name_of(std::uint32_t pid);
 
   /// Runs @a command through the system shell with the working directory set
   /// to @a working_directory, captures its standard output and the files it

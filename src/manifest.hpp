@@ -26,6 +26,9 @@ class Manifest {
     /// `copy <path>`: the output is the bytes of the file at `<path>`. No
     /// command runs, and `<path>` is the rule's one input.
     Copy,
+    /// `tracing`: the output is a trace of what makebelieve has been doing, in
+    /// the Trace Event Format. Takes no argument.
+    Tracing,
   };
 
   /// A single simple `@/output = <action> <argument>` rule: the output path
@@ -37,7 +40,7 @@ class Manifest {
 
     /// The command to run for `Run` and `Capture`, taken verbatim; for `Copy`,
     /// the normalised path of the file to copy, relative to the manifest's
-    /// directory.
+    /// directory; empty for `Tracing`.
     std::string command;
   };
 
@@ -49,7 +52,8 @@ class Manifest {
 
   /// Parses @a text into a `Manifest`. Blank lines and `#` comments are
   /// skipped. Every other line must be a simple `@/output = run <command>`,
-  /// `@/output = capture <command>` or `@/output = copy <path>` rule - the
+  /// `@/output = capture <command>`, `@/output = copy <path>` or
+  /// `@/output = tracing` rule - the
   /// richer manifest features (variables, `rule` declarations, wildcards,
   /// placeholders) are not handled yet - naming a file inside the output
   /// directory that no earlier rule declared, either as that file or as one of

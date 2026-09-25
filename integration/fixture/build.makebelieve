@@ -1,3 +1,4 @@
 @/copy.txt = run cmake -E copy input.txt %out
 @/second.txt = run cmake -E copy other.txt %out
 @/direct.txt = copy input.txt
+@/tracing.json = tracing

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "realdirectorytree.hpp"
 
+#include "tracer.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -458,6 +460,7 @@ void RealDirectoryTree::Impl::start_watcher() const {
 }
 
 void RealDirectoryTree::Impl::watch_loop() const {
+  MB_TRACE_THREAD_NAME("source watcher");
   // Heap-allocated, as ReadDirectoryChangesW requires for overlapped use, and
   // DWORD-aligned by virtue of coming from the allocator.
   std::vector<std::byte> buffer(k_watch_buffer_bytes);

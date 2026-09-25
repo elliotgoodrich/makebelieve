@@ -3,6 +3,7 @@
 
 #include "inmemorydirectorytree.hpp"
 #include "realdirectorytree.hpp"
+#include "tracer.hpp"
 
 #include <gtest/gtest.h>
 
@@ -941,6 +942,145 @@ TEST_F(BuildDirectoryTreeTest, ARemovedRuleForgetsItsDependencies) {
 
   EXPECT_EQ(runs, 1);  // re-declared unbuilt, so nothing to rebuild eagerly
   EXPECT_EQ(output_size(tree, "output.txt"), 1U);
+}
+
+// A `tracing` output is the installed tracer's trace, served by the tree
+// without involving the runner, and it shows the builds that went before.
+TEST_F(BuildDirectoryTreeTest, ATracingOutputServesTheTrace) {
+  write_manifest(
+      "@/trace.json = tracing\n"
+      "@/output.txt = run build %out\n");
+
+  Tracer tracer;
+  const TracerInstallation installed(tracer);
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
+
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+  const std::string trace = read_output(tree, "trace.json");
+  EXPECT_EQ(runs, 1);
+  EXPECT_TRUE(trace.starts_with("[")) << trace;
+  EXPECT_TRUE(trace.ends_with("]\n")) << trace;
+  EXPECT_TRUE(trace.contains(R"("ph":"B","cat":"build","name":"output.txt")"))
+      << trace;
+  EXPECT_TRUE(trace.contains(R"("ph":"E","cat":"build","name":"output.txt")"))
+      << trace;
+  EXPECT_TRUE(trace.contains(R"("command":"build %out")")) << trace;
+  // The build runs on a row of its own, with an arrow from whatever asked for
+  // it.
+  EXPECT_TRUE(trace.contains(R"("args":{"name":"build"})")) << trace;
+  EXPECT_TRUE(trace.contains(R"("ph":"s","cat":"build","name":"build")"))
+      << trace;
+  EXPECT_TRUE(trace.contains(R"("ph":"f","cat":"build","name":"build")"))
+      << trace;
+  // Its own build is left out, as its snapshot could only ever show it begun.
+  EXPECT_FALSE(trace.contains(R"("name":"trace.json")")) << trace;
+}
+
+// Every open takes a fresh snapshot, so the trace includes whatever happened
+// since the last one.
+TEST_F(BuildDirectoryTreeTest, ATracingOutputIsFreshOnEveryOpen) {
+  write_manifest(
+      "@/trace.json = tracing\n"
+      "@/output.txt = run build %out\n");
+
+  Tracer tracer;
+  const TracerInstallation installed(tracer);
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
+
+  const std::string before = read_output(tree, "trace.json");
+  EXPECT_FALSE(before.contains(R"("name":"output.txt")")) << before;
+
+  read_output(tree, "output.txt");
+  const std::string after = read_output(tree, "trace.json");
+  EXPECT_TRUE(after.contains(R"("name":"output.txt")")) << after;
+  EXPECT_EQ(output_size(tree, "trace.json"), after.size());
+}
+
+TEST_F(BuildDirectoryTreeTest, ATracingOutputWithoutATracerIsAnEmptyTrace) {
+  write_manifest("@/trace.json = tracing\n");
+
+  ASSERT_EQ(g_tracer, nullptr);
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
+
+  EXPECT_EQ(read_output(tree, "trace.json"), "[]\n");
+  EXPECT_EQ(runs, 0);
+}
+
+// Builds share a pool of rows in the trace: one row each while they overlap,
+// and a row goes back in the pool for the next build once its own span is
+// closed.
+TEST_F(BuildDirectoryTreeTest, BuildsShareRowsInTheTrace) {
+  write_manifest(
+      "@/a.txt = run build a %out\n"
+      "@/b.txt = run build b %out\n"
+      "@/c.txt = run build c %out\n");
+
+  Tracer tracer;
+  const TracerInstallation installed(tracer);
+  const DeferredRunner runner;
+  const BuildDirectoryTree tree(source, runner.runner());
+
+  // Two builds at once, so they cannot share a row.
+  std::thread first([&tree] { EXPECT_TRUE(tree.open("a.txt").has_value()); });
+  std::thread second([&tree] { EXPECT_TRUE(tree.open("b.txt").has_value()); });
+  ASSERT_TRUE(runner.wait_for_runs(2));
+  runner.complete(built("one"));
+  runner.complete(built("two"));
+  first.join();
+  second.join();
+
+  // Both rows are free again, so a third build takes one rather than adding to
+  // them.
+  std::thread third([&tree] { EXPECT_TRUE(tree.open("c.txt").has_value()); });
+  ASSERT_TRUE(runner.wait_for_runs(3));
+  runner.complete(built("three"));
+  third.join();
+
+  // Two rows were needed for the builds that overlapped, and the third build
+  // took one of them back rather than making another.
+  const std::string trace = tracer.snapshot();
+  std::size_t rows = 0;
+  for (std::size_t at = trace.find(R"("args":{"name":"build"})");
+       at != std::string::npos;
+       at = trace.find(R"("args":{"name":"build"})", at + 1)) {
+    ++rows;
+  }
+  EXPECT_EQ(rows, 2U) << trace;
+}
+
+// Reading the trace rewrites it; announcing that would have a watcher that
+// rereads changed files reread the trace forever. Adding the output is still
+// announced.
+TEST_F(BuildDirectoryTreeTest, RewritingATracingOutputIsNotAnnounced) {
+  write_manifest("@/output.txt = run build %out\n");
+
+  Tracer tracer;
+  const TracerInstallation installed(tracer);
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
+
+  std::vector<std::filesystem::path> changed;
+  const Subscription subscription =
+      tree.subscribe_to_changes([&changed](const DirectoryTreeDiff& diff) {
+        changed.insert(changed.end(), diff.entries_changed.begin(),
+                       diff.entries_changed.end());
+      });
+
+  write_manifest(
+      "@/output.txt = run build %out\n"
+      "@/trace.json = tracing\n");
+  ASSERT_EQ(changed.size(), 1U);
+  EXPECT_EQ(changed[0], std::filesystem::path("trace.json"));
+
+  changed.clear();
+  read_output(tree, "trace.json");
+  read_output(tree, "trace.json");
+  read_output(tree, "output.txt");
+  ASSERT_EQ(changed.size(), 1U);
+  EXPECT_EQ(changed[0], std::filesystem::path("output.txt"));
 }
 
 #if defined(_WIN32) || defined(__linux__)

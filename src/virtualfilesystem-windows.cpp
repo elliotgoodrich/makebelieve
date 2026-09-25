@@ -2,6 +2,8 @@
 #include "virtualfilesystem.hpp"
 
 #include "directorytree.hpp"
+#include "processutil.hpp"
+#include "tracer.hpp"
 
 #include <windows.h>
 
@@ -30,6 +32,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -37,6 +40,17 @@
 namespace makebelieve {
 
 namespace {
+
+// The process a request came from, as a row's group in the trace. WinFsp
+// names the process itself, so there is nothing to resolve.
+TraceProcess calling_process(std::uint32_t process) {
+  // Only a process the trace has not seen needs a name looked up; the tracer
+  // keeps the ones it has been given.
+  return {.id = process,
+          .name = g_tracer->knows_process(process)
+                      ? std::string()
+                      : ProcessUtil::name_of(process)};
+}
 
 // A nominal capacity to report for the volume. Nothing is ever written here,
 // so this only exists to keep tools that divide by it happy.
@@ -620,6 +634,10 @@ class VirtualFileSystem::Impl {
                 PVOID* file_context,
                 FSP_FSCTL_FILE_INFO* file_info) {
     const std::filesystem::path path = to_tree_path(name);
+    // WinFsp names the process, not the thread within it.
+    const std::uint32_t caller = FspFileSystemOperationProcessId();
+    MB_TRACE_POOL_SCOPE(m_reader_lanes, calling_process(caller), "vfs",
+                        std::tie("open", path), "caller", caller);
     std::expected<EntryInfo, std::error_code> status = m_tree.status(path);
     if (!status.has_value()) {
       return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -865,6 +883,7 @@ class VirtualFileSystem::Impl {
 
   // Drains queued changes, announcing each affected path in turn.
   void notify_loop() {
+    MB_TRACE_THREAD_NAME("vfs notifier");
     std::unique_lock<std::mutex> lock(m_notify_mutex);
     while (true) {
       m_wake.wait(lock, [this] {
@@ -1033,6 +1052,11 @@ class VirtualFileSystem::Impl {
 
     FspFileSystemNotify(m_filesystem, info, info->Size);
   }
+
+  // One row per open being served at once, so a reader's whole request - the
+  // build it waits for included - reads as one worker rather than as whichever
+  // WinFsp thread happened to take it.
+  mutable TraceLanePool m_reader_lanes{"reader"};
 
   const DirectoryTree& m_tree;
   const std::filesystem::path m_mountpoint;

@@ -1,7 +1,8 @@
 # Black-box integration test for the makebelieve daemon: spawns it, mounts a
 # build.makebelieve, and checks outputs appear as 1-byte placeholders, emit a
 # change notification when built or rebuilt, and hold the right value. Both a
-# `run` output and a `copy` output are driven over the same input.
+# `run` output and a `copy` output are driven over the same input, and a
+# `tracing` output is checked to hold a trace of those builds.
 #
 # Expected -D variables:
 #   MAKEBELIEVE_EXE   the built makebelieve binary
@@ -151,6 +152,23 @@ else()
   if(NOT recopied_ok)
     list(APPEND FAILURES
          "direct.txt after the input changed never settled to '${EXPECTED_UPDATED}' (last read '${recopied_value}')")
+  endif()
+
+  # tracing.json is the daemon's own trace: valid JSON that by now records the
+  # builds above.
+  execute_process(COMMAND "${CMAKE_COMMAND}" -E cat "${MNT}/tracing.json"
+                  OUTPUT_VARIABLE trace RESULT_VARIABLE trace_rc ERROR_QUIET)
+  if(NOT trace_rc EQUAL 0)
+    list(APPEND FAILURES "tracing.json could not be read")
+  else()
+    string(JSON trace_events ERROR_VARIABLE trace_error LENGTH "${trace}")
+    if(trace_error)
+      list(APPEND FAILURES "tracing.json is not valid JSON: ${trace_error}")
+    endif()
+    string(FIND "${trace}" "\"name\":\"copy.txt\"" copy_build)
+    if(copy_build EQUAL -1)
+      list(APPEND FAILURES "tracing.json does not record the build of copy.txt")
+    endif()
   endif()
 endif()
 

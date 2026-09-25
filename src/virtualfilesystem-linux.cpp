@@ -2,6 +2,8 @@
 #include "virtualfilesystem.hpp"
 
 #include "directorytree.hpp"
+#include "processutil.hpp"
+#include "tracer.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -11,8 +13,10 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -36,6 +40,59 @@
 namespace makebelieve {
 
 namespace {
+
+// The process the thread @a thread belongs to, read from `/proc`. FUSE names
+// the calling thread rather than the program behind it, and it is the program
+// a trace should group a request under, so its Tgid is what we want. A thread
+// that has gone between making the request and this lookup leaves only its own
+// id to go on.
+std::uint32_t process_of_thread(std::uint32_t thread) {
+  std::ifstream status("/proc/" + std::to_string(thread) + "/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    constexpr std::string_view k_field = "Tgid:";
+    if (!line.starts_with(k_field)) {
+      continue;
+    }
+    const std::size_t start = line.find_first_not_of(" \t", k_field.size());
+    if (start != std::string::npos) {
+      return static_cast<std::uint32_t>(
+          std::strtoul(line.c_str() + start, nullptr, 10));
+    }
+  }
+  return thread;
+}
+
+// As above, remembering each answer: a thread belongs to the same process for
+// as long as it lives, and reading `/proc` for every request would cost more
+// than the request itself.
+std::uint32_t process_of_caller(std::uint32_t thread) {
+  static std::mutex mutex;
+  static std::unordered_map<std::uint32_t, std::uint32_t> processes;
+  {
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (const auto it = processes.find(thread); it != processes.end()) {
+      return it->second;
+    }
+  }
+  // Outside the lock: two threads asking about the same caller at once only
+  // means reading `/proc` twice.
+  const std::uint32_t process = process_of_thread(thread);
+  const std::lock_guard<std::mutex> lock(mutex);
+  processes.insert_or_assign(thread, process);
+  return process;
+}
+
+// The process a request came from, as a row's group in the trace.
+TraceProcess calling_process(std::uint32_t thread) {
+  // Only a process the trace has not seen needs a name looked up; the tracer
+  // keeps the ones it has been given.
+  const std::uint32_t process = process_of_caller(thread);
+  return {.id = process,
+          .name = g_tracer->knows_process(process)
+                      ? std::string()
+                      : ProcessUtil::name_of(process)};
+}
 
 // Turns a FUSE path (absolute, from the mount root) into the tree-relative
 // path a DirectoryTree expects: "/" becomes the empty path (the root), and a
@@ -109,6 +166,11 @@ void merge_changes(Changes& into, const Changes& from) {
 
 // libfuse provider over a DirectoryTree.
 class VirtualFileSystem::Impl {
+  // One row per open being served at once, so a reader's whole request - the
+  // build it waits for included - reads as one worker rather than as whichever
+  // FUSE thread happened to take it.
+  mutable TraceLanePool m_reader_lanes{"reader"};
+
   const DirectoryTree& m_tree;
   std::filesystem::path m_mountpoint;
   fuse_args m_args{};
@@ -411,6 +473,11 @@ class VirtualFileSystem::Impl {
   // before a read or fstat, so it sees the settled one.
   int op_open(const char* path, fuse_file_info* info) {
     const std::filesystem::path relative = to_tree_path(path);
+    // FUSE names the calling thread, which is the process itself for a
+    // single-threaded reader.
+    const auto caller = static_cast<std::uint32_t>(fuse_get_context()->pid);
+    MB_TRACE_POOL_SCOPE(m_reader_lanes, calling_process(caller), "vfs",
+                        std::tie("open", relative), "caller", caller);
     const std::expected<EntryInfo, std::error_code> status =
         m_tree.status(relative);
     if (!status.has_value()) {
@@ -581,6 +648,7 @@ class VirtualFileSystem::Impl {
     // belongs to no other thread while this one lives, so a request carrying
     // it is ours by construction (see is_self_request).
     m_notifier_tid.store(::gettid(), std::memory_order_relaxed);
+    MB_TRACE_THREAD_NAME("vfs notifier");
 
     std::unique_lock<std::mutex> lock(m_notify_mutex);
     while (true) {

@@ -6,10 +6,12 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -375,6 +377,37 @@ void ProcessUtil::run(const std::filesystem::path& working_directory,
     on_done(Output{.standard_output = std::move(output),
                    .inputs = read_trace_log(*trace_log)});
   }
+}
+
+namespace {
+
+// The file name of the executable the process @a id is running, or nothing
+// when it has exited or may not be queried.
+std::optional<std::string> executable_name(std::uint32_t id) {
+  const ScopedHandle process(
+      OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, id));
+  if (process.get() == nullptr) {
+    return std::nullopt;
+  }
+  std::array<wchar_t, MAX_PATH> buffer{};
+  auto size = static_cast<DWORD>(buffer.size());
+  if (QueryFullProcessImageNameW(process.get(), 0, buffer.data(), &size) == 0) {
+    return std::nullopt;
+  }
+  return StringUtil::to_utf8(
+      std::filesystem::path(std::wstring_view(buffer.data(), size))
+          .filename()
+          .wstring());
+}
+
+}  // namespace
+
+std::uint32_t ProcessUtil::self() {
+  return GetCurrentProcessId();
+}
+
+std::string ProcessUtil::name_of(std::uint32_t pid) {
+  return executable_name(pid).value_or("unknown");
 }
 
 }  // namespace makebelieve
