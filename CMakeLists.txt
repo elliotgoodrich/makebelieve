@@ -17,11 +17,31 @@ endif()
 
 find_package(Threads REQUIRED)
 
+include(FetchContent)
+FetchContent_Declare(
+  stdexec
+  URL https://github.com/NVIDIA/stdexec/archive/ead186b1d8db3ebe37a946ff84a6ce08bf795153.tar.gz
+  URL_HASH SHA256=df8570088f9221ce79570d857aa3d481dd7eaa583102fb76ffacce1c09f82e88
+  # A missing directory, so stdexec is only downloaded and its CMakeLists never runs, see https://cmake.org/cmake/help/latest/module/FetchContent.html#populating-content-without-adding-it-to-the-build
+  SOURCE_SUBDIR do-not-configure
+)
+FetchContent_MakeAvailable(stdexec)
+add_library(stdexec INTERFACE)
+add_library(STDEXEC::stdexec ALIAS stdexec)
+target_include_directories(stdexec SYSTEM INTERFACE "${stdexec_SOURCE_DIR}/include")
+target_link_libraries(stdexec INTERFACE Threads::Threads)
+# The MSVC conformance flags stdexec's own target sets (/Zc:preprocessor is
+# already on for everything, below).
+target_compile_options(stdexec INTERFACE
+  $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
+  $<$<CXX_COMPILER_ID:MSVC>:/Zc:externConstexpr>
+  $<$<CXX_COMPILER_ID:MSVC>:/bigobj>
+)
+
 enable_testing()
 
 option(BUILD_TESTING "Build the tests." ON)
 if(BUILD_TESTING)
-  include(FetchContent)
   FetchContent_Declare(
     googletest
     GIT_REPOSITORY https://github.com/google/googletest.git
