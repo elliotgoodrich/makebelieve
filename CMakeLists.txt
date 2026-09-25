@@ -38,6 +38,9 @@ endif()
 
 add_compile_options(
   $<$<CXX_COMPILER_ID:MSVC>:/W4>
+  # MSVC's traditional preprocessor does not implement __VA_OPT__, which the
+  # tracing macros are built on.
+  $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>
   $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall>
   $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wextra>
   $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wno-missing-field-initializers>

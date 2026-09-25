@@ -4,6 +4,7 @@
 #include "inmemorydirectorytree.hpp"
 #include "manifest.hpp"
 #include "processutil.hpp"
+#include "tracer.hpp"
 
 #include <algorithm>
 #include <condition_variable>
@@ -15,6 +16,7 @@
 #include <fstream>
 #include <functional>
 #include <ios>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -27,6 +29,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -225,6 +228,27 @@ void remove_with_empty_parents(InMemoryDirectoryTree& tree,
 // One output, its action and that action's argument, as the runner receives it.
 using Command = BuildDirectoryTree::Command;
 
+// The name of @a action as a manifest spells it.
+std::string_view to_string(Manifest::Action action) {
+  switch (action) {
+    case Manifest::Action::Run:
+      return "run";
+    case Manifest::Action::Capture:
+      return "capture";
+    case Manifest::Action::Copy:
+      return "copy";
+    case Manifest::Action::Tracing:
+      return "tracing";
+  }
+  return "unknown";
+}
+
+// The content of a `tracing` output: the trace so far, or an empty one when
+// nothing is being traced.
+std::string trace_snapshot() {
+  return g_tracer != nullptr ? g_tracer->snapshot() : std::string("[]\n");
+}
+
 // Reads the rules of the manifest in @a source, mapping each output to its
 // command, or describes - one problem per line - why the manifest could not be
 // read or has lines it cannot accept. No manifest at all means no rules.
@@ -307,6 +331,21 @@ class BuildDirectoryTree::Impl {
 
   // Outputs opened at least once, which an input change rebuilds eagerly.
   std::set<std::filesystem::path> m_materialized;
+
+  // The id of the last build started, which ties the arrow drawn from the open
+  // that asked for it to the build itself.
+  std::uint64_t m_last_build_id = 0;
+
+  // The rows builds are recorded on, one per build running at once.
+  TraceLanePool m_build_lanes{"build"};
+
+  // Guards m_busy_lanes, which is its own concern and never held with another
+  // lock.
+  std::mutex m_lane_mutex;
+
+  // The row each build under way is being recorded on, so its end lands on the
+  // same row its beginning did.
+  std::unordered_map<std::filesystem::path, TraceLane> m_busy_lanes;
 
   // The inputs each built output last read. Kept so a rebuild can refresh
   // m_dependents when an output's set of inputs changes.
@@ -401,10 +440,18 @@ class BuildDirectoryTree::Impl {
   [[nodiscard]] std::error_code build_now(const std::filesystem::path& path) {
     const std::filesystem::path output = path.lexically_normal();
     std::unique_lock lock(m_mutex);
-    if (!m_commands.contains(output)) {
+    const auto command = m_commands.find(output);
+    if (command == m_commands.end()) {
       return {};
     }
     m_materialized.insert(output);
+
+    // A trace is out of date the moment anything else happens, so each open
+    // takes a fresh one.
+    if (command->second.action == Manifest::Action::Tracing &&
+        !m_in_flight.contains(output)) {
+      m_stale.insert(output);
+    }
 
     const std::uint64_t finished_before = m_finished[output];
     while (true) {
@@ -428,14 +475,53 @@ class BuildDirectoryTree::Impl {
     }
   }
 
+  // Passes on every change but the rewrite of a `tracing` output. Reading the
+  // trace is what rewrites it, so announcing that would have anything that
+  // rereads a file when told it changed - an editor showing it, say - reread
+  // the trace forever.
   [[nodiscard]] Subscription subscribe_to_changes(
-      const std::function<void(const DirectoryTreeDiff&)>& callback) const {
-    return m_structure.subscribe_to_changes(callback);
+      const std::function<void(const DirectoryTreeDiff&)>& callback) {
+    return m_structure.subscribe_to_changes(
+        [this, callback](const DirectoryTreeDiff& diff) {
+          if (diff.everything_dirty) {
+            callback(diff);
+            return;
+          }
+          // A rewrite rather than an addition or a removal, which changes the
+          // parent's list of children too.
+          const auto is_trace_rewrite = [&](const std::filesystem::path& path) {
+            const auto it = m_commands.find(path);
+            return it != m_commands.end() &&
+                   it->second.action == Manifest::Action::Tracing &&
+                   !std::ranges::contains(diff.child_lists_changed,
+                                          path.parent_path());
+          };
+
+          DirectoryTreeDiff filtered;
+          {
+            // Callers hold at most m_layout_mutex, which comes first.
+            const std::lock_guard lock(m_mutex);
+            if (std::ranges::none_of(diff.entries_changed, is_trace_rewrite)) {
+              filtered = diff;
+            } else {
+              filtered.child_lists_changed = diff.child_lists_changed;
+              std::ranges::copy_if(diff.entries_changed,
+                                   std::back_inserter(filtered.entries_changed),
+                                   std::not_fn(is_trace_rewrite));
+            }
+          }
+          // Outside m_mutex, so the callback may read back through us.
+          if (!filtered.entries_changed.empty() ||
+              !filtered.child_lists_changed.empty()) {
+            callback(filtered);
+          }
+        });
   }
 
  private:
   void start_build(const std::filesystem::path& output) {
     Command command;
+    std::uint64_t build_id = 0;
     {
       const std::lock_guard lock(m_mutex);
       if (!m_stale.contains(output) || m_in_flight.contains(output)) {
@@ -448,19 +534,82 @@ class BuildDirectoryTree::Impl {
       m_stale.erase(output);
       m_in_flight.insert(output);
       command = it->second;
+      // A `tracing` output is left out of the trace, whose snapshot would
+      // otherwise always hold its own unfinished build.
+      if (command.action != Manifest::Action::Tracing) {
+        build_id = ++m_last_build_id;
+      }
+    }
+
+    // A synchronous completion allocates and lets that escape open().
+    // NOLINTNEXTLINE(bugprone-exception-escape)
+    BuildComplete on_done = [this, output, build_id](BuildResult result) {
+      finish_build(output, build_id, std::move(result));
+    };
+
+    // Served by the tree itself rather than the runner.
+    if (command.action == Manifest::Action::Tracing) {
+      on_done(BuildOutput{.bytes = trace_snapshot(), .inputs = {}});
+      return;
+    }
+
+    if (Tracer* const tracer = g_tracer) {
+      // The arrow leaves whatever we are inside - the open that asked for this
+      // output, or the source change that dirtied it - and arrives at the
+      // build's own row.
+      const TraceLane lane = take_lane(output);
+      tracer->flow_out("build", "build", build_id);
+      TraceArgs args;
+      args.add("action", to_string(command.action));
+      args.add("command", command.text);
+      tracer->begin(lane, "build", output, args);
+      tracer->flow_in(lane, "build", "build", build_id);
     }
 
     // Outside the lock: a synchronous runner re-enters finish_build from within
     // this call.
-    m_runner(command, m_stop.get_token(),
-             // A synchronous completion allocates and lets that escape open().
-             // NOLINTNEXTLINE(bugprone-exception-escape)
-             [this, output](BuildResult result) {
-               finish_build(output, std::move(result));
-             });
+    m_runner(command, m_stop.get_token(), std::move(on_done));
   }
 
-  void finish_build(const std::filesystem::path& output, BuildResult result) {
+  // Takes a row for @a output's build.
+  // @pre There is a tracer.
+  TraceLane take_lane(const std::filesystem::path& output) {
+    const TraceLane lane = m_build_lanes.take(*g_tracer, ProcessUtil::self());
+    const std::lock_guard lock(m_lane_mutex);
+    m_busy_lanes.insert_or_assign(output, lane);
+    return lane;
+  }
+
+  // The row @a output's build is being recorded on, if it has one.
+  [[nodiscard]] std::optional<TraceLane> lane_of(
+      const std::filesystem::path& output) {
+    const std::lock_guard lock(m_lane_mutex);
+    const auto it = m_busy_lanes.find(output);
+    return it == m_busy_lanes.end() ? std::optional<TraceLane>()
+                                    : std::optional(it->second);
+  }
+
+  // Hands @a output's row back for the next build to take. Called once its
+  // span has been closed, so no other build can start one on that row first.
+  void free_lane(const std::filesystem::path& output) {
+    std::optional<TraceLane> lane;
+    {
+      const std::lock_guard lock(m_lane_mutex);
+      if (const auto it = m_busy_lanes.find(output); it != m_busy_lanes.end()) {
+        lane = it->second;
+        m_busy_lanes.erase(it);
+      }
+    }
+    if (lane.has_value()) {
+      m_build_lanes.give_back(*lane);
+    }
+  }
+
+  // Records the outcome of a build. @a build_id is 0 for one left out of the
+  // trace.
+  void finish_build(const std::filesystem::path& output,
+                    std::uint64_t build_id,
+                    BuildResult result) {
     if (result.has_value()) {
       const std::lock_guard layout(m_layout_mutex);
       bool declared = false;
@@ -500,6 +649,17 @@ class BuildDirectoryTree::Impl {
       }
     }
     m_settled.notify_all();
+
+    const std::optional<TraceLane> lane =
+        build_id != 0 ? lane_of(output) : std::nullopt;
+    if (lane.has_value()) {
+      TraceArgs args;
+      args.add("result", result.has_value() ? std::string("ok")
+                                            : result.error().message());
+      g_tracer->end(*lane, "build", output, args);
+      // Only now the span is closed may another build take this row.
+      free_lane(output);
+    }
 
     if (rebuild_again) {
       start_build(output);
@@ -599,6 +759,9 @@ class BuildDirectoryTree::Impl {
   // depending on whatever changed and invalidates each. Invalidation runs
   // outside the lock, since it may start an eager rebuild.
   void on_source_change(const DirectoryTreeDiff& diff) {
+    MB_TRACE_SCOPE("build", "source change", "changed",
+                   diff.entries_changed.size(), "everything_dirty",
+                   diff.everything_dirty);
     if (diff.everything_dirty ||
         std::ranges::contains(diff.entries_changed,
                               std::filesystem::path(k_manifest_name))) {

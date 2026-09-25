@@ -41,6 +41,7 @@ add_library(makebelieve_core STATIC
   processutil-${MAKEBELIEVE_PLATFORM}.cpp
   realdirectorytree-${MAKEBELIEVE_PLATFORM}.cpp
   stringutil.cpp
+  tracer.cpp
   unmountchannel-${MAKEBELIEVE_PLATFORM}.cpp
   unmountchannel-common.cpp
   virtualfilesystem-${MAKEBELIEVE_PLATFORM}.cpp
@@ -148,6 +149,7 @@ if(BUILD_TESTING)
   makebelieve_add_test(manifest)
   makebelieve_add_test(processutil)
   makebelieve_add_test(realdirectorytree)
+  makebelieve_add_test(tracer)
   makebelieve_add_test(inmemorydirectorytree)
   makebelieve_add_test(directorytreeutil)
   makebelieve_add_test(virtualfilesystem)

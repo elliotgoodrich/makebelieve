@@ -48,6 +48,9 @@ std::optional<Manifest::Action> to_action(std::string_view word) {
   if (word == "copy") {
     return Manifest::Action::Copy;
   }
+  if (word == "tracing") {
+    return Manifest::Action::Tracing;
+  }
   return std::nullopt;
 }
 
@@ -119,12 +122,20 @@ Manifest Manifest::parse(std::string_view text) {
     if (!action.has_value()) {
       reject(
           std::format("`{}` must be assigned `run <command>`, "
-                      "`capture <command>` or `copy <path>`",
+                      "`capture <command>`, `copy <path>` or `tracing`",
                       left));
       continue;
     }
     const std::string_view argument = trim(value.substr(word.size()));
-    if (argument.empty()) {
+    if (*action == Manifest::Action::Tracing) {
+      if (!argument.empty()) {
+        reject(
+            std::format("`{}` is assigned `tracing`, which takes no "
+                        "argument, but was given `{}`",
+                        left, argument));
+        continue;
+      }
+    } else if (argument.empty()) {
       reject(std::format("`{}` has no {}", left, argument_of(*action)));
       continue;
     }

@@ -1,0 +1,14 @@
+# A manifest for looking at what makebelieve spends its time on. The outputs
+# take noticeably different amounts of time to build, so they stand apart in a
+# trace viewer, and the last rule serves the trace itself.
+#
+# The commands use `cmake -E`, so they work whether the shell is sh or cmd.exe.
+
+@/fast.txt          = capture cmake -E echo "built quickly"
+@/slow.txt          = run cmake -E sleep 1 && cmake -E echo "built slowly" > %out
+@/copied.txt        = run cmake -E copy input.txt %out
+@/nested/direct.txt = copy input.txt
+
+# Everything makebelieve has done since the mount started, in the Trace Event
+# Format. Open it in https://ui.perfetto.dev or chrome://tracing.
+@/tracing.json = tracing

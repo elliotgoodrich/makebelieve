@@ -9,9 +9,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <expected>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -668,6 +670,37 @@ void ProcessUtil::run(const std::filesystem::path& working_directory,
   // The tracer could not attach; run untraced, reporting no inputs (an empty
   // list is a valid best-effort result).
   on_done(run_untraced(root, command, stop));
+}
+
+namespace {
+
+// What `/proc/<id>/status` says about @a field, or nothing when the file or
+// the field is missing - which is what a process that exited between the
+// request and this lookup gives.
+std::optional<std::string> read_proc_status(std::uint32_t id,
+                                            std::string_view field) {
+  std::ifstream status("/proc/" + std::to_string(id) + "/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    if (!line.starts_with(field)) {
+      continue;
+    }
+    const std::size_t start = line.find_first_not_of(" \t", field.size());
+    if (start != std::string::npos) {
+      return line.substr(start);
+    }
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
+std::uint32_t ProcessUtil::self() {
+  return static_cast<std::uint32_t>(::getpid());
+}
+
+std::string ProcessUtil::name_of(std::uint32_t pid) {
+  return read_proc_status(pid, "Name:").value_or("unknown");
 }
 
 }  // namespace makebelieve

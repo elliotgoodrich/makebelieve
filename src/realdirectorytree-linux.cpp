@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "realdirectorytree.hpp"
 
+#include "tracer.hpp"
+
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -394,6 +396,7 @@ void RealDirectoryTree::Impl::add_watch(const WatchTarget& target) const {
 }
 
 void RealDirectoryTree::Impl::watch_loop() const {
+  MB_TRACE_THREAD_NAME("source watcher");
   // alignas so each record can be read through at its natural alignment.
   alignas(struct inotify_event) std::array<char, k_event_buffer_bytes> buffer;
 

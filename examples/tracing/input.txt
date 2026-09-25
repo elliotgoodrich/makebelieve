@@ -1,0 +1,1 @@
+Rewriting this file rebuilds copied.txt and nested/direct.txt.

@@ -14,7 +14,9 @@ Declare `output = action argument` rules in a `build.makebelieve` file,
 With `run` the command writes the output itself, to the path `%out`
 stands for; with `capture` the bytes the command writes to standard
 output are the output. `copy` takes a path instead of a command and
-hands back that file's bytes, running nothing.
+hands back that file's bytes, running nothing. `tracing` takes nothing
+at all and hands back a performance trace of **makebelieve** itself (see
+[`DOCS.md`](DOCS.md)).
 
 Then **makebelieve** will instantly manifest this as a folder,
 

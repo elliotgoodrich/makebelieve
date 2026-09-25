@@ -3,6 +3,7 @@
 #include "consoleinterrupthandler.hpp"
 #include "filesystemutil.hpp"
 #include "realdirectorytree.hpp"
+#include "tracer.hpp"
 #include "unmountchannel.hpp"
 #include "virtualfilesystem.hpp"
 
@@ -42,6 +43,13 @@ void block_until_any(const Tokens&... tokens) {
 
 // Serves the manifest's outputs at `mountpoint`, blocking until torn down.
 int mount(const char* mountpoint_arg) {
+  // Always recording, so a `tracing` rule added to the manifest at any point
+  // shows the history leading up to it. Installed before anything below starts
+  // a thread that records, and uninstalled only once they are all gone.
+  Tracer tracer;
+  const TracerInstallation installed_tracer(tracer);
+  MB_TRACE_THREAD_NAME("main");
+
   const ConsoleInterruptHandler interrupt;
 
   const std::filesystem::path source = std::filesystem::current_path();

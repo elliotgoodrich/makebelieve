@@ -50,6 +50,29 @@ it, so the file is always one **makebelieve** can watch - a copy is
 rebuilt when its source changes even where command tracing is
 unavailable.
 
+`tracing` takes no argument: the output is a trace of what
+**makebelieve** itself has been doing - every file opened through the
+mount, every build with its command and how long it took, and an arrow
+from the open that asked for a build to the build itself. Each reading
+process gets a group of its own, named after its executable, and
+**makebelieve** another for its own threads and builds. Within a group,
+work goes on rows (`reader`, `build`) that are reused as it finishes, so
+a group holds as many rows as it ever had work running at once. It is in
+the
+[Trace Event Format](https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview),
+ready to open in [Perfetto](https://ui.perfetto.dev) or
+`chrome://tracing`.
+
+```mb
+@/tracing.json = tracing
+```
+
+Recording runs from the moment the mount starts, whether or not a
+`tracing` rule exists, keeping the most recent 64 MiB of events. Every
+open of the output takes a fresh snapshot. That rewrite is not
+announced as a change, so a tool that rereads files when told they
+changed does not reread the trace forever.
+
 ## Rules
 
 Reusable commands can be declared as rules:
@@ -67,7 +90,7 @@ Invoke them by name, prefixed with `!`:
 ```
 
 Without the `!`, the right-hand side is a built-in action (`run`,
-`capture` or `copy`) and its argument.
+`capture`, `copy` or `tracing`) and its argument, if it takes one.
 
 ## Directory Expansion
 

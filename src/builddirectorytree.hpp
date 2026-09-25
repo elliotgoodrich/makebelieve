@@ -38,6 +38,11 @@ namespace makebelieve {
 /// A manifest that cannot be read, or has any line @link Manifest::parse
 /// rejects, is not applied: the current rules stay in force until it is fixed.
 ///
+/// A `tracing` rule's output is the trace recorded to @link g_tracer (or an
+/// empty trace when there is none), served by the tree itself rather than the
+/// runner. Every open takes a fresh snapshot, and since that rewrite is caused
+/// by the reader it is not announced to subscribers.
+///
 /// Subscribers are notified while an internal lock is held, so they must not
 /// call `open` from within their callback.
 class BuildDirectoryTree : public DirectoryTree {
@@ -73,7 +78,7 @@ class BuildDirectoryTree : public DirectoryTree {
     Manifest::Action action = Manifest::Action::Run;
 
     /// The command to run for `Run` and `Capture`; for `Copy`, the path of the
-    /// file to read, relative to the source tree's root.
+    /// file to read, relative to the source tree's root; empty for `Tracing`.
     std::string text;
 
     [[nodiscard]] friend bool operator==(const Command&,
@@ -85,10 +90,10 @@ class BuildDirectoryTree : public DirectoryTree {
   using BuildComplete = std::move_only_function<void(BuildResult)>;
 
   /// Carries out one rule and reports the bytes it produced through the
-  /// completion handler. The runner may call the handler synchronously, before
-  /// returning, or later from another thread; either way it must call it
-  /// exactly once.
-  /// The `stop_token` is requested when the result is no longer wanted (for
+  /// completion handler. A `Manifest::Action::Tracing` rule never reaches it.
+  /// The runner may call the handler synchronously, before returning, or later
+  /// from another thread; either way it must call it exactly once. The
+  /// `stop_token` is requested when the result is no longer wanted (for
   /// instance when the tree is being destroyed), and a runner that defers work
   /// should honour it and still complete - reporting
   /// `std::errc::operation_canceled` is fine. A runner that does not care about

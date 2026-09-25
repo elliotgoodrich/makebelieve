@@ -82,6 +82,16 @@ INSTANTIATE_TEST_SUITE_P(
                            "@/e.txt = copy kept.txt\n",
                   .expected = {{"e.txt", Action::Copy, "kept.txt"}},
                   .error_lines = {1, 2, 3, 4}},
+        // `tracing` takes nothing after it: the output is makebelieve's own
+        // trace.
+        ParseCase{.name = "single_tracing_rule",
+                  .input = "@/trace.json = tracing  \n",
+                  .expected = {{"trace.json", Action::Tracing, ""}}},
+        ParseCase{.name = "rejects_a_tracing_rule_with_an_argument",
+                  .input = "@/a.json = tracing everything\n"
+                           "@/b.json = tracing\n",
+                  .expected = {{"b.json", Action::Tracing, ""}},
+                  .error_lines = {1}},
         // A copy source is a path, not a command line, so the whole of the
         // rest of the line is the path - spaces and all.
         ParseCase{.name = "keeps_spaces_in_a_copy_source",
@@ -125,16 +135,17 @@ INSTANTIATE_TEST_SUITE_P(
                            "@/output.txt =\n",
                   .expected = {},
                   .error_lines = {1, 2, 3, 4, 5}},
-        // Only `run`, `capture` and `copy` name an action; anything else - a
-        // bare command, a word that merely starts with one of them, or a rule
-        // invocation - is rejected rather than guessed at.
+        // Only `run`, `capture`, `copy` and `tracing` name an action; anything
+        // else - a bare command, a word that merely starts with one of them, or
+        // a rule invocation - is rejected rather than guessed at.
         ParseCase{.name = "rejects_an_unknown_action",
                   .input = "@/output.txt = cp input.txt %out\n"
                            "@/output.txt = running cp input.txt %out\n"
                            "@/output.txt = copying input.txt\n"
+                           "@/output.txt = tracingfile\n"
                            "@/foo.o = !cc foo.cpp\n",
                   .expected = {},
-                  .error_lines = {1, 2, 3, 4}},
+                  .error_lines = {1, 2, 3, 4, 5}},
         // Syntax the manifest format documents but the parser does not handle
         // yet is rejected rather than misread.
         ParseCase{.name = "rejects_unsupported_syntax",
