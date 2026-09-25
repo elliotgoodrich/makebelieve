@@ -4,12 +4,16 @@
 #include "directorytree.hpp"
 #include "manifest.hpp"
 
+#include <exec/any_sender_of.hpp>
+#include <exec/static_thread_pool.hpp>
+#include <stdexec/execution.hpp>
+
 #include <cstddef>
+#include <exception>
 #include <expected>
 #include <filesystem>
 #include <functional>
 #include <memory>
-#include <stop_token>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -22,9 +26,9 @@ namespace makebelieve {
 ///
 /// On construction it reads the manifest from a @a source tree and presents
 /// one entry per declared `@/output = <action> <argument>` rule. `open` builds
-/// an output that is unbuilt or dirty, blocking until its @link CommandRunner
-/// reports back. `status` and `read` never build: an unbuilt output reports
-/// size 1, otherwise the size of its last build.
+/// an output that is unbuilt or dirty, blocking until the build its
+/// @link CommandRunner returned completes. `status` and `read` never build: an
+/// unbuilt output reports size 1, otherwise the size of its last build.
 ///
 /// It then observes @a source for the rest of its life, recording the inputs
 /// each build reads, so a change to one of those inputs rebuilds the outputs
@@ -85,22 +89,29 @@ class BuildDirectoryTree : public DirectoryTree {
                                          const Command&) = default;
   };
 
-  /// Reports the outcome of a single command back to the tree. Move-only so it
-  /// can carry move-only state, and single-shot - call it exactly once.
-  using BuildComplete = std::move_only_function<void(BuildResult)>;
+  /// A build under way, as a sender: it completes with the @link BuildResult,
+  /// or with an `exception_ptr` or stopped, both of which the tree records as
+  /// a failed build. The tree cancels it through the stop token in the
+  /// receiver's environment when the result is no longer wanted (for instance
+  /// when the tree is being destroyed); a build that honours it should still
+  /// complete promptly, and completing stopped is fine. It must not complete
+  /// from within its stop callback, on the thread requesting the stop: the
+  /// stop sources stdexec interposes live inside the build and would be freed
+  /// while that request is still walking them. Completing from another thread
+  /// is fine.
+  using BuildSender = exec::any_sender<exec::any_receiver<
+      stdexec::completion_signatures<stdexec::set_value_t(BuildResult),
+                                     stdexec::set_error_t(std::exception_ptr),
+                                     stdexec::set_stopped_t()>,
+      exec::queries<stdexec::inplace_stop_token(
+          stdexec::get_stop_token_t) noexcept>>>;
 
-  /// Carries out one rule and reports the bytes it produced through the
-  /// completion handler. A `Manifest::Action::Tracing` rule never reaches it.
-  /// The runner may call the handler synchronously, before returning, or later
-  /// from another thread; either way it must call it exactly once. The
-  /// `stop_token` is requested when the result is no longer wanted (for
-  /// instance when the tree is being destroyed), and a runner that defers work
-  /// should honour it and still complete - reporting
-  /// `std::errc::operation_canceled` is fine. A runner that does not care about
-  /// cancellation can simply leave the `stop_token` parameter unnamed.
-  /// @pre A deferred completion does not outlive this `BuildDirectoryTree`.
-  using CommandRunner = std::function<
-      void(Command command, std::stop_token stop, BuildComplete on_done)>;
+  /// Carries out one rule, returning the build as a sender that the tree
+  /// starts. A `Manifest::Action::Tracing` rule never reaches it. The sender
+  /// may complete inline, from within `start`, or later on any thread. Any
+  /// sender whose completions fit @link BuildSender converts to it, so a
+  /// runner with its answer to hand can return `stdexec::just(result)`.
+  using CommandRunner = std::function<BuildSender(Command command)>;
 
   /// Told why a changed manifest was rejected, one problem per line (such as
   /// `build.makebelieve:3: expected ...`). Called on the source's watcher
@@ -118,6 +129,8 @@ class BuildDirectoryTree : public DirectoryTree {
                      CommandRunner runner,
                      ManifestErrorHandler on_manifest_error = {});
 
+  /// Cancels every build still under way and waits for each to complete, so
+  /// no build outlives the tree.
   ~BuildDirectoryTree() override;
 
   BuildDirectoryTree(const BuildDirectoryTree&) = delete;
@@ -126,20 +139,23 @@ class BuildDirectoryTree : public DirectoryTree {
   BuildDirectoryTree& operator=(BuildDirectoryTree&&) = delete;
 
   /// Returns a `CommandRunner` that runs a rule's command through the system
-  /// shell with the working directory set to @a working_directory (so relative
-  /// inputs resolve against it). A `Run` command has `%out` substituted with a
-  /// scratch file - with the same file name as the output it builds, so a
-  /// tool that chooses its format from the extension needs no extra flag - and
-  /// produces the bytes it wrote there; a `Capture` command produces the bytes
-  /// it wrote to standard output. A `Copy` rule runs no
-  /// command at all: it produces the bytes of the file it names, read from
-  /// under @a working_directory, and reports that file as its one input, so a
-  /// copy is tracked even where command tracing is unavailable. It works
-  /// synchronously, reporting the result before returning. Traced inputs are
-  /// reported relative to @a working_directory, so for dependency tracking to
-  /// line up it should be the filesystem root that @a source mirrors.
+  /// shell on @a scheduler, with the working directory set to
+  /// @a working_directory (so relative inputs resolve against it). A `Run`
+  /// command has `%out` substituted with a scratch file - with the same file
+  /// name as the output it builds, so a tool that chooses its format from the
+  /// extension needs no extra flag - and produces the bytes it wrote there; a
+  /// `Capture` command produces the bytes it wrote to standard output. A
+  /// `Copy` rule runs no command at all: it produces the bytes of the file it
+  /// names, read from under @a working_directory, and reports that file as its
+  /// one input, so a copy is tracked even where command tracing is
+  /// unavailable. Running a command blocks the @a scheduler thread it runs on
+  /// until the command exits. Traced inputs are reported relative to
+  /// @a working_directory, so for dependency tracking to line up it should be
+  /// the filesystem root that @a source mirrors.
+  /// @pre The pool behind @a scheduler outlives every tree using the runner.
   [[nodiscard]] static CommandRunner shell_runner(
-      std::filesystem::path working_directory);
+      std::filesystem::path working_directory,
+      exec::static_thread_pool::scheduler scheduler);
 
   [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
       const std::filesystem::path& path) const override;

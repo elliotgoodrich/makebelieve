@@ -7,6 +7,9 @@
 #include "unmountchannel.hpp"
 #include "virtualfilesystem.hpp"
 
+#include <exec/static_thread_pool.hpp>
+
+#include <algorithm>
 #include <array>
 #include <concepts>
 #include <cstddef>
@@ -18,6 +21,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -66,11 +70,17 @@ int mount(const char* mountpoint_arg) {
 
   const RealDirectoryTree tree(source);
 
+  // Where builds run: one thread per core, each blocked for as long as the
+  // command it runs. Outlives the tree, which waits out its builds when it
+  // goes.
+  exec::static_thread_pool builds(
+      std::max(1U, std::thread::hardware_concurrency()));
+
   // Presents the manifest's declared outputs, building each lazily through
   // the shell. The runner's working directory is the source root, so the
   // inputs it traces line up with the source's own change notifications.
   const BuildDirectoryTree build_tree(
-      tree, BuildDirectoryTree::shell_runner(source),
+      tree, BuildDirectoryTree::shell_runner(source, builds.get_scheduler()),
       [](const std::string& problems) {
         // Best-effort, as this runs on the source's watcher thread.
         try {

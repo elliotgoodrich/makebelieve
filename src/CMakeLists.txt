@@ -57,6 +57,7 @@ target_include_directories(makebelieve_core SYSTEM PUBLIC
 # fold in under PLATFORM_ID and evaluate to nothing elsewhere.
 target_link_libraries(makebelieve_core PUBLIC
   Threads::Threads
+  STDEXEC::stdexec
   $<$<PLATFORM_ID:Windows>:${WINFSP_LIBRARY}>  # FspFileSystemCreate and friends
   $<$<PLATFORM_ID:Windows>:Advapi32>           # SDDL, and FspLoad's registry read
   $<$<PLATFORM_ID:Windows>:Delayimp>           # the delay-load helper below

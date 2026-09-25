@@ -6,10 +6,13 @@
 #include "processutil.hpp"
 #include "tracer.hpp"
 
+#include <stdexec/execution.hpp>
+
 #include <algorithm>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <expected>
 #include <filesystem>
 #include <format>
@@ -20,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <random>
 #include <set>
@@ -228,6 +232,9 @@ void remove_with_empty_parents(InMemoryDirectoryTree& tree,
 // One output, its action and that action's argument, as the runner receives it.
 using Command = BuildDirectoryTree::Command;
 
+using BuildOutput = BuildDirectoryTree::BuildOutput;
+using BuildResult = BuildDirectoryTree::BuildResult;
+
 // The name of @a action as a manifest spells it.
 std::string_view to_string(Manifest::Action action) {
   switch (action) {
@@ -243,10 +250,84 @@ std::string_view to_string(Manifest::Action action) {
   return "unknown";
 }
 
+// The error a build that completed with @a error is recorded as.
+std::error_code to_error_code(const std::exception_ptr& error) noexcept {
+  try {
+    std::rethrow_exception(error);
+  } catch (const std::system_error& failure) {
+    return failure.code();
+  } catch (const std::bad_alloc&) {
+    return std::make_error_code(std::errc::not_enough_memory);
+  } catch (...) {
+    return std::make_error_code(std::errc::io_error);
+  }
+}
+
 // The content of a `tracing` output: the trace so far, or an empty one when
 // nothing is being traced.
 std::string trace_snapshot() {
   return g_tracer != nullptr ? g_tracer->snapshot() : std::string("[]\n");
+}
+
+// Carries out @a command as `BuildDirectoryTree::shell_runner` describes,
+// blocking until it is done. @a stop cancels a command still running.
+BuildResult run_shell_command(const std::filesystem::path& working_directory,
+                              const Command& command,
+                              stdexec::inplace_stop_token stop) {
+  // A `copy` rule names a file rather than a command: nothing is run, the
+  // output is that file's bytes, and the file itself is the build's one input -
+  // so a copy tracks its source even on a platform where command tracing is
+  // unavailable. The parser has already held the path to one inside the
+  // working directory.
+  if (command.action == Manifest::Action::Copy) {
+    const std::filesystem::path source = command.text;
+    std::expected<std::string, std::error_code> bytes =
+        read_file(working_directory / source);
+    if (!bytes.has_value()) {
+      return std::unexpected(bytes.error());
+    }
+    return BuildOutput{.bytes = std::move(*bytes), .inputs = {source}};
+  }
+
+  const bool capture = command.action == Manifest::Action::Capture;
+
+  // A `run` command gets a private file to write its output to - with the
+  // output's own file name, since plenty of tools (pandoc and friends) pick
+  // their format from the extension - with that path substituted in for %out.
+  // The directory is fresh per build, so the name cannot collide. Its build
+  // output is whatever it left in that file - not ProcessUtil's captured
+  // stdout, which a `> %out` rule leaves empty. A `capture` command has no
+  // output file: its stdout is the output.
+  std::optional<TempDirectory> scratch;
+  std::filesystem::path out_path;
+  if (!capture) {
+    scratch.emplace(make_temp_directory());
+    out_path = scratch->path() / command.output.filename();
+  }
+
+  // ProcessUtil is cancelled through a std::stop_token, so the build's own
+  // cancellation is forwarded to one.
+  std::stop_source cancel;
+  const auto request_cancel = [&cancel]() noexcept { cancel.request_stop(); };
+  const stdexec::inplace_stop_callback<decltype(request_cancel)> forward(
+      stop, request_cancel);
+
+  BuildResult built =
+      std::unexpected(std::make_error_code(std::errc::io_error));
+  ProcessUtil::run(
+      working_directory,
+      capture ? command.text : substitute_out(command.text, out_path),
+      cancel.get_token(), [&](ProcessUtil::Result result) {
+        if (!result.has_value()) {
+          built = std::unexpected(result.error());
+          return;
+        }
+        built = BuildOutput{
+            .bytes = capture ? std::move(result->standard_output)
+                             : read_file(out_path).value_or(std::string{}),
+            .inputs = relativize(result->inputs, working_directory)};
+      });
+  return built;
 }
 
 // Reads the rules of the manifest in @a source, mapping each output to its
@@ -361,9 +442,10 @@ class BuildDirectoryTree::Impl {
   // Told why a changed manifest was rejected; may be empty.
   ManifestErrorHandler m_on_manifest_error;
 
-  // Requested on destruction to tell in-flight runners their results are no
-  // longer wanted.
-  std::stop_source m_stop;
+  // Every build under way. Destruction requests a stop through it, telling
+  // those builds their results are no longer wanted, then joins it, so none
+  // completes into a tree that is gone.
+  stdexec::counting_scope m_builds;
 
   // Drains the source-change callback on teardown: the callback holds the gate
   // while it touches our state and bails if closed, and the destructor closes
@@ -404,13 +486,15 @@ class BuildDirectoryTree::Impl {
 
   ~Impl() {
     // Close the gate first, so no source notification runs against the state we
-    // are about to destroy; then stop observing and cancel in-flight runners.
+    // are about to destroy; then stop observing, cancel the builds under way
+    // and wait for each to complete.
     {
       const std::lock_guard lock(m_gate->mutex);
       m_gate->open = false;
     }
     m_source_subscription.reset();
-    m_stop.request_stop();
+    m_builds.request_stop();
+    stdexec::sync_wait(m_builds.join());
   }
 
   Impl(const Impl&) = delete;
@@ -468,7 +552,7 @@ class BuildDirectoryTree::Impl {
           return it->second;
         }
       }
-      // Unlocked: a synchronous runner calls finish_build from inside.
+      // Unlocked: a build that completes inline calls finish_build from inside.
       lock.unlock();
       start_build(output);
       lock.lock();
@@ -519,6 +603,10 @@ class BuildDirectoryTree::Impl {
   }
 
  private:
+  // Recursive with finish_build: a build that completes inline and finds its
+  // output went stale meanwhile starts the next one. Each round needs another
+  // change to the output's inputs, so it cannot run away.
+  // NOLINTNEXTLINE(misc-no-recursion)
   void start_build(const std::filesystem::path& output) {
     Command command;
     std::uint64_t build_id = 0;
@@ -541,15 +629,10 @@ class BuildDirectoryTree::Impl {
       }
     }
 
-    // A synchronous completion allocates and lets that escape open().
-    // NOLINTNEXTLINE(bugprone-exception-escape)
-    BuildComplete on_done = [this, output, build_id](BuildResult result) {
-      finish_build(output, build_id, std::move(result));
-    };
-
     // Served by the tree itself rather than the runner.
     if (command.action == Manifest::Action::Tracing) {
-      on_done(BuildOutput{.bytes = trace_snapshot(), .inputs = {}});
+      finish_build(output, build_id,
+                   BuildOutput{.bytes = trace_snapshot(), .inputs = {}});
       return;
     }
 
@@ -566,9 +649,35 @@ class BuildDirectoryTree::Impl {
       tracer->flow_in(lane, "build", "build", build_id);
     }
 
-    // Outside the lock: a synchronous runner re-enters finish_build from within
-    // this call.
-    m_runner(command, m_stop.get_token(), std::move(on_done));
+    std::optional<BuildSender> build;
+    try {
+      build.emplace(m_runner(std::move(command)));
+    } catch (...) {
+      finish_build(output, build_id,
+                   std::unexpected(to_error_code(std::current_exception())));
+      return;
+    }
+
+    // Started, not awaited, and outside the lock: a build that completes inline
+    // re-enters finish_build from within spawn. Every way a build can end is
+    // turned into a result, so a waiting open() is always released.
+    stdexec::spawn(
+        std::move(*build) |
+            stdexec::upon_error([](const std::exception_ptr& error) noexcept {
+              return BuildResult(std::unexpected(to_error_code(error)));
+            }) |
+            stdexec::upon_stopped([]() noexcept {
+              return BuildResult(std::unexpected(
+                  std::make_error_code(std::errc::operation_canceled)));
+            }) |
+            // Recording a result allocates; with nowhere left to report that
+            // to, a failure there ends the process, as it would on any thread.
+            stdexec::then(
+                // NOLINTNEXTLINE(bugprone-exception-escape)
+                [this, output, build_id](BuildResult result) noexcept {
+                  finish_build(output, build_id, std::move(result));
+                }),
+        m_builds.get_token());
   }
 
   // Takes a row for @a output's build.
@@ -607,6 +716,7 @@ class BuildDirectoryTree::Impl {
 
   // Records the outcome of a build. @a build_id is 0 for one left out of the
   // trace.
+  // NOLINTNEXTLINE(misc-no-recursion): see start_build.
   void finish_build(const std::filesystem::path& output,
                     std::uint64_t build_id,
                     BuildResult result) {
@@ -819,63 +929,22 @@ BuildDirectoryTree::BuildDirectoryTree(const DirectoryTree& source,
 BuildDirectoryTree::~BuildDirectoryTree() = default;
 
 BuildDirectoryTree::CommandRunner BuildDirectoryTree::shell_runner(
-    std::filesystem::path working_directory) {
-  return [working_directory = std::move(working_directory)](
-             const Command& command, const std::stop_token& stop,
-             BuildComplete on_done) {
-    // A `copy` rule names a file rather than a command: nothing is run, the
-    // output is that file's bytes, and the file itself is the build's one
-    // input - so a copy tracks its source even on a platform where command
-    // tracing is unavailable. The parser has already held the path to one
-    // inside the working directory.
-    if (command.action == Manifest::Action::Copy) {
-      const std::filesystem::path source = command.text;
-      std::expected<std::string, std::error_code> bytes =
-          read_file(working_directory / source);
-      if (bytes.has_value()) {
-        on_done(BuildOutput{.bytes = std::move(*bytes), .inputs = {source}});
-      } else {
-        on_done(std::unexpected(bytes.error()));
-      }
-      return;
-    }
-
-    const bool capture = command.action == Manifest::Action::Capture;
-
-    // A `run` command gets a private file to write its output to - with the
-    // output's own file name, since plenty of tools (pandoc and friends) pick
-    // their format from the extension - with that path substituted in for
-    // %out. The directory is fresh per build, so the name cannot collide. Its
-    // build output is
-    // whatever it left in that file - not ProcessUtil's captured stdout,
-    // which a `> %out` rule leaves empty - so the scratch directory is kept
-    // alive (through the shared_ptr the completion captures) until we have
-    // read it back. A `capture` command has no output file: its stdout is the
-    // output.
-    const std::shared_ptr<TempDirectory> scratch =
-        capture ? nullptr
-                : std::make_shared<TempDirectory>(make_temp_directory());
-    const std::filesystem::path out_path =
-        capture ? std::filesystem::path{}
-                : scratch->path() / command.output.filename();
-
-    ProcessUtil::run(
-        working_directory,
-        capture ? command.text : substitute_out(command.text, out_path), stop,
-        // Reading the output allocates; a synchronous ProcessUtil
-        // lets that propagate back out to the triggering read().
-        // NOLINTNEXTLINE(bugprone-exception-escape)
-        [scratch, out_path, capture, working_directory,
-         on_done = std::move(on_done)](ProcessUtil::Result result) mutable {
-          if (result.has_value()) {
-            on_done(BuildOutput{
-                .bytes = capture ? std::move(result->standard_output)
-                                 : read_file(out_path).value_or(std::string{}),
-                .inputs = relativize(result->inputs, working_directory)});
-          } else {
-            on_done(std::unexpected(result.error()));
-          }
-        });
+    std::filesystem::path working_directory,
+    exec::static_thread_pool::scheduler scheduler) {
+  return [working_directory = std::move(working_directory),
+          scheduler](Command command) -> BuildSender {
+    // Spelled as schedule-then-let_value because stdexec cannot type-erase a
+    // starts_on (or continues_on) onto a static_thread_pool.
+    return stdexec::schedule(scheduler) |
+           stdexec::let_value(
+               [working_directory, command = std::move(command)]() {
+                 return stdexec::read_env(stdexec::get_stop_token) |
+                        stdexec::then([&](stdexec::inplace_stop_token stop) {
+                          MB_TRACE_THREAD_NAME("build worker");
+                          return run_shell_command(working_directory, command,
+                                                   stop);
+                        });
+               });
   };
 }
 

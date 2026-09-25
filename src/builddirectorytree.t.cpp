@@ -5,8 +5,13 @@
 #include "realdirectorytree.hpp"
 #include "tracer.hpp"
 
+#include <exec/single_thread_context.hpp>
+#include <exec/static_thread_pool.hpp>
+#include <stdexec/execution.hpp>
+
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -18,8 +23,8 @@
 #include <ios>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -46,14 +51,18 @@ BuildDirectoryTree::BuildResult built(std::string bytes) {
                                          .inputs = {}};
 }
 
+// A build that has already finished with @a result, completing as soon as it
+// is started.
+BuildDirectoryTree::BuildSender finished(
+    BuildDirectoryTree::BuildResult result) {
+  return stdexec::just(std::move(result));
+}
+
 // A runner that produces fixed bytes for any command, so the tree's behaviour
-// can be tested without a shell. Written with the completion handler spelled as
-// its concrete type.
+// can be tested without a shell.
 BuildDirectoryTree::CommandRunner returning(std::string output) {
-  return [output = std::move(output)](
-             BuildDirectoryTree::Command /*command*/, std::stop_token /*stop*/,
-             BuildDirectoryTree::BuildComplete on_done) {
-    on_done(built(output));
+  return [output = std::move(output)](BuildDirectoryTree::Command /*command*/) {
+    return finished(built(output));
   };
 }
 
@@ -63,37 +72,163 @@ BuildDirectoryTree::CommandRunner returning(std::string output) {
 BuildDirectoryTree::CommandRunner counting_with_inputs(
     int& runs,
     std::vector<std::filesystem::path> inputs) {
-  return [&runs, inputs = std::move(inputs)](
-             BuildDirectoryTree::Command /*command*/, std::stop_token /*stop*/,
-             BuildDirectoryTree::BuildComplete on_done) {
+  return [&runs,
+          inputs = std::move(inputs)](BuildDirectoryTree::Command /*command*/) {
     ++runs;
-    on_done(BuildDirectoryTree::BuildOutput{
+    return finished(BuildDirectoryTree::BuildOutput{
         .bytes = "build " + std::to_string(runs), .inputs = inputs});
   };
 }
 
 // A thread-safe runner that holds each build in flight until the test
-// completes it.
+// completes it. A build stopped while held completes stopped instead, from a
+// thread of the runner's own, since a build must not complete from within its
+// stop callback.
 class DeferredRunner {
+  // A build being held, as the test sees it.
+  class Pending {
+   public:
+    virtual void finish(BuildDirectoryTree::BuildResult result) noexcept = 0;
+
+   protected:
+    Pending() = default;
+    ~Pending() = default;
+
+   public:
+    Pending(const Pending&) = delete;
+    Pending& operator=(const Pending&) = delete;
+    Pending(Pending&&) = delete;
+    Pending& operator=(Pending&&) = delete;
+  };
+
   struct State {
     std::mutex mutex;
     std::condition_variable started;
-    std::deque<BuildDirectoryTree::BuildComplete> pending;
+    std::deque<Pending*> pending;
     int runs = 0;
+    int stopped = 0;
+
+    // Where stopped builds complete, owned by the DeferredRunner.
+    exec::single_thread_context* stopper = nullptr;
+    stdexec::counting_scope* stopping = nullptr;
   };
+
+  template <class Receiver>
+  class Operation final : public Pending {
+    struct OnStop {
+      Operation* self;
+      void operator()() const noexcept { self->on_stop(); }
+    };
+    using Token = stdexec::stop_token_of_t<stdexec::env_of_t<Receiver>>;
+
+    Receiver m_receiver;
+    std::shared_ptr<State> m_state;
+
+    // Set when a stop arrives before start() has queued this build, which
+    // start() then completes stopped itself.
+    bool m_stopped_early = false;
+    std::optional<stdexec::stop_callback_for_t<Token, OnStop>> m_on_stop;
+
+   public:
+    using operation_state_concept = stdexec::operation_state_t;
+
+    Operation(Receiver receiver, std::shared_ptr<State> state)
+        : m_receiver(std::move(receiver)), m_state(std::move(state)) {}
+
+    Operation(const Operation&) = delete;
+    Operation& operator=(const Operation&) = delete;
+    Operation(Operation&&) = delete;
+    Operation& operator=(Operation&&) = delete;
+    ~Operation() = default;
+
+    void start() & noexcept {
+      // Registered before this build is queued, so a stop arriving now - even
+      // one that runs the callback inline, right here - finds nothing queued to
+      // complete and leaves that to the block below.
+      m_on_stop.emplace(stdexec::get_stop_token(stdexec::get_env(m_receiver)),
+                        OnStop{this});
+      bool stopped = false;
+      {
+        const std::lock_guard lock(m_state->mutex);
+        ++m_state->runs;
+        stopped = m_stopped_early;
+        if (stopped) {
+          ++m_state->stopped;
+        } else {
+          m_state->pending.push_back(this);
+        }
+      }
+      m_state->started.notify_all();
+      if (stopped) {
+        complete_stopped();
+      }
+    }
+
+    void finish(BuildDirectoryTree::BuildResult result) noexcept override {
+      stdexec::set_value(std::move(m_receiver), std::move(result));
+    }
+
+   private:
+    // Completes this build stopped if it is still queued; if complete() took
+    // it first, completing it is complete()'s job.
+    void on_stop() noexcept {
+      {
+        const std::lock_guard lock(m_state->mutex);
+        const auto it = std::ranges::find(m_state->pending, this);
+        if (it == m_state->pending.end()) {
+          m_stopped_early = true;
+          return;
+        }
+        m_state->pending.erase(it);
+        ++m_state->stopped;
+      }
+      complete_stopped();
+    }
+
+    void complete_stopped() noexcept {
+      stdexec::spawn(stdexec::schedule(m_state->stopper->get_scheduler()) |
+                         stdexec::then([this]() noexcept {
+                           stdexec::set_stopped(std::move(m_receiver));
+                         }),
+                     m_state->stopping->get_token());
+    }
+  };
+
+  struct Sender {
+    using sender_concept = stdexec::sender_t;
+    using completion_signatures =
+        stdexec::completion_signatures<stdexec::set_value_t(
+                                           BuildDirectoryTree::BuildResult),
+                                       stdexec::set_stopped_t()>;
+
+    std::shared_ptr<State> state;
+
+    template <class Receiver>
+    Operation<Receiver> connect(Receiver receiver) && {
+      return Operation<Receiver>(std::move(receiver), std::move(state));
+    }
+  };
+
+  exec::single_thread_context m_stopper;
+  stdexec::counting_scope m_stopping;
   std::shared_ptr<State> m_state = std::make_shared<State>();
 
  public:
+  DeferredRunner() {
+    m_state->stopper = &m_stopper;
+    m_state->stopping = &m_stopping;
+  }
+
+  ~DeferredRunner() { stdexec::sync_wait(m_stopping.join()); }
+
+  DeferredRunner(const DeferredRunner&) = delete;
+  DeferredRunner& operator=(const DeferredRunner&) = delete;
+  DeferredRunner(DeferredRunner&&) = delete;
+  DeferredRunner& operator=(DeferredRunner&&) = delete;
+
   [[nodiscard]] BuildDirectoryTree::CommandRunner runner() const {
-    return [state = m_state](BuildDirectoryTree::Command /*command*/,
-                             std::stop_token /*stop*/,
-                             BuildDirectoryTree::BuildComplete on_done) {
-      {
-        const std::lock_guard lock(state->mutex);
-        ++state->runs;
-        state->pending.push_back(std::move(on_done));
-      }
-      state->started.notify_all();
+    return [state = m_state](BuildDirectoryTree::Command /*command*/) {
+      return BuildDirectoryTree::BuildSender(Sender{state});
     };
   }
 
@@ -106,26 +241,36 @@ class DeferredRunner {
 
   // Completes the oldest pending build.
   void complete(BuildDirectoryTree::BuildResult result) const {
-    BuildDirectoryTree::BuildComplete on_done;
+    Pending* pending = nullptr;
     {
       const std::lock_guard lock(m_state->mutex);
       ASSERT_FALSE(m_state->pending.empty());
-      on_done = std::move(m_state->pending.front());
+      pending = m_state->pending.front();
       m_state->pending.pop_front();
     }
     // Unlocked: completing may start the next build.
-    on_done(std::move(result));
+    pending->finish(std::move(result));
   }
 
   [[nodiscard]] int runs() const {
     const std::lock_guard lock(m_state->mutex);
     return m_state->runs;
   }
+
+  // How many builds were stopped rather than completed.
+  [[nodiscard]] int stopped() const {
+    const std::lock_guard lock(m_state->mutex);
+    return m_state->stopped;
+  }
 };
 
 class BuildDirectoryTreeTest : public ::testing::Test {
  protected:
   InMemoryDirectoryTree source;
+
+  // Where the shell runner's commands run. Declared before (and so outliving)
+  // every tree a test makes.
+  exec::static_thread_pool pool{2};
 
   // A real, throwaway directory for the tests that drive the real shell runner.
   std::filesystem::path work =
@@ -177,12 +322,10 @@ class BuildDirectoryTreeTest : public ::testing::Test {
 
 TEST_F(BuildDirectoryTreeTest, NoManifestYieldsAnEmptyTree) {
   int runs = 0;
-  const BuildDirectoryTree tree(
-      source, [&runs](BuildDirectoryTree::Command, std::stop_token,
-                      BuildDirectoryTree::BuildComplete done) {
-        ++runs;
-        done(built(std::string{}));
-      });
+  const BuildDirectoryTree tree(source, [&runs](BuildDirectoryTree::Command) {
+    ++runs;
+    return finished(built(std::string{}));
+  });
 
   const auto root = tree.ls("");
   ASSERT_TRUE(root.has_value());
@@ -195,12 +338,10 @@ TEST_F(BuildDirectoryTreeTest, OnlyOpenBuilds) {
   write_manifest("@/output.txt = run anything %out\n");
 
   int runs = 0;
-  const BuildDirectoryTree tree(
-      source, [&runs](BuildDirectoryTree::Command, std::stop_token,
-                      BuildDirectoryTree::BuildComplete done) {
-        ++runs;
-        done(built("built"));
-      });
+  const BuildDirectoryTree tree(source, [&runs](BuildDirectoryTree::Command) {
+    ++runs;
+    return finished(built("built"));
+  });
 
   const auto root = tree.ls("");
   ASSERT_TRUE(root.has_value());
@@ -234,10 +375,9 @@ TEST_F(BuildDirectoryTreeTest, ReadHandsTheRawCommandToTheRunner) {
 
   std::vector<std::string> commands;
   const BuildDirectoryTree tree(
-      source, [&commands](BuildDirectoryTree::Command command, std::stop_token,
-                          BuildDirectoryTree::BuildComplete done) {
+      source, [&commands](BuildDirectoryTree::Command command) {
         commands.push_back(std::move(command.text));
-        done(built("result"));
+        return finished(built("result"));
       });
 
   EXPECT_EQ(read_output(tree, "output.txt"), "result");
@@ -252,10 +392,9 @@ TEST_F(BuildDirectoryTreeTest, ReadHandsACopysSourceToTheRunner) {
 
   std::vector<BuildDirectoryTree::Command> commands;
   const BuildDirectoryTree tree(
-      source, [&commands](BuildDirectoryTree::Command command, std::stop_token,
-                          BuildDirectoryTree::BuildComplete done) {
+      source, [&commands](BuildDirectoryTree::Command command) {
         commands.push_back(std::move(command));
-        done(built("result"));
+        return finished(built("result"));
       });
 
   EXPECT_EQ(read_output(tree, "output.txt"), "result");
@@ -271,10 +410,9 @@ TEST_F(BuildDirectoryTreeTest, ReadHandsTheOutputBeingBuiltToTheRunner) {
 
   std::vector<BuildDirectoryTree::Command> commands;
   const BuildDirectoryTree tree(
-      source, [&commands](BuildDirectoryTree::Command command, std::stop_token,
-                          BuildDirectoryTree::BuildComplete done) {
+      source, [&commands](BuildDirectoryTree::Command command) {
         commands.push_back(std::move(command));
-        done(built("result"));
+        return finished(built("result"));
       });
 
   EXPECT_EQ(read_output(tree, "out/report.pdf"), "result");
@@ -286,12 +424,10 @@ TEST_F(BuildDirectoryTreeTest, BuildsLazilyAndOncePerOutputOnSuccess) {
   write_manifest("@/output.txt = run build %out\n");
 
   int runs = 0;
-  const BuildDirectoryTree tree(
-      source, [&runs](BuildDirectoryTree::Command, std::stop_token,
-                      BuildDirectoryTree::BuildComplete done) {
-        ++runs;
-        done(built("hello world"));
-      });
+  const BuildDirectoryTree tree(source, [&runs](BuildDirectoryTree::Command) {
+    ++runs;
+    return finished(built("hello world"));
+  });
 
   EXPECT_EQ(runs, 0);
   EXPECT_EQ(read_output(tree, "output.txt"), "hello world");
@@ -305,16 +441,15 @@ TEST_F(BuildDirectoryTreeTest, RetriesAfterAFailedBuild) {
   write_manifest("@/output.txt = run build %out\n");
 
   int runs = 0;
-  const BuildDirectoryTree tree(
-      source, [&runs](BuildDirectoryTree::Command, std::stop_token,
-                      BuildDirectoryTree::BuildComplete done) {
-        ++runs;
-        if (runs == 1) {
-          done(std::unexpected(std::make_error_code(std::errc::io_error)));
-        } else {
-          done(built("recovered"));
-        }
-      });
+  const BuildDirectoryTree tree(source, [&runs](BuildDirectoryTree::Command) {
+    ++runs;
+    if (runs == 1) {
+      return finished(
+          std::unexpected(std::make_error_code(std::errc::io_error)));
+    } else {
+      return finished(built("recovered"));
+    }
+  });
 
   // The failed first build fails the open...
   const std::expected<FileInfo, std::error_code> failed =
@@ -358,17 +493,41 @@ TEST_F(BuildDirectoryTreeTest, CreatesParentDirectoriesForNestedOutputs) {
   EXPECT_EQ(read_output(tree, "out/deep/file.txt"), "nested");
 }
 
-// The completion handler can be taken as `auto`, so a runner never has to name
-// BuildComplete.
-TEST_F(BuildDirectoryTreeTest, RunnerCompletionHandlerCanBeGeneric) {
+// A runner may return any sender that fits, without naming BuildSender.
+TEST_F(BuildDirectoryTreeTest, RunnerCanReturnAnyFittingSender) {
   write_manifest("@/output.txt = run build %out\n");
 
-  const BuildDirectoryTree tree(
-      source, [](BuildDirectoryTree::Command, std::stop_token, auto done) {
-        done(built("generic"));
-      });
+  const BuildDirectoryTree tree(source, [](BuildDirectoryTree::Command) {
+    return stdexec::just(std::string("generic")) |
+           stdexec::then([](std::string bytes) { return built(bytes); });
+  });
 
   EXPECT_EQ(read_output(tree, "output.txt"), "generic");
+}
+
+// A runner that throws, or a build that completes with an exception, fails the
+// build rather than wedging the open waiting on it.
+TEST_F(BuildDirectoryTreeTest, ARunnerOrBuildThatThrowsFailsTheBuild) {
+  write_manifest(
+      "@/thrown.txt = run build %out\n@/raised.txt = run build %out\n");
+
+  const BuildDirectoryTree tree(
+      source,
+      [](BuildDirectoryTree::Command command)
+          -> BuildDirectoryTree::BuildSender {
+        if (command.output == "thrown.txt") {
+          throw std::system_error(
+              std::make_error_code(std::errc::permission_denied));
+        }
+        return stdexec::just() |
+               stdexec::then([]() -> BuildDirectoryTree::BuildResult {
+                 throw std::system_error(
+                     std::make_error_code(std::errc::bad_message));
+               });
+      });
+
+  EXPECT_EQ(tree.open("thrown.txt").error(), std::errc::permission_denied);
+  EXPECT_EQ(tree.open("raised.txt").error(), std::errc::bad_message);
 }
 
 // open() waits for the build to report back; status() does not.
@@ -418,24 +577,29 @@ TEST_F(BuildDirectoryTreeTest, ConcurrentOpensShareOneBuild) {
   EXPECT_EQ(builds.runs(), 1);
 }
 
-// Destroying the tree requests a stop on the token handed to in-flight runners.
-TEST_F(BuildDirectoryTreeTest, DestructionRequestsStop) {
+// Destroying the tree stops the builds under way and waits for them, rather
+// than leaving them to complete into a tree that is gone.
+TEST_F(BuildDirectoryTreeTest, DestructionStopsBuildsUnderWay) {
+  source.write_file("input.txt", "v1");
   write_manifest("@/output.txt = run build %out\n");
 
-  std::stop_token token;
+  const DeferredRunner builds;
   {
-    const BuildDirectoryTree tree(
-        source, [&token](BuildDirectoryTree::Command, std::stop_token stop,
-                         BuildDirectoryTree::BuildComplete done) {
-          token = std::move(stop);
-          done(built("built"));
-        });
-    EXPECT_EQ(read_output(tree, "output.txt"), "built");
-    EXPECT_TRUE(token.stop_possible());
-    EXPECT_FALSE(token.stop_requested());
+    const BuildDirectoryTree tree(source, builds.runner());
+    std::thread first(
+        [&] { EXPECT_EQ(read_output(tree, "output.txt"), "v1"); });
+    ASSERT_TRUE(builds.wait_for_runs(1));
+    builds.complete(BuildDirectoryTree::BuildOutput{.bytes = "v1",
+                                                    .inputs = {"input.txt"}});
+    first.join();
+
+    // An eager rebuild, left in flight.
+    source.write_file("input.txt", "v2");
+    ASSERT_TRUE(builds.wait_for_runs(2));
+    EXPECT_EQ(builds.stopped(), 0);
   }
 
-  EXPECT_TRUE(token.stop_requested());
+  EXPECT_EQ(builds.stopped(), 1);
 }
 
 // The bundled shell runner actually drives the system shell end to end.
@@ -445,7 +609,8 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerBuildsLazilyThroughTheShell) {
   write_input("input.txt", "hello world");
   write_manifest("@/output.txt = run cmake -E copy input.txt %out\n");
 
-  const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
+  const BuildDirectoryTree tree(
+      source, BuildDirectoryTree::shell_runner(work, pool.get_scheduler()));
 
   EXPECT_EQ(output_size(tree, "output.txt"), 1U);  // unbuilt until opened
   EXPECT_EQ(read_output(tree, "output.txt"), "hello world");
@@ -459,7 +624,8 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerBuildsLazilyThroughTheShell) {
 TEST_F(BuildDirectoryTreeTest, ShellRunnerGivesOutTheOutputsName) {
   write_manifest("@/docs/report.pdf = run cmake -E echo %out > %out\n");
 
-  const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
+  const BuildDirectoryTree tree(
+      source, BuildDirectoryTree::shell_runner(work, pool.get_scheduler()));
 
   const std::filesystem::path scratch =
       trimmed_path(read_output(tree, "docs/report.pdf"));
@@ -471,7 +637,8 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerGivesOutTheOutputsName) {
 TEST_F(BuildDirectoryTreeTest, ShellRunnerAddsNoExtensionToABareOutput) {
   write_manifest("@/report = run cmake -E echo %out > %out\n");
 
-  const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
+  const BuildDirectoryTree tree(
+      source, BuildDirectoryTree::shell_runner(work, pool.get_scheduler()));
 
   const std::filesystem::path scratch =
       trimmed_path(read_output(tree, "report"));
@@ -485,7 +652,8 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerCapturesStandardOutput) {
   write_input("input.txt", "hello world");
   write_manifest("@/output.txt = capture cmake -E cat input.txt\n");
 
-  const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
+  const BuildDirectoryTree tree(
+      source, BuildDirectoryTree::shell_runner(work, pool.get_scheduler()));
 
   EXPECT_EQ(output_size(tree, "output.txt"), 1U);  // unbuilt until opened
   EXPECT_EQ(read_output(tree, "output.txt"), "hello world");
@@ -497,7 +665,8 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerCopiesAFileWithoutAShell) {
   write_input("input.txt", "hello world");
   write_manifest("@/output.txt = copy input.txt\n");
 
-  const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
+  const BuildDirectoryTree tree(
+      source, BuildDirectoryTree::shell_runner(work, pool.get_scheduler()));
 
   EXPECT_EQ(output_size(tree, "output.txt"), 1U);  // unbuilt until opened
   EXPECT_EQ(read_output(tree, "output.txt"), "hello world");
@@ -510,7 +679,8 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerCopiesBytesVerbatim) {
   write_input("input.bin", binary);
   write_manifest("@/output.bin = copy input.bin\n");
 
-  const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
+  const BuildDirectoryTree tree(
+      source, BuildDirectoryTree::shell_runner(work, pool.get_scheduler()));
 
   EXPECT_EQ(read_output(tree, "output.bin"), binary);
 }
@@ -520,7 +690,8 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerCopiesBytesVerbatim) {
 TEST_F(BuildDirectoryTreeTest, ShellRunnerFailsACopyOfAMissingFile) {
   write_manifest("@/output.txt = copy missing.txt\n");
 
-  const BuildDirectoryTree tree(source, BuildDirectoryTree::shell_runner(work));
+  const BuildDirectoryTree tree(
+      source, BuildDirectoryTree::shell_runner(work, pool.get_scheduler()));
 
   const std::expected<FileInfo, std::error_code> opened =
       tree.open("output.txt");
@@ -627,17 +798,14 @@ TEST_F(BuildDirectoryTreeTest, ARebuildRefreshesTheTrackedInputs) {
 
   int runs = 0;
   // The first build reads a.txt; every rebuild thereafter reads b.txt instead.
-  const BuildDirectoryTree tree(
-      source, [&runs](BuildDirectoryTree::Command, std::stop_token,
-                      BuildDirectoryTree::BuildComplete on_done) {
-        ++runs;
-        std::vector<std::filesystem::path> inputs =
-            runs == 1 ? std::vector<std::filesystem::path>{"a.txt"}
-                      : std::vector<std::filesystem::path>{"b.txt"};
-        on_done(BuildDirectoryTree::BuildOutput{
-            .bytes = "build " + std::to_string(runs),
-            .inputs = std::move(inputs)});
-      });
+  const BuildDirectoryTree tree(source, [&runs](BuildDirectoryTree::Command) {
+    ++runs;
+    std::vector<std::filesystem::path> inputs =
+        runs == 1 ? std::vector<std::filesystem::path>{"a.txt"}
+                  : std::vector<std::filesystem::path>{"b.txt"};
+    return finished(BuildDirectoryTree::BuildOutput{
+        .bytes = "build " + std::to_string(runs), .inputs = std::move(inputs)});
+  });
 
   read_output(tree, "output.txt");  // runs=1, depends on a.txt
   EXPECT_EQ(runs, 1);
@@ -660,46 +828,45 @@ TEST_F(BuildDirectoryTreeTest, CoalescesInputChangesDuringAnInFlightRebuild) {
   write_manifest("@/output.txt = run build %out\n");
 
   // Build #1 completes at once; later ones are held in flight.
-  std::vector<BuildDirectoryTree::BuildComplete> deferred;
+  const DeferredRunner deferred;
   int runs = 0;
   const BuildDirectoryTree tree(
-      source, [&](BuildDirectoryTree::Command, std::stop_token,
-                  BuildDirectoryTree::BuildComplete on_done) {
+      source,
+      [&, held = deferred.runner()](BuildDirectoryTree::Command command) {
         ++runs;
         if (runs == 1) {
-          on_done(BuildDirectoryTree::BuildOutput{.bytes = "build 1",
-                                                  .inputs = {"input.txt"}});
-        } else {
-          deferred.push_back(std::move(on_done));
+          return finished(BuildDirectoryTree::BuildOutput{
+              .bytes = "build 1", .inputs = {"input.txt"}});
         }
+        return held(std::move(command));
       });
 
-  const auto complete_latest = [&deferred](std::string bytes) {
-    deferred.back()(BuildDirectoryTree::BuildOutput{.bytes = std::move(bytes),
-                                                    .inputs = {"input.txt"}});
+  const auto complete = [&deferred](std::string bytes) {
+    deferred.complete(BuildDirectoryTree::BuildOutput{.bytes = std::move(bytes),
+                                                      .inputs = {"input.txt"}});
   };
 
   EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
   EXPECT_EQ(runs, 1);
-  ASSERT_TRUE(deferred.empty());
+  EXPECT_EQ(deferred.runs(), 0);
 
   // An input change starts eager rebuild #2 (in flight, not yet reported).
   source.write_file("input.txt", "v2");
   EXPECT_EQ(runs, 2);
-  ASSERT_EQ(deferred.size(), 1U);
+  EXPECT_EQ(deferred.runs(), 1);
 
   // A second change while #2 is in flight starts no new build yet.
   source.write_file("input.txt", "v3");
   EXPECT_EQ(runs, 2);
-  ASSERT_EQ(deferred.size(), 1U);
+  EXPECT_EQ(deferred.runs(), 1);
 
   // Completing #2 sees the output went stale mid-build and kicks off #3.
-  complete_latest("build 2");
+  complete("build 2");
   EXPECT_EQ(runs, 3);
-  ASSERT_EQ(deferred.size(), 2U);
+  EXPECT_EQ(deferred.runs(), 2);
 
   // #3 settles it: no further change arrived, so no rebuild #4.
-  complete_latest("build 3");
+  complete("build 3");
   EXPECT_EQ(read_output(tree, "output.txt"), "build 3");
   EXPECT_EQ(runs, 3);
 }
@@ -748,12 +915,10 @@ TEST_F(BuildDirectoryTreeTest, OpeningADirtyOutputWaitsForItsRebuild) {
 
 // A runner whose output names the command it ran, recording each command.
 BuildDirectoryTree::CommandRunner echoing(std::vector<std::string>& commands) {
-  return
-      [&commands](BuildDirectoryTree::Command command, std::stop_token /*stop*/,
-                  BuildDirectoryTree::BuildComplete on_done) {
-        commands.push_back(command.text);
-        on_done(built("ran " + command.text));
-      };
+  return [&commands](BuildDirectoryTree::Command command) {
+    commands.push_back(command.text);
+    return finished(built("ran " + command.text));
+  };
 }
 
 TEST_F(BuildDirectoryTreeTest, AManifestWrittenLaterAddsItsOutputs) {
@@ -1147,8 +1312,8 @@ TEST_F(BuildDirectoryTreeTest, RebuildsThroughRealTracingWhenAnInputChanges) {
       << "@/output.txt = run cmake -E copy input.txt %out\n";
 
   const RealDirectoryTree real_source(work);
-  const BuildDirectoryTree tree(real_source,
-                                BuildDirectoryTree::shell_runner(work));
+  const BuildDirectoryTree tree(real_source, BuildDirectoryTree::shell_runner(
+                                                 work, pool.get_scheduler()));
 
   // First read builds it and traces input.txt as a dependency.
   EXPECT_EQ(read_output(tree, "output.txt"), "v1");
@@ -1178,8 +1343,8 @@ TEST_F(BuildDirectoryTreeTest, RebuildsACopyWhenItsSourceChanges) {
       << "@/output.txt = copy input.txt\n";
 
   const RealDirectoryTree real_source(work);
-  const BuildDirectoryTree tree(real_source,
-                                BuildDirectoryTree::shell_runner(work));
+  const BuildDirectoryTree tree(real_source, BuildDirectoryTree::shell_runner(
+                                                 work, pool.get_scheduler()));
 
   EXPECT_EQ(read_output(tree, "output.txt"), "v1");
 
@@ -1206,8 +1371,8 @@ TEST_F(BuildDirectoryTreeTest, ReloadsTheManifestWhenItChangesOnDisk) {
       << "@/old.txt = run cmake -E echo_append old > %out\n";
 
   const RealDirectoryTree real_source(work);
-  const BuildDirectoryTree tree(real_source,
-                                BuildDirectoryTree::shell_runner(work));
+  const BuildDirectoryTree tree(real_source, BuildDirectoryTree::shell_runner(
+                                                 work, pool.get_scheduler()));
   ASSERT_TRUE(tree.status("old.txt").has_value());
 
   // The watcher arms asynchronously, so a single early write can go unseen;
