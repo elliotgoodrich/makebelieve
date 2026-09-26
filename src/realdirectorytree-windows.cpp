@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 #include "realdirectorytree.hpp"
 
-#include "tracer.hpp"
+#include "iocontext.hpp"
+
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -17,7 +19,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -181,42 +182,61 @@ DirectoryTreeDiff parse_changes(const std::byte* buffer, DWORD bytes) {
 
 class RealDirectoryTree::Impl {
   std::filesystem::path m_root;
+  IoContext& m_io;
 
   // Everything below is mutable because the whole interface is const: these
   // are the internals that const-as-thread-safety permits us to touch, and
-  // each is guarded either by m_mutex or by the watcher thread's own lifetime.
+  // each is guarded either by m_mutex or by being the watch's alone.
 
   // Guards m_subscribers, m_next_id, and the lazy watcher startup.
   mutable std::mutex m_mutex;
   mutable std::list<std::function<void(const DirectoryTreeDiff&)>>
       m_subscribers;
 
-  // The root, opened with FILE_FLAG_OVERLAPPED, and the manual-reset event the
-  // destructor signals to unblock the pump. Both are created lazily by
-  // start_watcher() and torn down by the destructor.
+  // Held for a whole round of callbacks, and by unsubscribing, so that an
+  // unsubscribe returns only once none of its callbacks can still be running.
+  // Recursive so that a callback may still (un)subscribe from within itself.
+  // Taken before m_mutex.
+  mutable std::recursive_mutex m_notifying;
+
+  // The root, opened with FILE_FLAG_OVERLAPPED, and the one
+  // ReadDirectoryChangesW read kept outstanding on it: its buffer - on the
+  // heap, as overlapped use requires, and DWORD-aligned by coming from the
+  // allocator - and the manual-reset event it signals. Created lazily by
+  // start_watcher(), then touched only on the context's thread (which issues
+  // every read, so none is cancelled by the thread that issued it exiting)
+  // until the destructor.
   mutable HANDLE m_directory = INVALID_HANDLE_VALUE;
-  mutable HANDLE m_stop_event = nullptr;
-  mutable std::thread m_watcher;
+  mutable HANDLE m_change_event = nullptr;
+  mutable OVERLAPPED m_overlapped{};
+  mutable std::vector<std::byte> m_buffer;
+  mutable bool m_read_pending = false;
+
+  // The wait on m_change_event, stopped and joined on destruction.
+  mutable stdexec::counting_scope m_watching;
+  mutable bool m_watching_started = false;
 
  public:
-  explicit Impl(const std::filesystem::path& root)
-      : m_root(std::filesystem::weakly_canonical(root)) {}
+  Impl(const std::filesystem::path& root, IoContext& io)
+      : m_root(std::filesystem::weakly_canonical(root)), m_io(io) {}
 
   ~Impl() {
-    if (m_watcher.joinable()) {
-      // Order matters. Signalling first means the loop sees the stop request
-      // even if it is between iterations; cancelling then unblocks the wait
-      // itself. The loop takes responsibility for draining the outstanding
-      // read before it releases its buffer.
-      SetEvent(m_stop_event);
-      CancelIoEx(m_directory, nullptr);
-      m_watcher.join();
+    if (m_watching_started) {
+      m_watching.request_stop();
+      stdexec::sync_wait(m_watching.join());
+    }
+    if (m_read_pending) {
+      // The kernel may yet write into m_buffer, so cancel the read and block
+      // until the cancellation is acknowledged before releasing it.
+      DWORD bytes = 0;
+      CancelIoEx(m_directory, &m_overlapped);
+      GetOverlappedResult(m_directory, &m_overlapped, &bytes, TRUE);
     }
     if (m_directory != INVALID_HANDLE_VALUE) {
       CloseHandle(m_directory);
     }
-    if (m_stop_event != nullptr) {
-      CloseHandle(m_stop_event);
+    if (m_change_event != nullptr) {
+      CloseHandle(m_change_event);
     }
   }
 
@@ -242,12 +262,18 @@ class RealDirectoryTree::Impl {
   [[nodiscard]] std::optional<std::filesystem::path> resolve(
       const std::filesystem::path& path) const;
 
-  // Opens the root for change notifications and spawns the watcher. Called
-  // once, from the first subscribe_to_changes(), with m_mutex held.
+  // Opens the root for change notifications, issues the first read, and starts
+  // waiting on it. Called once, from the first subscribe_to_changes(), with
+  // m_mutex held.
   void start_watcher() const;
 
-  // Pumps ReadDirectoryChangesW until the stop event is signalled.
-  void watch_loop() const;
+  // Issues the next read into m_buffer, returning whether it is outstanding.
+  // On the context's thread.
+  bool issue_read() const noexcept;
+
+  // Turns the read that just completed into a diff for the subscribers and
+  // issues the next. On the context's thread.
+  void on_change() const;
 
   // Invokes every registered callback with `diff`. Takes a copy of the
   // callback list so that a callback which unsubscribes cannot deadlock
@@ -425,21 +451,23 @@ Subscription RealDirectoryTree::Impl::subscribe_to_changes(
     const std::function<void(const DirectoryTreeDiff&)>& callback) const {
   const std::lock_guard<std::mutex> lock(m_mutex);
 
-  if (!m_watcher.joinable()) {
+  if (!m_watching_started) {
     start_watcher();
   }
 
   const auto it = m_subscribers.emplace(m_subscribers.end(), callback);
   return Subscription([this, it] {
+    const std::lock_guard notifying(m_notifying);
     const std::lock_guard<std::mutex> unsubscribe_lock(m_mutex);
     m_subscribers.erase(it);
   });
 }
 
 void RealDirectoryTree::Impl::start_watcher() const {
-  // Manual reset: once we are stopping, every subsequent wait must see it.
-  m_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  if (m_stop_event == nullptr) {
+  // Manual reset, so a change that lands before the wait on it starts is not
+  // missed; issue_read() resets it for each read.
+  m_change_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (m_change_event == nullptr) {
     throw_last_error("CreateEventW");
   }
 
@@ -451,65 +479,69 @@ void RealDirectoryTree::Impl::start_watcher() const {
                   nullptr, OPEN_EXISTING,
                   FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
   if (m_directory == INVALID_HANDLE_VALUE) {
-    CloseHandle(m_stop_event);
-    m_stop_event = nullptr;
     throw_last_error("CreateFileW (watch root)");
   }
 
-  m_watcher = std::thread([this]() { watch_loop(); });
+  m_buffer.resize(k_watch_buffer_bytes);
+
+  // Issued, on the context's thread, before this returns, so a change made
+  // once the subscription is in place is caught.
+  const std::optional issued = stdexec::sync_wait(
+      stdexec::schedule(m_io.get_scheduler()) |
+      stdexec::then([this]() noexcept { return issue_read(); }));
+  if (!issued.has_value() || !std::get<0>(*issued)) {
+    throw_last_error("ReadDirectoryChangesW");
+  }
+
+  m_io.spawn_watch(m_change_event, m_watching, [this]() noexcept {
+    // Best-effort: a change dropped for want of memory is lost, as one the
+    // buffer overflows on is.
+    try {
+      on_change();
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+    }
+  });
+  m_watching_started = true;
 }
 
-void RealDirectoryTree::Impl::watch_loop() const {
-  MB_TRACE_THREAD_NAME("source watcher");
-  // Heap-allocated, as ReadDirectoryChangesW requires for overlapped use, and
-  // DWORD-aligned by virtue of coming from the allocator.
-  std::vector<std::byte> buffer(k_watch_buffer_bytes);
+bool RealDirectoryTree::Impl::issue_read() const noexcept {
+  ResetEvent(m_change_event);
+  m_overlapped = OVERLAPPED{};
+  m_overlapped.hEvent = m_change_event;
+  m_read_pending = ReadDirectoryChangesW(m_directory, m_buffer.data(),
+                                         static_cast<DWORD>(m_buffer.size()),
+                                         TRUE, k_watch_filter, nullptr,
+                                         &m_overlapped, nullptr) != 0;
+  return m_read_pending;
+}
 
-  const UniqueHandle change_event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-  if (change_event.get() == nullptr) {
+void RealDirectoryTree::Impl::on_change() const {
+  DWORD bytes = 0;
+  m_read_pending = false;
+  if (!GetOverlappedResult(m_directory, &m_overlapped, &bytes, FALSE)) {
+    // The watch has failed for good. Leave the event unsignalled so the wait
+    // on it stays quiet until the destructor stops it.
+    ResetEvent(m_change_event);
     return;
   }
 
-  while (true) {
-    OVERLAPPED overlapped{};
-    overlapped.hEvent = change_event.get();
-    ResetEvent(change_event.get());
+  // bytes == 0 means the buffer overflowed and the kernel discarded the
+  // records. The changes still happened but their identities are gone, so
+  // there is nothing to hand over but the blanket signal.
+  const DirectoryTreeDiff diff =
+      bytes == 0 ? DirectoryTreeDiff{.everything_dirty = true}
+                 : parse_changes(m_buffer.data(), bytes);
 
-    if (!ReadDirectoryChangesW(m_directory, buffer.data(),
-                               static_cast<DWORD>(buffer.size()), TRUE,
-                               k_watch_filter, nullptr, &overlapped, nullptr)) {
-      return;
-    }
-
-    const HANDLE waits[] = {change_event.get(), m_stop_event};
-    const DWORD signalled = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-
-    DWORD bytes = 0;
-    if (signalled != WAIT_OBJECT_0) {
-      // Stopping, or the wait itself failed. Either way the read is still
-      // outstanding and the kernel may yet write into `buffer`, so cancel it
-      // and block until the cancellation is acknowledged before unwinding.
-      CancelIoEx(m_directory, &overlapped);
-      GetOverlappedResult(m_directory, &overlapped, &bytes, TRUE);
-      return;
-    }
-
-    if (!GetOverlappedResult(m_directory, &overlapped, &bytes, FALSE)) {
-      return;
-    }
-
-    // bytes == 0 means the buffer overflowed and the kernel discarded the
-    // records. The changes still happened but their identities are gone, so
-    // there is nothing to hand over but the blanket signal.
-    const DirectoryTreeDiff diff =
-        bytes == 0 ? DirectoryTreeDiff{.everything_dirty = true}
-                   : parse_changes(buffer.data(), bytes);
-    notify_subscribers(diff);
-  }
+  // The next read goes out before anyone hears of this one, so nothing that
+  // changes while they react is missed. A read that will not issue leaves the
+  // event reset, quietening the wait as above.
+  issue_read();
+  notify_subscribers(diff);
 }
 
 void RealDirectoryTree::Impl::notify_subscribers(
     const DirectoryTreeDiff& diff) const {
+  const std::lock_guard notifying(m_notifying);
   std::vector<std::function<void(const DirectoryTreeDiff&)>> callbacks = [&] {
     const std::lock_guard<std::mutex> lock(m_mutex);
     return std::vector<std::function<void(const DirectoryTreeDiff&)>>(
@@ -521,8 +553,9 @@ void RealDirectoryTree::Impl::notify_subscribers(
   }
 }
 
-RealDirectoryTree::RealDirectoryTree(const std::filesystem::path& root)
-    : m_impl(std::make_unique<Impl>(root)) {}
+RealDirectoryTree::RealDirectoryTree(const std::filesystem::path& root,
+                                     IoContext& io)
+    : m_impl(std::make_unique<Impl>(root, io)) {}
 
 RealDirectoryTree::~RealDirectoryTree() = default;
 

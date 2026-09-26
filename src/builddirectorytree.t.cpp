@@ -2,6 +2,7 @@
 #include "builddirectorytree.hpp"
 
 #include "inmemorydirectorytree.hpp"
+#include "iocontext.hpp"
 #include "realdirectorytree.hpp"
 #include "tracer.hpp"
 
@@ -268,9 +269,10 @@ class BuildDirectoryTreeTest : public ::testing::Test {
  protected:
   InMemoryDirectoryTree source;
 
-  // Where the shell runner's commands run. Declared before (and so outliving)
-  // every tree a test makes.
+  // Where the shell runner's commands run, and what a real source is watched
+  // through. Declared before (and so outliving) every tree a test makes.
   exec::static_thread_pool pool{2};
+  IoContext io;
 
   // A real, throwaway directory for the tests that drive the real shell runner.
   std::filesystem::path work =
@@ -1311,7 +1313,7 @@ TEST_F(BuildDirectoryTreeTest, RebuildsThroughRealTracingWhenAnInputChanges) {
   std::ofstream(work / "build.makebelieve", std::ios::binary)
       << "@/output.txt = run cmake -E copy input.txt %out\n";
 
-  const RealDirectoryTree real_source(work);
+  const RealDirectoryTree real_source(work, io);
   const BuildDirectoryTree tree(real_source, BuildDirectoryTree::shell_runner(
                                                  work, pool.get_scheduler()));
 
@@ -1342,7 +1344,7 @@ TEST_F(BuildDirectoryTreeTest, RebuildsACopyWhenItsSourceChanges) {
   std::ofstream(work / "build.makebelieve", std::ios::binary)
       << "@/output.txt = copy input.txt\n";
 
-  const RealDirectoryTree real_source(work);
+  const RealDirectoryTree real_source(work, io);
   const BuildDirectoryTree tree(real_source, BuildDirectoryTree::shell_runner(
                                                  work, pool.get_scheduler()));
 
@@ -1370,7 +1372,7 @@ TEST_F(BuildDirectoryTreeTest, ReloadsTheManifestWhenItChangesOnDisk) {
   std::ofstream(work / "build.makebelieve", std::ios::binary)
       << "@/old.txt = run cmake -E echo_append old > %out\n";
 
-  const RealDirectoryTree real_source(work);
+  const RealDirectoryTree real_source(work, io);
   const BuildDirectoryTree tree(real_source, BuildDirectoryTree::shell_runner(
                                                  work, pool.get_scheduler()));
   ASSERT_TRUE(tree.status("old.txt").has_value());

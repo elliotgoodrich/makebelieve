@@ -5,12 +5,13 @@
 #include "processutil.hpp"
 #include "tracer.hpp"
 
+#include <stdexec/execution.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -173,6 +174,9 @@ class VirtualFileSystem::Impl {
 
   const DirectoryTree& m_tree;
   std::filesystem::path m_mountpoint;
+
+  // Where notifier passes run.
+  exec::static_thread_pool::scheduler m_scheduler;
   fuse_args m_args{};
   struct fuse* m_fuse = nullptr;
   std::thread m_loop;
@@ -203,19 +207,21 @@ class VirtualFileSystem::Impl {
   std::filesystem::path m_pretence_path;
   Pretence m_pretence = Pretence::none;
 
-  // The notifier thread and the queue on_tree_changed hands it. m_pending
-  // coalesces: a path repeated across diffs is announced once per pass, and
-  // m_everything_dirty supersedes the lot.
+  // The queue on_tree_changed hands the notifier, and whether a pass of it is
+  // under way. m_pending coalesces: a path repeated across diffs is announced
+  // once per pass, and m_everything_dirty supersedes the lot.
   std::mutex m_notify_mutex;
-  std::condition_variable m_wake;
   Changes m_pending;
   bool m_everything_dirty = false;
   bool m_stopping = false;
-  std::thread m_notifier;
+  bool m_notifying = false;
 
-  // gettid() of the notifier while it runs, and 0 otherwise, which is never
-  // a valid tid.
+  // gettid() of the thread running a notifier pass, and 0 between passes,
+  // which is never a valid tid.
   std::atomic<pid_t> m_notifier_tid{0};
+
+  // The notifier pass under way, if any, joined on destruction.
+  stdexec::counting_scope m_notifications;
 
   // Declared last so it is destroyed first, stopping notifications before the
   // state they touch goes away.
@@ -226,8 +232,10 @@ class VirtualFileSystem::Impl {
   // starting anything, so that the one below can delegate to it.
   struct Unstarted {};
 
-  Impl(const DirectoryTree& tree, const std::filesystem::path& mountpoint)
-      : Impl(tree, mountpoint, Unstarted{}) {
+  Impl(const DirectoryTree& tree,
+       const std::filesystem::path& mountpoint,
+       exec::static_thread_pool::scheduler scheduler)
+      : Impl(tree, mountpoint, scheduler, Unstarted{}) {
     m_args = FUSE_ARGS_INIT(0, nullptr);
     if (fuse_opt_add_arg(&m_args, "makebelieve") != 0) {
       const int error = errno != 0 ? errno : EIO;
@@ -267,10 +275,8 @@ class VirtualFileSystem::Impl {
       fuse_loop_mt(m_fuse, &config);
     });
 
-    // The notifier has to be running before a change can be queued for it, and
-    // the subscription is taken last so no change can arrive before there is a
+    // The subscription is taken last so no change can arrive before there is a
     // mount to poke.
-    m_notifier = std::thread([this]() { notify_loop(); });
     m_subscription.emplace(m_tree.subscribe_to_changes(
         [this](const DirectoryTreeDiff& diff) { on_tree_changed(diff); }));
   }
@@ -278,14 +284,12 @@ class VirtualFileSystem::Impl {
   ~Impl() {
     m_subscription.reset();
 
+    // A pass under way sees m_stopping and ends after the change it is on.
     {
       const std::lock_guard<std::mutex> lock(m_notify_mutex);
       m_stopping = true;
     }
-    m_wake.notify_one();
-    if (m_notifier.joinable()) {
-      m_notifier.join();
-    }
+    stdexec::sync_wait(m_notifications.join());
 
     if (m_fuse != nullptr) {
       fuse_exit(m_fuse);
@@ -315,11 +319,14 @@ class VirtualFileSystem::Impl {
   // we can cleanup.
   Impl(const DirectoryTree& tree,
        const std::filesystem::path& mountpoint,
+       exec::static_thread_pool::scheduler scheduler,
        Unstarted)
       // Absolute, because the notifier reopens paths beneath it for as long
       // as the mount lives, by which time the process's working directory may
       // have moved on from whatever made a relative path meaningful.
-      : m_tree(tree), m_mountpoint(std::filesystem::absolute(mountpoint)) {
+      : m_tree(tree),
+        m_mountpoint(std::filesystem::absolute(mountpoint)),
+        m_scheduler(scheduler) {
     create_mountpoint(m_mountpoint);
   }
 
@@ -350,10 +357,10 @@ class VirtualFileSystem::Impl {
   template <auto MemFn>
   static constexpr auto trampoline = Bridge<MemFn>::call;
 
-  // Whether the request being serviced originates from our own notifier
-  // thread, which is the only writer this filesystem accepts.
+  // Whether the request being serviced originates from a notifier pass, the
+  // only writer this filesystem accepts.
   [[nodiscard]] bool is_self_request() const {
-    // `m_notifier_tid` is 0 when the mount has outlived the notifier.
+    // `m_notifier_tid` is 0 between passes.
     const pid_t writer = m_notifier_tid.load(std::memory_order_relaxed);
     return writer != 0 && fuse_get_context()->pid == writer;
   }
@@ -610,7 +617,8 @@ class VirtualFileSystem::Impl {
     m_known.insert_or_assign(path, is_directory);
   }
 
-  // Queues a tree change for the notifier thread.
+  // Queues a tree change for the notifier, starting a pass if none is under
+  // way.
   //
   // Runs on whichever thread the tree notifies from, so it does no I/O. A
   // poke writes into our own mount and blocks until the FUSE loop has
@@ -639,53 +647,74 @@ class VirtualFileSystem::Impl {
       }
       merge_changes(m_pending, changes);
     }
-    m_wake.notify_one();
+    start_notifying();
   }
 
-  // Drains queued changes, poking each affected path in turn.
-  void notify_loop() {
-    // Claimed for the whole life of the thread rather than per write: this tid
-    // belongs to no other thread while this one lives, so a request carrying
-    // it is ours by construction (see is_self_request).
+  // Starts a pass announcing the queued changes, unless one is under way or we
+  // are stopping. A pass that cannot be started is retried by the next change.
+  // @pre m_notify_mutex is held.
+  void start_notifying() noexcept {
+    if (m_notifying || m_stopping) {
+      return;
+    }
+    m_notifying = true;
+    try {
+      stdexec::spawn(stdexec::schedule(m_scheduler) |
+                         stdexec::then([this]() noexcept { notify_pending(); }),
+                     m_notifications.get_token());
+    } catch (...) {
+      m_notifying = false;
+    }
+  }
+
+  // One pass of the notifier: pokes each affected path in turn until nothing
+  // is queued, then stands down.
+  void notify_pending() noexcept {
+    MB_TRACE_SCOPE("vfs", "notify");
+    // Claimed for the whole pass rather than per write: only one pass runs at
+    // a time, and this thread runs nothing else meanwhile, so a request
+    // carrying this tid is ours by construction (see is_self_request).
     m_notifier_tid.store(::gettid(), std::memory_order_relaxed);
-    MB_TRACE_THREAD_NAME("vfs notifier");
 
     std::unique_lock<std::mutex> lock(m_notify_mutex);
-    while (true) {
-      m_wake.wait(lock, [this] {
-        return m_stopping || m_everything_dirty || !m_pending.empty();
-      });
-      if (m_stopping) {
-        break;
-      }
-
-      Changes batch;
-      if (m_everything_dirty) {
-        // The tree lost track of what changed, so everything we have handed
-        // out could be stale. Announce the paths we know the kernel has seen
-        // rather than walking the mount: an enumeration of our own mountpoint
-        // would re-enter the FUSE callbacks from here and wait on a loop that
-        // is waiting on us.
-        m_everything_dirty = false;
-        m_pending.clear();
-        const std::lock_guard<std::mutex> known_lock(m_known_mutex);
-        for (const auto& [path, is_directory] : m_known) {
-          batch.emplace(path, ChangeKind::modified);
+    // Best-effort: a change dropped for want of memory goes unannounced, as
+    // one a watcher's own queue overflows on does.
+    try {
+      while (!m_stopping && (m_everything_dirty || !m_pending.empty())) {
+        Changes batch;
+        if (m_everything_dirty) {
+          // The tree lost track of what changed, so everything we have handed
+          // out could be stale. Announce the paths we know the kernel has seen
+          // rather than walking the mount: an enumeration of our own
+          // mountpoint would re-enter the FUSE callbacks from here and wait on
+          // a loop that is waiting on us.
+          m_everything_dirty = false;
+          m_pending.clear();
+          const std::lock_guard<std::mutex> known_lock(m_known_mutex);
+          for (const auto& [path, is_directory] : m_known) {
+            batch.emplace(path, ChangeKind::modified);
+          }
+        } else {
+          batch = std::exchange(m_pending, {});
         }
-      } else {
-        batch = std::exchange(m_pending, {});
-      }
 
-      // Unlocked for the announcements themselves, so a change arriving
-      // mid-batch simply queues up for the next pass.
-      lock.unlock();
-      for (const auto& [path, kind] : batch) {
-        announce(path, kind);
+        // Unlocked for the announcements themselves, so a change arriving
+        // mid-batch simply queues up for the next round.
+        lock.unlock();
+        for (const auto& [path, kind] : batch) {
+          announce(path, kind);
+        }
+        lock.lock();
       }
-      lock.lock();
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+      if (!lock.owns_lock()) {
+        lock.lock();
+      }
     }
 
+    // Released before the next pass can start, which only this lets happen.
     m_notifier_tid.store(0, std::memory_order_relaxed);
+    m_notifying = false;
   }
 
   // Makes the kernel raise the inotify event that describes one change. FUSE
@@ -778,9 +807,11 @@ class VirtualFileSystem::Impl {
   }
 };
 
-VirtualFileSystem::VirtualFileSystem(const DirectoryTree& tree,
-                                     const std::filesystem::path& mountpoint)
-    : m_impl(std::make_unique<Impl>(tree, mountpoint)) {}
+VirtualFileSystem::VirtualFileSystem(
+    const DirectoryTree& tree,
+    const std::filesystem::path& mountpoint,
+    exec::static_thread_pool::scheduler scheduler)
+    : m_impl(std::make_unique<Impl>(tree, mountpoint, scheduler)) {}
 
 VirtualFileSystem::~VirtualFileSystem() = default;
 

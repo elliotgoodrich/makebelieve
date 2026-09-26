@@ -6,6 +6,8 @@
 
 namespace makebelieve {
 
+class IoContext;
+
 /// @class ConsoleInterruptHandler
 /// Installs a console interrupt handler that provides a
 /// `std::stop_token` when the user interrupts the process
@@ -15,11 +17,14 @@ class ConsoleInterruptHandler {
 
  public:
   /// Creates a `ConsoleInterruptHandler` that will install a console interrupt
-  /// handler or throw `std::system_error` one cannot be installed.
-  /// @pre No other instance of this class is alive.
-  ConsoleInterruptHandler();
+  /// handler, using @a io if necessary, or throw `std::system_error` if one
+  /// cannot be installed.
+  /// @pre No other instance of this class is alive, and @a io outlives this
+  /// object.
+  explicit ConsoleInterruptHandler(IoContext& io);
 
   /// Uninstalls the console interrupt handler.
+  /// @pre Not called from @a io's thread.
   ~ConsoleInterruptHandler();
 
   ConsoleInterruptHandler(const ConsoleInterruptHandler&) = delete;

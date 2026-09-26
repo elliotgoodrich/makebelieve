@@ -14,6 +14,8 @@
 
 namespace makebelieve {
 
+class IoContext;
+
 /// @class RealDirectoryTree
 /// A concrete implementation of @link DirectoryTree that represents a real
 /// directory on disk.
@@ -22,11 +24,15 @@ class RealDirectoryTree : public DirectoryTree {
   std::unique_ptr<Impl> m_impl;
 
  public:
-  /// Creates a `RealDirectoryTree` at @a root.  If @a root does not exist
-  /// then construction still succeeds and every query fails with
+  /// Creates a `RealDirectoryTree` at @a root, watching it for changes
+  /// through @a io once something subscribes; subscribers are called on
+  /// @a io's thread. If @a root does not exist then construction still
+  /// succeeds and every query fails with
   /// `std::errc::no_such_file_or_directory`.
-  explicit RealDirectoryTree(const std::filesystem::path& root);
+  /// @pre @a io outlives this object.
+  RealDirectoryTree(const std::filesystem::path& root, IoContext& io);
 
+  /// @pre Not called from the thread of the `IoContext` it watches through.
   ~RealDirectoryTree() override;
 
   RealDirectoryTree(const RealDirectoryTree&) = delete;
@@ -53,9 +59,11 @@ class RealDirectoryTree : public DirectoryTree {
       std::size_t size) const override;
 
   /// Subscribes to changes in this object by calling @a callback and returns an
-  /// RAII guard that will unsubscribe on destruction.
+  /// RAII guard that will unsubscribe on destruction. Changes made once this
+  /// returns are reported.
   /// @note Paths in the diff are relative to the tree root.
-  /// @pre The returned object does not outlive this `DirectoryTree`.
+  /// @pre The returned object does not outlive this `DirectoryTree`, and this
+  /// is not called from the thread of the `IoContext` it watches through.
   [[nodiscard]] Subscription subscribe_to_changes(
       const std::function<void(const DirectoryTreeDiff&)>& callback)
       const override;

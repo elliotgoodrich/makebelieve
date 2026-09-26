@@ -110,7 +110,9 @@ class ConsoleInterruptHandler::Impl {
   std::stop_token token() const { return m_source.get_token(); }
 };
 
-ConsoleInterruptHandler::ConsoleInterruptHandler()
+// Windows runs the handler on a thread of its own, so there is nothing to wait
+// on through @a io.
+ConsoleInterruptHandler::ConsoleInterruptHandler(IoContext& /*io*/)
     : m_impl(std::make_unique<Impl>()) {}
 
 ConsoleInterruptHandler::~ConsoleInterruptHandler() = default;

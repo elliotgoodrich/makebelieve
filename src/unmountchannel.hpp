@@ -8,6 +8,8 @@
 
 namespace makebelieve {
 
+class IoContext;
+
 /// @class UnmountChannel
 /// Owns a per-mount control endpoint and provides a `std::stop_token` that is
 /// signalled when another process asks the mount to shut down. The endpoint is
@@ -43,15 +45,18 @@ class UnmountChannel {
   [[nodiscard]] static Result request_unmount(
       const std::filesystem::path& mountpoint);
 
-  /// Creates the control endpoint for @a mountpoint and starts a listener that
-  /// signals `token()` when the endpoint is poked. If no per-user runtime
-  /// directory is available (Linux), it warns and runs without an endpoint:
-  /// `token()` never fires and `request_unmount` cannot reach this mount.
+  /// Creates the control endpoint for @a mountpoint and listens on it through
+  /// @a io, signalling `token()` when the endpoint is poked. If no per-user
+  /// runtime directory is available (Linux), it warns and runs without an
+  /// endpoint: `token()` never fires and `request_unmount` cannot reach this
+  /// mount.
   /// @throws std::system_error if the endpoint cannot be created.
   /// @throws std::runtime_error if another live instance already owns it.
-  explicit UnmountChannel(const std::filesystem::path& mountpoint);
+  /// @pre @a io outlives this object.
+  UnmountChannel(const std::filesystem::path& mountpoint, IoContext& io);
 
-  /// Stops the listener and removes the endpoint.
+  /// Stops listening and removes the endpoint.
+  /// @pre Not called from the thread of the `IoContext` it listens through.
   ~UnmountChannel();
 
   UnmountChannel(const UnmountChannel&) = delete;

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 #include "unmountchannel.hpp"
 
-#include <array>
+#include "iocontext.hpp"
+
+#include <stdexec/execution.hpp>
+
 #include <cerrno>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,10 +16,7 @@
 #include <stop_token>
 #include <string>
 #include <system_error>
-#include <thread>
 
-#include <poll.h>
-#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -150,11 +149,13 @@ class UnmountChannel::Impl {
   std::stop_source m_source;
   std::filesystem::path m_path;  // The socket file, unlinked on teardown.
   UniqueFd m_listen;
-  UniqueFd m_quit;  // Signalled to stop the listener.
-  std::thread m_listener;
+
+  // The wait on m_listen, stopped and joined on destruction.
+  stdexec::counting_scope m_listening;
+  bool m_serving = false;
 
  public:
-  explicit Impl(const std::filesystem::path& mountpoint) {
+  Impl(const std::filesystem::path& mountpoint, IoContext& io) {
     const std::optional<std::filesystem::path> path =
         socket_path(endpoint_id(canonical_key(mountpoint)));
     if (!path) {
@@ -175,7 +176,10 @@ class UnmountChannel::Impl {
                                m_path.string());
     }
 
-    m_listen.reset(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    // Non-blocking, so an accept for a client that has already gone again
+    // returns instead of stalling the context's thread.
+    m_listen.reset(
+        ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
     if (!m_listen) {
       throw std::system_error(last_error_code(), "socket");
     }
@@ -186,22 +190,17 @@ class UnmountChannel::Impl {
       throw std::system_error(last_error_code(), "listen");
     }
 
-    m_quit.reset(::eventfd(0, EFD_CLOEXEC));
-    if (!m_quit) {
-      throw std::system_error(last_error_code(), "eventfd");
-    }
-
-    m_listener = std::thread([this] { listen_loop(); });
+    io.spawn_watch(m_listen.get(), m_listening,
+                   [this]() noexcept { accept_pokes(); });
+    m_serving = true;
   }
 
   ~Impl() {
-    if (!m_listener.joinable()) {
+    if (!m_serving) {
       return;  // Disabled: no endpoint was created.
     }
-    const std::uint64_t one = 1;
-    const ssize_t written = ::write(m_quit.get(), &one, sizeof(one));
-    static_cast<void>(written);
-    m_listener.join();
+    m_listening.request_stop();
+    stdexec::sync_wait(m_listening.join());
     // Remove the endpoint; the directory is left in place.
     ::unlink(m_path.c_str());
   }
@@ -244,30 +243,16 @@ class UnmountChannel::Impl {
     }
   }
 
-  // Accepts a poke (a client connect) into a stop request, until the quit
-  // eventfd is signalled.
-  void listen_loop() {
-    std::array<pollfd, 2> fds{
-        pollfd{.fd = m_listen.get(), .events = POLLIN, .revents = 0},
-        pollfd{.fd = m_quit.get(), .events = POLLIN, .revents = 0},
-    };
+  // Turns every poke (a client connect) waiting to be accepted into a stop
+  // request. Idempotent, so the watch keeps going to the end.
+  void accept_pokes() noexcept {
     while (true) {
-      if (::poll(fds.data(), fds.size(), -1) < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        return;
+      const int client = ::accept(m_listen.get(), nullptr, nullptr);
+      if (client < 0) {
+        return;  // Drained (EAGAIN), or nothing more to be done.
       }
-      if ((fds[1].revents & POLLIN) != 0) {
-        return;  // The quit signal.
-      }
-      if ((fds[0].revents & POLLIN) != 0) {
-        const int client = ::accept(m_listen.get(), nullptr, nullptr);
-        if (client >= 0) {
-          ::close(client);
-          m_source.request_stop();  // Idempotent; keep listening for quit.
-        }
-      }
+      ::close(client);
+      m_source.request_stop();
     }
   }
 };
@@ -300,8 +285,9 @@ UnmountChannel::Result UnmountChannel::request_unmount(
   return wait_until_gone(mountpoint) ? Result::ok : Result::teardown_timeout;
 }
 
-UnmountChannel::UnmountChannel(const std::filesystem::path& mountpoint)
-    : m_impl(std::make_unique<Impl>(mountpoint)) {}
+UnmountChannel::UnmountChannel(const std::filesystem::path& mountpoint,
+                               IoContext& io)
+    : m_impl(std::make_unique<Impl>(mountpoint, io)) {}
 
 UnmountChannel::~UnmountChannel() = default;
 

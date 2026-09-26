@@ -771,6 +771,12 @@ class GatedOpenTree : public makebelieve::DirectoryTree {
   }
 };
 
+// Where every mount here sends its change notifications from.
+exec::static_thread_pool::scheduler notifier() {
+  static exec::static_thread_pool pool(2);
+  return pool.get_scheduler();
+}
+
 // Named for the type under test so TEST_F reads as VirtualFileSystem.<case>.
 // That takes the name, so the class under test is spelled makebelieve::
 // throughout this file.
@@ -790,7 +796,7 @@ class VirtualFileSystem : public ::testing::Test {
 
   void mount() { mount_at(m_mountpoint); }
   void mount_at(const std::filesystem::path& mountpoint) {
-    m_vfs.emplace(m_tree, mountpoint);
+    m_vfs.emplace(m_tree, mountpoint, notifier());
   }
   void unmount() { m_vfs.reset(); }
 
@@ -1027,7 +1033,7 @@ TEST_F(VirtualFileSystem, OpeningAFileSettlesItAndAStatDoesNot) {
   tree().write_file("a.txt", "x");
   const std::string settled = "settled contents";
   const SettleOnOpenTree settling(tree(), settled);
-  const makebelieve::VirtualFileSystem vfs(settling, mountpoint());
+  const makebelieve::VirtualFileSystem vfs(settling, mountpoint(), notifier());
 
   EXPECT_EQ(std::filesystem::file_size(mountpoint() / "a.txt"), 1U);
   EXPECT_TRUE(std::filesystem::is_regular_file(mountpoint() / "a.txt"));
@@ -1047,7 +1053,7 @@ TEST_F(VirtualFileSystem, AnOpenThatWaitsDoesNotHoldUpOtherRequests) {
   tree().write_file("slow.txt", "slow");
   tree().write_file("fast.txt", "fast");
   GatedOpenTree gated(tree(), "slow.txt");
-  const makebelieve::VirtualFileSystem vfs(gated, mountpoint());
+  const makebelieve::VirtualFileSystem vfs(gated, mountpoint(), notifier());
 
   // After the mount, so these finish before it is torn down.
   std::future<std::optional<std::string>> slow = std::async(
@@ -1087,7 +1093,7 @@ TEST_F(VirtualFileSystem, SurfacesTheTreesReadError) {
     const FailingReadTree failing(tree(), errors[i]);
     const std::filesystem::path at =
         scratch() / ("failing" + std::to_string(i));
-    const makebelieve::VirtualFileSystem vfs(failing, at);
+    const makebelieve::VirtualFileSystem vfs(failing, at, notifier());
     const std::error_code error = read_error(at / "a.txt");
     EXPECT_TRUE(error == std::errc::permission_denied)
         << error.value() << ": " << error.message();

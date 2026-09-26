@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: MIT
 #include "unmountchannel.hpp"
 
-#include <array>
+#include "iocontext.hpp"
+
+#include <stdexec/execution.hpp>
+
 #include <filesystem>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 
 #include <windows.h>
 
@@ -107,11 +109,12 @@ class ScopedHandle {
 class UnmountChannel::Impl {
   std::stop_source m_source;
   ScopedHandle m_poke;  // Auto-reset event, signalled to trigger a stop.
-  ScopedHandle m_quit;  // Signalled to stop the listener.
-  std::thread m_listener;
+
+  // The wait on m_poke, stopped and joined on destruction.
+  stdexec::counting_scope m_listening;
 
  public:
-  explicit Impl(const std::filesystem::path& mountpoint) {
+  Impl(const std::filesystem::path& mountpoint, IoContext& io) {
     // Create the named event first and read the "already exists" flag before
     // any other Win32 call can clear it: a live event of this name means
     // another instance already owns the mount.
@@ -130,21 +133,14 @@ class UnmountChannel::Impl {
           mountpoint.string() + "]");
     }
 
-    m_quit.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    if (m_quit.get() == nullptr) {
-      throw std::system_error(last_error_code(),
-                              "CreateEvent failed to create the control "
-                              "endpoint");
-    }
-
-    m_listener = std::thread([this] { listen(); });
+    // The poke is idempotent, so the watch keeps going to the end.
+    io.spawn_watch(m_poke.get(), m_listening,
+                   [this]() noexcept { m_source.request_stop(); });
   }
 
   ~Impl() {
-    SetEvent(m_quit.get());
-    if (m_listener.joinable()) {
-      m_listener.join();
-    }
+    m_listening.request_stop();
+    stdexec::sync_wait(m_listening.join());
     // Closing the last handle to the named event removes the endpoint.
   }
 
@@ -154,20 +150,6 @@ class UnmountChannel::Impl {
   Impl& operator=(Impl&&) = delete;
 
   [[nodiscard]] std::stop_token token() const { return m_source.get_token(); }
-
- private:
-  void listen() {
-    const std::array<HANDLE, 2> handles{m_poke.get(), m_quit.get()};
-    while (true) {
-      const DWORD waited = WaitForMultipleObjects(
-          static_cast<DWORD>(handles.size()), handles.data(), FALSE, INFINITE);
-      if (waited == WAIT_OBJECT_0) {
-        m_source.request_stop();  // The poke; idempotent, keep listening.
-      } else {
-        return;  // The quit signal, or a wait failure we cannot recover from.
-      }
-    }
-  }
 };
 
 UnmountChannel::Result UnmountChannel::request_unmount(
@@ -189,8 +171,9 @@ UnmountChannel::Result UnmountChannel::request_unmount(
   return wait_until_gone(mountpoint) ? Result::ok : Result::teardown_timeout;
 }
 
-UnmountChannel::UnmountChannel(const std::filesystem::path& mountpoint)
-    : m_impl(std::make_unique<Impl>(mountpoint)) {}
+UnmountChannel::UnmountChannel(const std::filesystem::path& mountpoint,
+                               IoContext& io)
+    : m_impl(std::make_unique<Impl>(mountpoint, io)) {}
 
 UnmountChannel::~UnmountChannel() = default;
 
