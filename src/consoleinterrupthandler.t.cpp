@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "consoleinterrupthandler.hpp"
 
+#include "iocontext.hpp"
+
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -21,25 +23,31 @@
 
 namespace {
 
+// What every handler here picks its interrupts up through.
+makebelieve::IoContext& io() {
+  static makebelieve::IoContext context;
+  return context;
+}
+
 TEST(ConsoleInterruptHandler, TokenIsArmedButUnsetBeforeInterrupt) {
-  const makebelieve::ConsoleInterruptHandler handler;
+  const makebelieve::ConsoleInterruptHandler handler(io());
   const std::stop_token token = handler.token();
   EXPECT_TRUE(token.stop_possible());
   EXPECT_FALSE(token.stop_requested());
 }
 
 TEST(ConsoleInterruptHandler, SecondConstructionThrows) {
-  const makebelieve::ConsoleInterruptHandler handler;
+  const makebelieve::ConsoleInterruptHandler handler(io());
   // Creating 2 handlers violated our preconditions, but we throw in
   // this case to make it easier to test.
-  EXPECT_THROW(makebelieve::ConsoleInterruptHandler{}, std::logic_error);
+  EXPECT_THROW(makebelieve::ConsoleInterruptHandler{io()}, std::logic_error);
 }
 
 TEST(ConsoleInterruptHandler, CanReinstallOnceTheFirstIsDestroyed) {
-  { const makebelieve::ConsoleInterruptHandler first; }
+  { const makebelieve::ConsoleInterruptHandler first(io()); }
   // If the destructor failed to release the single-instance slot, this second
   // construction would throw instead.
-  EXPECT_NO_THROW(makebelieve::ConsoleInterruptHandler{});
+  EXPECT_NO_THROW(makebelieve::ConsoleInterruptHandler{io()});
 }
 
 TEST(ConsoleInterruptHandler, ConstructionSurfacesAnInstallFailure) {
@@ -49,7 +57,7 @@ TEST(ConsoleInterruptHandler, ConstructionSurfacesAnInstallFailure) {
   makebelieve::ConsoleInterruptHandlerTestUtil::fail_next_install(fake_error);
 
   try {
-    const makebelieve::ConsoleInterruptHandler handler;
+    const makebelieve::ConsoleInterruptHandler handler(io());
     ADD_FAILURE() << "construction should have thrown";
     // Only reached if the injection did not fire; clear it so it cannot leak
     // into a later test.
@@ -74,7 +82,7 @@ TEST(ConsoleInterruptHandler, ConstructionSurfacesAnInstallFailure) {
   // A failed construction must still release the single-instance slot, so a
   // fresh handler can be created afterwards. If the throwing path left g_source
   // set, this second construction would incorrectly throw std::logic_error.
-  EXPECT_NO_THROW(makebelieve::ConsoleInterruptHandler{});
+  EXPECT_NO_THROW(makebelieve::ConsoleInterruptHandler{io()});
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +155,7 @@ TEST(ConsoleInterruptHandler, InterruptRequestsStop) {
 // from wait_for_stop() in main.cpp - duplicating a handful of lines is cheaper
 // than exporting that helper just for a test.
 int serve() {
-  const makebelieve::ConsoleInterruptHandler handler;
+  const makebelieve::ConsoleInterruptHandler handler(io());
   const std::stop_token token = handler.token();
 
   if (const HANDLE ready =
@@ -170,7 +178,7 @@ int serve() {
 // than letting the default disposition terminate the runner. So the subject is
 // this process itself - no child, no re-exec.
 TEST(ConsoleInterruptHandler, InterruptRequestsStop) {
-  const makebelieve::ConsoleInterruptHandler handler;
+  const makebelieve::ConsoleInterruptHandler handler(io());
   const std::stop_token token = handler.token();
   ASSERT_TRUE(token.stop_possible());
   ASSERT_FALSE(token.stop_requested());
@@ -211,7 +219,7 @@ TEST(ConsoleInterruptHandler, AFailedInstallLeavesNothingBehind) {
   // process, so the baseline has to be taken with it already standing. Without
   // this the two descriptors would read as a leak whenever this test happens to
   // run first.
-  { const makebelieve::ConsoleInterruptHandler warm_up; }
+  { const makebelieve::ConsoleInterruptHandler warm_up(io()); }
 
   const std::optional<int> before = count_open_fds();
   if (!before.has_value()) {
@@ -223,7 +231,7 @@ TEST(ConsoleInterruptHandler, AFailedInstallLeavesNothingBehind) {
   constexpr int attempts = 50;
   for (int i = 0; i < attempts; ++i) {
     makebelieve::ConsoleInterruptHandlerTestUtil::fail_next_install(5);
-    EXPECT_THROW(makebelieve::ConsoleInterruptHandler{}, std::system_error);
+    EXPECT_THROW(makebelieve::ConsoleInterruptHandler{io()}, std::system_error);
   }
   EXPECT_EQ(count_open_fds(), before)
       << "the failed installs leaked descriptors";
@@ -231,7 +239,7 @@ TEST(ConsoleInterruptHandler, AFailedInstallLeavesNothingBehind) {
   // The rollback also has to put SIGINT back as it found it and leave no
   // dispatcher behind, so a handler built afterwards must still work end to
   // end rather than merely construct.
-  const makebelieve::ConsoleInterruptHandler handler;
+  const makebelieve::ConsoleInterruptHandler handler(io());
   std::binary_semaphore stopped{0};
   const std::stop_callback callback{handler.token(),
                                     [&stopped] { stopped.release(); }};

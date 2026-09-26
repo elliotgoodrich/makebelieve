@@ -3,15 +3,19 @@
 
 #include "directorytreeutil.hpp"
 #include "inmemorydirectorytree.hpp"
+#include "iocontext.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <expected>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <string>
@@ -22,6 +26,12 @@
 #include <vector>
 
 namespace {
+
+// What every tree here watches for changes through.
+makebelieve::IoContext& io() {
+  static makebelieve::IoContext context;
+  return context;
+}
 
 std::filesystem::path platform_absolute_path() {
 #ifdef _WIN32
@@ -103,7 +113,7 @@ class RealDirectoryTree : public ::testing::Test {
     write_file(m_root / "sub" / "nested.txt", "nested");
     ASSERT_TRUE(std::filesystem::create_directory(m_root / "sub" / "deeper"));
 
-    m_tree.emplace(m_root);
+    m_tree.emplace(m_root, io());
   }
 
   void TearDown() override {
@@ -462,6 +472,115 @@ INSTANTIATE_TEST_SUITE_P(
       return std::string(info.param.label);
     });
 
+// Collects the diffs a tree reports, for a test to wait on.
+class ChangeLog {
+  std::mutex m_mutex;
+  std::condition_variable m_changed;
+  std::vector<makebelieve::DirectoryTreeDiff> m_diffs;
+
+ public:
+  [[nodiscard]] std::function<void(const makebelieve::DirectoryTreeDiff&)>
+  callback() {
+    return [this](const makebelieve::DirectoryTreeDiff& diff) {
+      {
+        const std::lock_guard lock(m_mutex);
+        m_diffs.push_back(diff);
+      }
+      m_changed.notify_all();
+    };
+  }
+
+  // Waits (bounded) until some diff satisfies @a matches.
+  template <class Predicate>
+  [[nodiscard]] bool wait_for(Predicate matches) {
+    std::unique_lock lock(m_mutex);
+    return m_changed.wait_for(lock, std::chrono::seconds(10), [&] {
+      return std::ranges::any_of(m_diffs, matches);
+    });
+  }
+
+  // Whether some diff reported so far satisfies @a matches.
+  template <class Predicate>
+  [[nodiscard]] bool has(Predicate matches) {
+    const std::lock_guard lock(m_mutex);
+    return std::ranges::any_of(m_diffs, matches);
+  }
+
+  // Waits (bounded) until a diff names @a path as changed.
+  [[nodiscard]] bool wait_for_entry(const std::filesystem::path& path) {
+    return wait_for([&](const makebelieve::DirectoryTreeDiff& diff) {
+      return diff.everything_dirty ||
+             std::ranges::contains(diff.entries_changed, path);
+    });
+  }
+
+  // Waits (bounded) until a diff names @a directory's child list as changed.
+  [[nodiscard]] bool wait_for_child_list(
+      const std::filesystem::path& directory) {
+    return wait_for([&](const makebelieve::DirectoryTreeDiff& diff) {
+      return diff.everything_dirty ||
+             std::ranges::contains(diff.child_lists_changed, directory);
+    });
+  }
+};
+
+// Made the moment the subscription is in place, with no retry: the watch has
+// to be armed before subscribe_to_changes returns.
+TEST_F(RealDirectoryTree, ReportsAChangeMadeRightAfterSubscribing) {
+  ChangeLog log;
+  const makebelieve::Subscription subscription =
+      tree().subscribe_to_changes(log.callback());
+  write_file(root() / "hello.txt", "changed");
+  EXPECT_TRUE(log.wait_for_entry("hello.txt"));
+}
+
+TEST_F(RealDirectoryTree, ReportsChangesInSubdirectories) {
+  ChangeLog log;
+  const makebelieve::Subscription subscription =
+      tree().subscribe_to_changes(log.callback());
+  write_file(root() / "sub" / "deeper" / "new.txt", "new");
+  EXPECT_TRUE(
+      log.wait_for_entry(std::filesystem::path("sub") / "deeper" / "new.txt"));
+  EXPECT_TRUE(log.wait_for_child_list(std::filesystem::path("sub") / "deeper"));
+}
+
+TEST_F(RealDirectoryTree, ReportsAddedAndRemovedFilesInTheirParentsChildList) {
+  ChangeLog log;
+  const makebelieve::Subscription subscription =
+      tree().subscribe_to_changes(log.callback());
+  write_file(root() / "added.txt", "added");
+  EXPECT_TRUE(log.wait_for_entry("added.txt"));
+  EXPECT_TRUE(log.wait_for_child_list(""));
+
+  std::filesystem::remove(root() / "sub" / "nested.txt");
+  EXPECT_TRUE(log.wait_for_entry(std::filesystem::path("sub") / "nested.txt"));
+  EXPECT_TRUE(log.wait_for_child_list("sub"));
+}
+
+// Every subscriber hears of a change, and one that has gone hears of no more.
+TEST_F(RealDirectoryTree, NotifiesEverySubscriberUntilItUnsubscribes) {
+  ChangeLog first;
+  ChangeLog second;
+  const makebelieve::Subscription kept =
+      tree().subscribe_to_changes(first.callback());
+  std::optional<makebelieve::Subscription> dropped =
+      tree().subscribe_to_changes(second.callback());
+
+  write_file(root() / "hello.txt", "one");
+  EXPECT_TRUE(first.wait_for_entry("hello.txt"));
+  EXPECT_TRUE(second.wait_for_entry("hello.txt"));
+
+  dropped.reset();
+  write_file(root() / "empty.txt", "two");
+  EXPECT_TRUE(first.wait_for_entry("empty.txt"));
+  // Both would have heard of it in the same pass, so the first having heard
+  // is enough to know the second never will.
+  EXPECT_FALSE(second.has([](const makebelieve::DirectoryTreeDiff& diff) {
+    return std::ranges::contains(diff.entries_changed,
+                                 std::filesystem::path("empty.txt"));
+  }));
+}
+
 class RealDirectoryTreeWithAMissingRoot : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -486,11 +605,11 @@ class RealDirectoryTreeWithAMissingRoot : public ::testing::Test {
 TEST_F(RealDirectoryTreeWithAMissingRoot, ConstructionSucceeds) {
   // weakly_canonical must not throw on a path that is not there, so a
   // misconfigured root surfaces when it is queried rather than at startup.
-  EXPECT_NO_THROW({ const makebelieve::RealDirectoryTree tree(root()); });
+  EXPECT_NO_THROW({ const makebelieve::RealDirectoryTree tree(root(), io()); });
 }
 
 TEST_F(RealDirectoryTreeWithAMissingRoot, EveryOperationFails) {
-  const makebelieve::RealDirectoryTree tree(root());
+  const makebelieve::RealDirectoryTree tree(root(), io());
 
   const std::expected<makebelieve::EntryInfo, std::error_code> status =
       tree.status("");

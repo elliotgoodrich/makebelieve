@@ -2,6 +2,7 @@
 #include "builddirectorytree.hpp"
 #include "consoleinterrupthandler.hpp"
 #include "filesystemutil.hpp"
+#include "iocontext.hpp"
 #include "realdirectorytree.hpp"
 #include "tracer.hpp"
 #include "unmountchannel.hpp"
@@ -54,7 +55,17 @@ int mount(const char* mountpoint_arg) {
   const TracerInstallation installed_tracer(tracer);
   MB_TRACE_THREAD_NAME("main");
 
-  const ConsoleInterruptHandler interrupt;
+  // Every wait on the operating system - source changes, interrupts, unmount
+  // requests - happens on this context's one thread.
+  IoContext io;
+
+  // Where builds and mount notifications run: one thread per core, a build
+  // blocking its thread for as long as the command it runs. Outlives
+  // everything below, which waits out its work on the pool when it goes.
+  exec::static_thread_pool workers(
+      std::max(1U, std::thread::hardware_concurrency()));
+
+  const ConsoleInterruptHandler interrupt(io);
 
   const std::filesystem::path source = std::filesystem::current_path();
   const std::filesystem::path mountpoint =
@@ -68,21 +79,15 @@ int mount(const char* mountpoint_arg) {
     return 1;
   }
 
-  const RealDirectoryTree tree(source);
-
-  // Where builds run: one thread per core, each blocked for as long as the
-  // command it runs. Outlives the tree, which waits out its builds when it
-  // goes.
-  exec::static_thread_pool builds(
-      std::max(1U, std::thread::hardware_concurrency()));
+  const RealDirectoryTree tree(source, io);
 
   // Presents the manifest's declared outputs, building each lazily through
   // the shell. The runner's working directory is the source root, so the
   // inputs it traces line up with the source's own change notifications.
   const BuildDirectoryTree build_tree(
-      tree, BuildDirectoryTree::shell_runner(source, builds.get_scheduler()),
+      tree, BuildDirectoryTree::shell_runner(source, workers.get_scheduler()),
       [](const std::string& problems) {
-        // Best-effort, as this runs on the source's watcher thread.
+        // Best-effort, as this runs on the IoContext's thread.
         try {
           std::println(stderr,
                        "makebelieve: ignoring the change to build.makebelieve "
@@ -92,10 +97,11 @@ int mount(const char* mountpoint_arg) {
         }
       });
 
-  const VirtualFileSystem vfs(build_tree, mountpoint_arg);
+  const VirtualFileSystem vfs(build_tree, mountpoint_arg,
+                              workers.get_scheduler());
 
   // Constructed after the mount so the mount root exists to canonicalize.
-  const UnmountChannel unmount_channel(mountpoint);
+  const UnmountChannel unmount_channel(mountpoint, io);
 
   std::println(stderr,
                "makebelieve serving [{}], press Ctrl+C or run "

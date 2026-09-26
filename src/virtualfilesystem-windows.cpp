@@ -5,6 +5,8 @@
 #include "processutil.hpp"
 #include "tracer.hpp"
 
+#include <stdexec/execution.hpp>
+
 #include <windows.h>
 
 #include <bcrypt.h>  // PNTSTATUS
@@ -16,7 +18,6 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -346,8 +347,10 @@ class VirtualFileSystem::Impl {
   // Delegates first, so that once the mountpoint is claimed the object counts
   // as constructed: anything below that throws still runs ~Impl, which tears
   // down exactly the parts that got started.
-  Impl(const DirectoryTree& tree, const std::filesystem::path& mountpoint)
-      : Impl(tree, mountpoint, Unstarted{}) {
+  Impl(const DirectoryTree& tree,
+       const std::filesystem::path& mountpoint,
+       exec::static_thread_pool::scheduler scheduler)
+      : Impl(tree, mountpoint, scheduler, Unstarted{}) {
     // WinFsp's DLL lives in its own install directory rather than anywhere the
     // loader searches, so the import library is delay-loaded and this is what
     // resolves it. It has to run before any other WinFsp call, and it is what
@@ -423,10 +426,8 @@ class VirtualFileSystem::Impl {
     }
     m_dispatching = true;
 
-    // The notifier has to be running before a change can be queued for it, and
-    // the subscription is taken last so no notification can arrive before
+    // The subscription is taken last so no notification can arrive before
     // there is a filesystem to announce it through.
-    m_notifier = std::thread([this]() { notify_loop(); });
     m_subscription.emplace(m_tree.subscribe_to_changes(
         [this](const DirectoryTreeDiff& diff) { on_tree_changed(diff); }));
   }
@@ -438,10 +439,12 @@ class VirtualFileSystem::Impl {
   // removes what this object brought into being.
   Impl(const DirectoryTree& tree,
        const std::filesystem::path& mountpoint,
+       exec::static_thread_pool::scheduler scheduler,
        Unstarted)
       : m_tree(tree),
         m_mountpoint(normalize_mountpoint(mountpoint)),
-        m_root(m_mountpoint.wstring()) {
+        m_root(m_mountpoint.wstring()),
+        m_scheduler(scheduler) {
     create_mountpoint(m_mountpoint);
   }
 
@@ -450,17 +453,15 @@ class VirtualFileSystem::Impl {
     // would call into a torn-down filesystem.
     m_subscription.reset();
 
-    // Then stop the notifier and wait for it to drain. It issues
+    // Then stop the notifier and wait out a pass under way, which sees
+    // m_stopping and ends after the batch it is on. It issues
     // FspFileSystemNotify against m_filesystem, so it has to be gone before
     // that object is deleted.
     {
       const std::lock_guard<std::mutex> lock(m_notify_mutex);
       m_stopping = true;
     }
-    m_wake.notify_one();
-    if (m_notifier.joinable()) {
-      m_notifier.join();
-    }
+    stdexec::sync_wait(m_notifications.join());
 
     if (m_filesystem != nullptr) {
       if (m_dispatching) {
@@ -878,43 +879,63 @@ class VirtualFileSystem::Impl {
       }
       merge_changes(m_pending, changes);
     }
-    m_wake.notify_one();
+    start_notifying();
   }
 
-  // Drains queued changes, announcing each affected path in turn.
-  void notify_loop() {
-    MB_TRACE_THREAD_NAME("vfs notifier");
-    std::unique_lock<std::mutex> lock(m_notify_mutex);
-    while (true) {
-      m_wake.wait(lock, [this] {
-        return m_stopping || m_everything_dirty || !m_pending.empty();
-      });
-      if (m_stopping) {
-        break;
-      }
-
-      Changes batch;
-      if (m_everything_dirty) {
-        // The tree lost track of what changed, so everything handed out could
-        // be stale. Announce the paths we know were opened rather than walking
-        // the mount: enumerating our own volume would re-enter the operations
-        // above from here.
-        m_everything_dirty = false;
-        m_pending.clear();
-        const std::lock_guard<std::mutex> known_lock(m_known_mutex);
-        for (const std::filesystem::path& path : m_known) {
-          batch.emplace(path, ChangeKind::modified);
-        }
-      } else {
-        batch = std::exchange(m_pending, {});
-      }
-
-      // Unlocked for the announcements themselves, so a change arriving
-      // mid-batch simply queues up for the next pass.
-      lock.unlock();
-      send_notifications(std::move(batch));
-      lock.lock();
+  // Starts a pass announcing the queued changes, unless one is under way or we
+  // are stopping. A pass that cannot be started is retried by the next change.
+  // @pre m_notify_mutex is held.
+  void start_notifying() noexcept {
+    if (m_notifying || m_stopping) {
+      return;
     }
+    m_notifying = true;
+    try {
+      stdexec::spawn(stdexec::schedule(m_scheduler) |
+                         stdexec::then([this]() noexcept { notify_pending(); }),
+                     m_notifications.get_token());
+    } catch (...) {
+      m_notifying = false;
+    }
+  }
+
+  // One pass of the notifier: announces each affected path in turn until
+  // nothing is queued, then stands down.
+  void notify_pending() noexcept {
+    MB_TRACE_SCOPE("vfs", "notify");
+    std::unique_lock<std::mutex> lock(m_notify_mutex);
+    // Best-effort: a change dropped for want of memory goes unannounced, as
+    // one a watcher's own buffer overflows on does.
+    try {
+      while (!m_stopping && (m_everything_dirty || !m_pending.empty())) {
+        Changes batch;
+        if (m_everything_dirty) {
+          // The tree lost track of what changed, so everything handed out
+          // could be stale. Announce the paths we know were opened rather than
+          // walking the mount: enumerating our own volume would re-enter the
+          // operations above from here.
+          m_everything_dirty = false;
+          m_pending.clear();
+          const std::lock_guard<std::mutex> known_lock(m_known_mutex);
+          for (const std::filesystem::path& path : m_known) {
+            batch.emplace(path, ChangeKind::modified);
+          }
+        } else {
+          batch = std::exchange(m_pending, {});
+        }
+
+        // Unlocked for the announcements themselves, so a change arriving
+        // mid-batch simply queues up for the next round.
+        lock.unlock();
+        send_notifications(std::move(batch));
+        lock.lock();
+      }
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+      if (!lock.owns_lock()) {
+        lock.lock();
+      }
+    }
+    m_notifying = false;
   }
 
   void send_notifications(Changes batch) {
@@ -992,8 +1013,8 @@ class VirtualFileSystem::Impl {
       }
       merge_changes(m_pending, Changes{*it});
       m_deferred.erase(it);
+      start_notifying();
     }
-    m_wake.notify_one();
   }
 
   // Announces one changed path, so anything watching the mount with
@@ -1065,6 +1086,9 @@ class VirtualFileSystem::Impl {
   // FspFileSystemSetMountPoint takes a mutable pointer.
   std::wstring m_root;
 
+  // Where notifier passes run.
+  exec::static_thread_pool::scheduler m_scheduler;
+
   const SecurityDescriptor m_security;
 
   FSP_FILE_SYSTEM* m_filesystem = nullptr;
@@ -1082,11 +1106,10 @@ class VirtualFileSystem::Impl {
   std::mutex m_open_mutex;
   std::map<std::filesystem::path, int> m_open_counts;
 
-  // The notifier thread and the queue on_tree_changed hands it. m_pending
-  // coalesces: a path repeated across diffs is announced once per pass, and
-  // m_everything_dirty supersedes the lot.
+  // The queue on_tree_changed hands the notifier. m_pending coalesces: a path
+  // repeated across diffs is announced once per pass, and m_everything_dirty
+  // supersedes the lot.
   std::mutex m_notify_mutex;
-  std::condition_variable m_wake;
   Changes m_pending;
 
   // Changes that could not be announced because the file was open, waiting on
@@ -1095,16 +1118,22 @@ class VirtualFileSystem::Impl {
 
   bool m_everything_dirty = false;
   bool m_stopping = false;
-  std::thread m_notifier;
+
+  // Whether a notifier pass is under way, and that pass, joined on
+  // destruction.
+  bool m_notifying = false;
+  stdexec::counting_scope m_notifications;
 
   // Declared last so it is destroyed first, stopping notifications before the
   // state they touch goes away.
   std::optional<Subscription> m_subscription;
 };
 
-VirtualFileSystem::VirtualFileSystem(const DirectoryTree& tree,
-                                     const std::filesystem::path& mountpoint)
-    : m_impl(std::make_unique<Impl>(tree, mountpoint)) {}
+VirtualFileSystem::VirtualFileSystem(
+    const DirectoryTree& tree,
+    const std::filesystem::path& mountpoint,
+    exec::static_thread_pool::scheduler scheduler)
+    : m_impl(std::make_unique<Impl>(tree, mountpoint, scheduler)) {}
 
 VirtualFileSystem::~VirtualFileSystem() = default;
 

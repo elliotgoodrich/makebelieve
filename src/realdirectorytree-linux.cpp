@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 #include "realdirectorytree.hpp"
 
-#include "tracer.hpp"
+#include "iocontext.hpp"
+
+#include <stdexec/execution.hpp>
 
 #include <array>
 #include <cerrno>
@@ -19,14 +21,11 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 #include <utility>
 #include <vector>
 
 #include <dirent.h>
 #include <fcntl.h>
-#include <poll.h>
-#include <sys/eventfd.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -78,45 +77,47 @@ using UniqueDir = std::unique_ptr<DIR, int (*)(DIR*)>;
 
 class RealDirectoryTree::Impl {
   std::filesystem::path m_root;
+  IoContext& m_io;
 
   // Everything below is mutable because the whole interface is const: these
   // are the internals that const-as-thread-safety permits us to touch, and
-  // each is guarded either by m_mutex or by the watcher thread's own lifetime.
+  // each is guarded either by m_mutex or by being the watch's alone.
 
   // Guards m_subscribers, m_next_id, and the lazy watcher startup.
   mutable std::mutex m_mutex;
   mutable std::list<std::function<void(const DirectoryTreeDiff&)>>
       m_subscribers;
 
-  // The inotify instance and an eventfd the destructor writes to. Created
-  // lazily by start_watcher(). m_watch_descriptors maps each watch descriptor
-  // back to its directory relative to the root (the root itself being the
-  // empty path), since inotify names only the leaf within the watched
-  // directory; it is touched only by start_watcher() and the watcher thread,
-  // which never run at the same time, so it needs no lock.
+  // Held for a whole round of callbacks, and by unsubscribing, so that an
+  // unsubscribe returns only once none of its callbacks can still be running.
+  // Recursive so that a callback may still (un)subscribe from within itself.
+  // Taken before m_mutex.
+  mutable std::recursive_mutex m_notifying;
+
+  // The inotify instance, created lazily by start_watcher().
+  // m_watch_descriptors maps each watch descriptor back to its directory
+  // relative to the root (the root itself being the empty path), since inotify
+  // names only the leaf within the watched directory; it is touched only by
+  // start_watcher() and then the watch, which never run at the same time, so
+  // it needs no lock.
   mutable int m_inotify_fd = -1;
-  mutable int m_stop_fd = -1;
   mutable std::map<int, std::filesystem::path> m_watch_descriptors;
-  mutable std::thread m_watcher;
+
+  // The wait on m_inotify_fd, stopped and joined on destruction.
+  mutable stdexec::counting_scope m_watching;
+  mutable bool m_watching_started = false;
 
  public:
-  explicit Impl(const std::filesystem::path& root)
-      : m_root(std::filesystem::weakly_canonical(root)) {}
+  Impl(const std::filesystem::path& root, IoContext& io)
+      : m_root(std::filesystem::weakly_canonical(root)), m_io(io) {}
 
   ~Impl() {
-    if (m_watcher.joinable()) {
-      // Nudge the eventfd so the watch loop's poll() returns even while
-      // blocked, then join before releasing the descriptors it reads.
-      const std::uint64_t one = 1;
-      const ssize_t written = ::write(m_stop_fd, &one, sizeof(one));
-      static_cast<void>(written);
-      m_watcher.join();
+    if (m_watching_started) {
+      m_watching.request_stop();
+      stdexec::sync_wait(m_watching.join());
     }
     if (m_inotify_fd >= 0) {
       ::close(m_inotify_fd);
-    }
-    if (m_stop_fd >= 0) {
-      ::close(m_stop_fd);
     }
   }
 
@@ -142,9 +143,9 @@ class RealDirectoryTree::Impl {
   [[nodiscard]] std::optional<std::filesystem::path> resolve(
       const std::filesystem::path& path) const;
 
-  // Creates the inotify and eventfd descriptors, plants the initial watches,
-  // and spawns the watcher. Called once, from the first subscribe_to_changes(),
-  // with m_mutex held.
+  // Creates the inotify descriptor, plants the initial watches, and starts
+  // waiting on it. Called once, from the first subscribe_to_changes(), with
+  // m_mutex held.
   void start_watcher() const;
 
   // The two paths add_watch() needs, named so that a call site cannot pass
@@ -163,8 +164,8 @@ class RealDirectoryTree::Impl {
   // The recursion mirrors the tree, which symlink_status() keeps finite.
   void add_watch(const WatchTarget& target) const;
 
-  // Drains inotify until the eventfd is signalled, turning records into diffs.
-  void watch_loop() const;
+  // Drains what inotify has queued into one diff for the subscribers.
+  void drain_events() const;
 
   // Invokes every registered callback with @a diff. Takes a copy of the
   // callback list so that a callback which unsubscribes cannot deadlock
@@ -341,12 +342,13 @@ Subscription RealDirectoryTree::Impl::subscribe_to_changes(
     const std::function<void(const DirectoryTreeDiff&)>& callback) const {
   const std::lock_guard<std::mutex> lock(m_mutex);
 
-  if (!m_watcher.joinable()) {
+  if (!m_watching_started) {
     start_watcher();
   }
 
   const auto it = m_subscribers.emplace(m_subscribers.end(), callback);
   return Subscription([this, it] {
+    const std::lock_guard notifying(m_notifying);
     const std::lock_guard<std::mutex> unsubscribe_lock(m_mutex);
     m_subscribers.erase(it);
   });
@@ -358,18 +360,18 @@ void RealDirectoryTree::Impl::start_watcher() const {
     throw std::system_error(errno, std::system_category(), "inotify_init1");
   }
 
-  // A counter eventfd used purely as a wakeup: the destructor writes to it to
-  // break the watch loop's poll().
-  m_stop_fd = ::eventfd(0, EFD_CLOEXEC);
-  if (m_stop_fd < 0) {
-    const int error = errno;
-    ::close(m_inotify_fd);
-    m_inotify_fd = -1;
-    throw std::system_error(error, std::system_category(), "eventfd");
-  }
-
+  // Planted before this returns, so a change made once the subscription is in
+  // place is queued for the watch even before it first runs.
   add_watch({.absolute = m_root, .relative = std::filesystem::path{}});
-  m_watcher = std::thread([this]() { watch_loop(); });
+  m_io.spawn_watch(m_inotify_fd, m_watching, [this]() noexcept {
+    // Best-effort: a change dropped for want of memory is lost, as a record
+    // inotify overflows is.
+    try {
+      drain_events();
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+    }
+  });
+  m_watching_started = true;
 }
 
 // NOLINTNEXTLINE(misc-no-recursion): see the declaration.
@@ -395,28 +397,11 @@ void RealDirectoryTree::Impl::add_watch(const WatchTarget& target) const {
   }
 }
 
-void RealDirectoryTree::Impl::watch_loop() const {
-  MB_TRACE_THREAD_NAME("source watcher");
+void RealDirectoryTree::Impl::drain_events() const {
   // alignas so each record can be read through at its natural alignment.
   alignas(struct inotify_event) std::array<char, k_event_buffer_bytes> buffer;
 
-  while (true) {
-    std::array<pollfd, 2> fds{
-        {{.fd = m_inotify_fd, .events = POLLIN, .revents = 0},
-         {.fd = m_stop_fd, .events = POLLIN, .revents = 0}}};
-    if (::poll(fds.data(), fds.size(), -1) < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      return;
-    }
-    if ((fds[1].revents & POLLIN) != 0) {
-      return;  // Destructor signalled the eventfd.
-    }
-    if ((fds[0].revents & POLLIN) == 0) {
-      continue;
-    }
-
+  {
     // Ordered sets so repeated records for one path collapse and the lists come
     // out sorted, exactly as the Windows backend produces them.
     std::set<std::filesystem::path> files;
@@ -504,6 +489,7 @@ void RealDirectoryTree::Impl::watch_loop() const {
 
 void RealDirectoryTree::Impl::notify_subscribers(
     const DirectoryTreeDiff& diff) const {
+  const std::lock_guard notifying(m_notifying);
   const std::vector<std::function<void(const DirectoryTreeDiff&)>> callbacks =
       [&] {
         const std::lock_guard<std::mutex> lock(m_mutex);
@@ -516,8 +502,9 @@ void RealDirectoryTree::Impl::notify_subscribers(
   }
 }
 
-RealDirectoryTree::RealDirectoryTree(const std::filesystem::path& root)
-    : m_impl(std::make_unique<Impl>(root)) {}
+RealDirectoryTree::RealDirectoryTree(const std::filesystem::path& root,
+                                     IoContext& io)
+    : m_impl(std::make_unique<Impl>(root, io)) {}
 
 RealDirectoryTree::~RealDirectoryTree() = default;
 
