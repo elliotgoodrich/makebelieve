@@ -3,6 +3,7 @@
 
 #include "intrusivetask.hpp"
 
+#include <exec/finally.hpp>
 #include <stdexec/execution.hpp>
 
 #include <cstddef>
@@ -116,18 +117,27 @@ class BuildQueue {
   ~BuildQueue() = default;
 
   /// A sender that starts @a work once a slot is free and completes as it
-  /// does, holding the slot until then. Stopped before a slot is free, it
-  /// leaves the queue and completes stopped without starting @a work.
+  /// does, giving the slot back as @a work completes - before passing on how
+  /// it completed, and whenever the operation itself is destroyed. Stopped
+  /// before a slot is free, it leaves the queue and completes stopped without
+  /// starting @a work.
   template <stdexec::sender Work>
   [[nodiscard]] auto schedule(Work work) {
     return take() |
-           stdexec::let_value([work = std::move(work)](Slot& /*slot*/) mutable {
-             return std::move(work);
+           stdexec::let_value([work = std::move(work)](Slot& slot) mutable {
+             // Not left to the Slot's destructor: this operation may outlive
+             // the work by a long way - a when_all's lives until all its work
+             // is done, which may need this very slot.
+             return exec::finally(
+                 std::move(work),
+                 stdexec::just() |
+                     stdexec::then([&slot]() noexcept { slot.release(); }));
            });
   }
 };
 
-// One slot, given back to its queue when destroyed.
+// One slot, given back to its queue by release() or, failing that, when
+// destroyed.
 template <stdexec::scheduler StoppedOn>
 class BuildQueue<StoppedOn>::Slot {
   BuildQueue* m_queue;
@@ -145,9 +155,12 @@ class BuildQueue<StoppedOn>::Slot {
 
   Slot(const Slot&) = delete;
 
-  ~Slot() {
-    if (m_queue != nullptr) {
-      m_queue->release();
+  ~Slot() { release(); }
+
+  // Gives the slot back, if it has not been already.
+  void release() noexcept {
+    if (BuildQueue* const queue = std::exchange(m_queue, nullptr)) {
+      queue->release();
     }
   }
 };

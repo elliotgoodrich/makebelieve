@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -21,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -68,24 +70,6 @@ class ScopedHandle {
   ScopedHandle& operator=(const ScopedHandle&) = delete;
   ScopedHandle(ScopedHandle&&) = delete;
   ScopedHandle& operator=(ScopedHandle&&) = delete;
-};
-
-// Removes a file on scope exit.
-class ScopedFile {
-  std::filesystem::path m_path;
-
- public:
-  explicit ScopedFile(const std::filesystem::path& path) : m_path(path) {}
-
-  ~ScopedFile() {
-    std::error_code ec;
-    std::filesystem::remove(m_path, ec);
-  }
-
-  ScopedFile(const ScopedFile&) = delete;
-  ScopedFile& operator=(const ScopedFile&) = delete;
-  ScopedFile(ScopedFile&&) = delete;
-  ScopedFile& operator=(ScopedFile&&) = delete;
 };
 
 // Locates makebelievehook.dll next to the running executable. Fails if absent,
@@ -181,14 +165,20 @@ std::wstring child_environment_with_trace(const std::wstring& log_value,
 }
 
 // Reads the hook's UTF-8, newline-terminated log of read paths, deduplicated
-// and sorted. A missing or empty log yields an empty list.
-std::vector<std::filesystem::path> read_trace_log(
-    const std::filesystem::path& log) {
-  std::vector<std::filesystem::path> inputs;
+// and sorted. An empty log means the command read nothing; a log that is
+// missing, or cannot be read or decoded, is an error rather than an empty list,
+// since tracing is required and a lost read is a lost dependency.
+std::expected<std::vector<std::filesystem::path>, std::error_code>
+read_trace_log(const std::filesystem::path& log) {
   std::ifstream stream(log, std::ios::binary);
   if (!stream) {
-    return inputs;
+    std::error_code ec;
+    return std::unexpected(
+        std::filesystem::exists(log, ec)
+            ? std::make_error_code(std::errc::io_error)
+            : std::make_error_code(std::errc::no_such_file_or_directory));
   }
+  std::vector<std::filesystem::path> inputs;
   std::string line;
   while (std::getline(stream, line)) {
     if (!line.empty() && line.back() == '\r') {
@@ -197,11 +187,15 @@ std::vector<std::filesystem::path> read_trace_log(
     if (line.empty()) {
       continue;
     }
-    if (std::expected<std::wstring, std::error_code> wide =
-            StringUtil::to_wide(line);
-        wide.has_value()) {
-      inputs.emplace_back(std::move(*wide));
+    std::expected<std::wstring, std::error_code> wide =
+        StringUtil::to_wide(line);
+    if (!wide.has_value()) {
+      return std::unexpected(wide.error());
     }
+    inputs.emplace_back(std::move(*wide));
+  }
+  if (stream.bad()) {
+    return std::unexpected(std::make_error_code(std::errc::io_error));
   }
   std::ranges::sort(inputs);
   inputs.erase(std::ranges::unique(inputs).begin(), inputs.end());
@@ -354,20 +348,253 @@ class OutputReader {
   [[nodiscard]] std::string take() && { return std::move(m_output); }
 };
 
-// Ends a command on stop: through its job, the whole tree it spawned, else
-// cmd.exe alone.
-struct Terminate {
-  HANDLE process;
-  HANDLE job;
-  bool in_job;
+// Traces the files one command, and everything it starts, reads under a root:
+// the hook DLL injected into them, and the private log the hook appends each
+// read to. Prepared before the launch, which it supplies the DLL and the
+// environment for, and read back once everything the command started has
+// finished.
+class TracingSession {
+  std::filesystem::path m_log;
+  std::string m_hook;
+  std::wstring m_environment;
 
-  void operator()() const noexcept {
-    if (in_job) {
-      TerminateJobObject(job, 1);
+  TracingSession(std::filesystem::path log,
+                 std::string hook,
+                 std::wstring environment)
+      : m_log(std::move(log)),
+        m_hook(std::move(hook)),
+        m_environment(std::move(environment)) {}
+
+ public:
+  // Finds the hook DLL and creates the log for a command run in
+  // @a working_directory, or says why it cannot: tracing is required, so
+  // either missing fails the run.
+  static std::expected<std::unique_ptr<TracingSession>, std::error_code>
+  prepare(const std::filesystem::path& working_directory) {
+    if (const std::optional<std::error_code> forced = ProcessUtilTestUtil::take(
+            static_cast<int>(ProcessUtilTestUtil::Failure::tracing_setup))) {
+      return std::unexpected(*forced);
+    }
+    const std::expected<std::filesystem::path, std::error_code> hook =
+        find_hook_dll();
+    if (!hook.has_value()) {
+      return std::unexpected(hook.error());
+    }
+    std::expected<std::filesystem::path, std::error_code> log =
+        make_trace_log();
+    if (!log.has_value()) {
+      return std::unexpected(log.error());
+    }
+    // The hook reports each read in canonical form, so hand it the root in the
+    // same form or its under-the-root filter drops everything on a caller
+    // whose working directory carries an 8.3 short component.
+    std::wstring environment = child_environment_with_trace(
+        log->wstring(), canonical_directory(working_directory).wstring());
+    return std::unique_ptr<TracingSession>(new TracingSession(
+        std::move(*log), StringUtil::to_utf8(hook->wstring()),
+        std::move(environment)));
+  }
+
+  ~TracingSession() {
+    std::error_code ec;
+    std::filesystem::remove(m_log, ec);
+  }
+
+  TracingSession(const TracingSession&) = delete;
+  TracingSession& operator=(const TracingSession&) = delete;
+  TracingSession(TracingSession&&) = delete;
+  TracingSession& operator=(TracingSession&&) = delete;
+
+  // The hook DLL to inject, as Detours wants it.
+  [[nodiscard]] const std::string& hook() const { return m_hook; }
+
+  // The command's environment block. CreateProcessW may write to it.
+  [[nodiscard]] std::wstring& environment() { return m_environment; }
+
+  // The files the command and everything it started read, or why the log
+  // could not be read.
+  [[nodiscard]] std::expected<std::vector<std::filesystem::path>,
+                              std::error_code>
+  take_inputs() const {
+    if (ProcessUtilTestUtil::take(
+            static_cast<int>(ProcessUtilTestUtil::Failure::trace_log))) {
+      std::error_code ec;
+      std::filesystem::remove(m_log, ec);
+    }
+    return read_trace_log(m_log);
+  }
+};
+
+// A running command, in a job of its own along with everything it starts.
+// terminate() ends the job and waits, through the IoContext, until every
+// process in it has exited. Closing the job - when this is destroyed - asks
+// the system to kill whatever is left, as a last resort, but does not wait
+// for it.
+//
+// How long terminate() can take is bounded by the processes themselves: it
+// waits on each one it can open, which the system kills promptly, and polls
+// for any it cannot open only until a short deadline, after which their exit
+// is requested but not confirmed.
+class ChildProcess {
+  ScopedHandle m_job;
+  ScopedHandle m_process;
+  ScopedHandle m_thread;
+  bool m_in_job;
+
+  ChildProcess(HANDLE job, HANDLE process, HANDLE thread, bool in_job)
+      : m_job(job), m_process(process), m_thread(thread), m_in_job(in_job) {}
+
+  // The processes still in the job, opened to be waited on. Those that have
+  // exited already, or cannot be opened, are left out.
+  [[nodiscard]] std::vector<HANDLE> open_processes_left() const {
+    constexpr DWORD k_max_ids = 256;
+    std::vector<std::byte> buffer(sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) +
+                                  k_max_ids * sizeof(ULONG_PTR));
+    auto* list =
+        reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST*>(buffer.data());
+    std::vector<HANDLE> handles;
+    if (!QueryInformationJobObject(m_job.get(), JobObjectBasicProcessIdList,
+                                   list, static_cast<DWORD>(buffer.size()),
+                                   nullptr) &&
+        GetLastError() != ERROR_MORE_DATA) {
+      return handles;
+    }
+    for (DWORD i = 0; i < list->NumberOfProcessIdsInList; ++i) {
+      if (const HANDLE handle = OpenProcess(
+              SYNCHRONIZE, FALSE, static_cast<DWORD>(list->ProcessIdList[i]));
+          handle != nullptr) {
+        handles.push_back(handle);
+      }
+    }
+    return handles;
+  }
+
+  // How many processes are still in the job.
+  [[nodiscard]] DWORD active_processes() const {
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+    if (!QueryInformationJobObject(m_job.get(),
+                                   JobObjectBasicAccountingInformation,
+                                   &accounting, sizeof(accounting), nullptr)) {
+      return 0;
+    }
+    return accounting.ActiveProcesses;
+  }
+
+ public:
+  // Starts @a command_line, traced by @a tracing, in @a working_directory with
+  // its standard output on @a standard_output, or says why it could not.
+  static std::expected<std::unique_ptr<ChildProcess>, std::error_code> launch(
+      std::wstring& command_line,
+      TracingSession& tracing,
+      const std::filesystem::path& working_directory,
+      HANDLE standard_output) {
+    // Created before the suspended launch so the command is enrolled before it
+    // can start anything. nullptr falls back to ending cmd.exe alone.
+    const HANDLE job = create_kill_on_close_job();
+
+    STARTUPINFOW startup = {
+        .cb = sizeof(startup),
+        .dwFlags = STARTF_USESTDHANDLES,
+        .hStdInput = GetStdHandle(STD_INPUT_HANDLE),
+        .hStdOutput = standard_output,
+        .hStdError = GetStdHandle(STD_ERROR_HANDLE),
+    };
+
+    // Suspended, so the command is enrolled in the job before its code runs.
+    // Detours injects into the suspended process and, given CREATE_SUSPENDED,
+    // leaves the resume to us. The hook is in place before the command's code
+    // runs, and re-injects into anything it starts.
+    const DWORD creation_flags =
+        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
+    PROCESS_INFORMATION process{};
+    if (!DetourCreateProcessWithDllExW(
+            nullptr, command_line.data(), nullptr, nullptr, TRUE,
+            creation_flags, tracing.environment().data(),
+            working_directory.c_str(), &startup, &process,
+            tracing.hook().c_str(), nullptr)) {
+      const std::error_code error = last_error_code();
+      if (job != nullptr) {
+        CloseHandle(job);
+      }
+      return std::unexpected(error);
+    }
+
+    // If enrolment fails the command still runs, and ending it falls back to
+    // terminating cmd.exe alone.
+    const bool in_job =
+        job != nullptr && AssignProcessToJobObject(job, process.hProcess);
+    ResumeThread(process.hThread);
+    return std::unique_ptr<ChildProcess>(
+        new ChildProcess(job, process.hProcess, process.hThread, in_job));
+  }
+
+  ChildProcess(const ChildProcess&) = delete;
+  ChildProcess& operator=(const ChildProcess&) = delete;
+  ChildProcess(ChildProcess&&) = delete;
+  ChildProcess& operator=(ChildProcess&&) = delete;
+  ~ChildProcess() = default;
+
+  // Signalled once the command itself - cmd.exe - has exited.
+  [[nodiscard]] HANDLE exited() const { return m_process.get(); }
+
+  // Asks for the command, and everything it started, to be killed.
+  void kill() const noexcept {
+    if (m_in_job) {
+      TerminateJobObject(m_job.get(), 1);
     } else {
-      TerminateProcess(process, 1);
+      TerminateProcess(m_process.get(), 1);
     }
   }
+
+  // Kills the command and everything it started, then waits through @a io
+  // until every one of them has exited - or, for any it cannot open, until a
+  // short deadline passes.
+  exec::task<void> terminate(IoContext& io) {
+    const auto wait = [&io](HANDLE handle) {
+      return stdexec::write_env(io.async_wait(handle),
+                                stdexec::prop{stdexec::get_stop_token,
+                                              stdexec::never_stop_token{}}) |
+             stdexec::upon_error([](std::error_code) noexcept {});
+    };
+    if (!m_in_job || !TerminateJobObject(m_job.get(), 1)) {
+      // The tree's termination cannot be requested, so nothing in it will
+      // exit for us to wait on: end cmd.exe, and wait for that alone.
+      TerminateProcess(m_process.get(), 1);
+      co_await wait(m_process.get());
+      co_return;
+    }
+    // Termination takes effect asynchronously, so wait on whatever is still
+    // in the job until nothing is. A process there that cannot be opened -
+    // its access denies it - cannot be waited on, so it is polled for, but
+    // only until the deadline, so that one that also never exits cannot hold
+    // the run forever.
+    constexpr auto k_unopenable_deadline = std::chrono::seconds(2);
+    const auto deadline =
+        std::chrono::steady_clock::now() + k_unopenable_deadline;
+    while (active_processes() != 0) {
+      const std::vector<HANDLE> left = open_processes_left();
+      if (left.empty()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+          co_return;  // Requested, not confirmed.
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+      for (const HANDLE handle : left) {
+        co_await wait(handle);
+      }
+      for (const HANDLE handle : left) {
+        CloseHandle(handle);
+      }
+    }
+  }
+};
+
+// Kills @a child on stop.
+struct Kill {
+  const ChildProcess* child;
+
+  void operator()() const noexcept { child->kill(); }
 };
 
 }  // namespace
@@ -382,6 +609,12 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
         std::make_error_code(std::errc::operation_canceled));
   }
 
+  std::expected<std::unique_ptr<TracingSession>, std::error_code> tracing =
+      TracingSession::prepare(working_directory);
+  if (!tracing.has_value()) {
+    co_return std::unexpected(tracing.error());
+  }
+
   ScopedHandle read_end(nullptr);
   ScopedHandle write_end(nullptr);
   if (const std::error_code error = make_output_pipe(read_end, write_end)) {
@@ -392,119 +625,63 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     co_return std::unexpected(last_error_code());
   }
 
-  // CreateProcessW takes a mutable command-line buffer, so this must be a
-  // writable std::wstring rather than a literal.
-  std::expected<std::wstring, std::error_code> wcommand =
+  const std::expected<std::wstring, std::error_code> wcommand =
       StringUtil::to_wide(command);
-  if (!wcommand) {
+  if (!wcommand.has_value()) {
     co_return std::unexpected(wcommand.error());
   }
+  // CreateProcessW takes a mutable command line.
+  std::wstring command_line = L"cmd.exe /c " + *wcommand;
 
-  // Launch with the hook DLL injected to trace the command's reads. Both the
-  // DLL and a private log file are required; failing to find either fails the
-  // run.
-  const std::expected<std::filesystem::path, std::error_code> hook =
-      find_hook_dll();
-  if (!hook.has_value()) {
-    co_return std::unexpected(hook.error());
-  }
-  const std::expected<std::filesystem::path, std::error_code> trace_log =
-      make_trace_log();
-  if (!trace_log.has_value()) {
-    co_return std::unexpected(trace_log.error());
-  }
-  const ScopedFile log_cleanup(*trace_log);
-
-  // The hook reports each read in canonical form, so hand it the root in the
-  // same form or its under-the-root filter drops everything on a caller whose
-  // working directory carries an 8.3 short component.
-  std::wstring environment = child_environment_with_trace(
-      trace_log->wstring(), canonical_directory(working_directory).wstring());
-
-  // Create the job before the suspended launch so the child is enrolled before
-  // it can spawn anything. Destroyed last, so closing it kills any process
-  // still running; nullptr falls back to ending cmd.exe alone.
-  const ScopedHandle job(create_kill_on_close_job());
-
-  std::wstring command_line = L"cmd.exe /c " + wcommand.value();
-  STARTUPINFOW startup = {
-      .cb = sizeof(startup),
-      .dwFlags = STARTF_USESTDHANDLES,
-      .hStdInput = GetStdHandle(STD_INPUT_HANDLE),
-      .hStdOutput = write_end.get(),
-      .hStdError = GetStdHandle(STD_ERROR_HANDLE),
-  };
-
-  // Suspended, so the child is enrolled in the job before its code runs.
-  // Detours injects into the suspended process and, given CREATE_SUSPENDED,
-  // leaves the resume to us.
-  const DWORD creation_flags =
-      CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
-
-  PROCESS_INFORMATION process{};
-  // The hook is in place before the command's code runs, and re-injects into
-  // any child the command spawns.
-  const std::string hook_utf8 = StringUtil::to_utf8(hook->wstring());
-  const BOOL created = DetourCreateProcessWithDllExW(
-      nullptr, command_line.data(), nullptr, nullptr, TRUE, creation_flags,
-      environment.data(), working_directory.c_str(), &startup, &process,
-      hook_utf8.c_str(), nullptr);
-  const std::error_code create_error =
-      created ? std::error_code{} : last_error_code();
+  std::expected<std::unique_ptr<ChildProcess>, std::error_code> child =
+      ChildProcess::launch(command_line, **tracing, working_directory,
+                           write_end.get());
   // Close our copy of the command's end, so only it can write to the pipe and
   // the pipe closes once it has gone.
   write_end.reset(nullptr);
-  if (!created) {
-    co_return std::unexpected(create_error);
+  if (!child.has_value()) {
+    co_return std::unexpected(child.error());
   }
 
-  const ScopedHandle thread(process.hThread);
-  const ScopedHandle handle(process.hProcess);
-
-  // Enrol in the job, then run. If enrolment fails the command still runs, and
-  // a stop falls back to terminating cmd.exe alone.
-  const bool in_job = job.get() != nullptr &&
-                      AssignProcessToJobObject(job.get(), process.hProcess);
-  ResumeThread(process.hThread);
-
-  // Declared after the handles so it can no longer fire once they close,
-  // avoiding a reused-id race. Runs at once if stop is already set.
-  const stdexec::inplace_stop_callback<Terminate> on_stop(
-      stop,
-      Terminate{
-          .process = process.hProcess, .job = job.get(), .in_job = in_job});
-
-  // Collect output until the direct child exits. Waiting on the process
-  // rather than on the pipe closing is what keeps a grandchild that inherited
+  // Collect output until the command exits. Waiting on the process rather
+  // than on the pipe closing is what keeps anything it started that inherited
   // the pipe from wedging us, and reading as it arrives keeps a full pipe from
   // blocking the command.
   std::error_code wait_error;
-  const auto failed = [&wait_error](std::error_code error) noexcept {
-    wait_error = error;
-    return -1;
-  };
-  constexpr int k_output = 0;
-  constexpr int k_exited = 1;
-  reader.pump();
-  while (true) {
-    auto exited = io.async_wait(process.hProcess) |
-                  stdexec::then([]() noexcept { return k_exited; }) |
-                  stdexec::upon_error(failed);
-    const int which =
-        reader.open()
-            ? co_await exec::when_any(
-                  io.async_wait(reader.event()) | stdexec::then([]() noexcept {
-                    return k_output;
-                  }) | stdexec::upon_error(failed),
-                  exited)
-            : co_await exited;
-    if (which != k_output) {
-      break;
-    }
+  {
+    const stdexec::inplace_stop_callback<Kill> on_stop(stop,
+                                                       Kill{child->get()});
+    const auto failed = [&wait_error](std::error_code error) noexcept {
+      wait_error = error;
+      return -1;
+    };
+    constexpr int k_output = 0;
+    constexpr int k_exited = 1;
     reader.pump();
+    while (true) {
+      auto exited = io.async_wait((*child)->exited()) |
+                    stdexec::then([]() noexcept { return k_exited; }) |
+                    stdexec::upon_error(failed);
+      const int which =
+          reader.open()
+              ? co_await exec::when_any(
+                    io.async_wait(reader.event()) |
+                        stdexec::then([]() noexcept { return k_output; }) |
+                        stdexec::upon_error(failed),
+                    exited)
+              : co_await exited;
+      if (which != k_output) {
+        break;
+      }
+      reader.pump();
+    }
   }
-  // Whatever the child wrote just before it exited.
+  // Whatever the command wrote just before it exited.
   reader.finish();
+
+  // Everything the command started has gone too, and so has finished writing
+  // to the trace log, once this returns.
+  co_await (*child)->terminate(io);
 
   if (wait_error) {
     co_return std::unexpected(wait_error);
@@ -513,10 +690,13 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     co_return std::unexpected(
         std::make_error_code(std::errc::operation_canceled));
   }
-  // cmd.exe has waited for the command, so every traced process' synchronous
-  // appends are already on disk.
+  std::expected<std::vector<std::filesystem::path>, std::error_code> inputs =
+      (*tracing)->take_inputs();
+  if (!inputs.has_value()) {
+    co_return std::unexpected(inputs.error());
+  }
   co_return Output{.standard_output = std::move(reader).take(),
-                   .inputs = read_trace_log(*trace_log)};
+                   .inputs = std::move(*inputs)};
 }
 
 namespace {

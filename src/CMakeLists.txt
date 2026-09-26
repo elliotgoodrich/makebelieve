@@ -41,6 +41,7 @@ add_library(makebelieve_core STATIC
   iocontext-${MAKEBELIEVE_PLATFORM}.cpp
   manifest.cpp
   processutil-${MAKEBELIEVE_PLATFORM}.cpp
+  processutil-common.cpp
   realdirectorytree-${MAKEBELIEVE_PLATFORM}.cpp
   shellrunner.cpp
   stringutil.cpp
@@ -153,6 +154,7 @@ if(BUILD_TESTING)
   makebelieve_add_test(manifest)
   makebelieve_add_test(processutil)
   makebelieve_add_test(realdirectorytree)
+  makebelieve_add_test(shellrunner)
   makebelieve_add_test(tracer)
   makebelieve_add_test(inmemorydirectorytree)
   makebelieve_add_test(buildqueue)

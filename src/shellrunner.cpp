@@ -26,10 +26,6 @@ namespace makebelieve {
 
 namespace {
 
-using Command = BuildDirectoryTree::Command;
-using BuildOutput = BuildDirectoryTree::BuildOutput;
-using BuildResult = BuildDirectoryTree::BuildResult;
-
 // The placeholder in a command that is replaced with the output's path.
 constexpr std::string_view k_out_placeholder = "%out";
 
@@ -147,14 +143,15 @@ std::vector<std::filesystem::path> relativize(
   return result;
 }
 
-// Carries out @a command as `ShellRunner` describes,
-// waiting on a command it runs through @a io. @a stop cancels a command still
-// running.
-exec::task<BuildResult> run_shell_command(
+}  // namespace
+
+exec::task<BuildResult> detail::run_shell_command(
     IoContext& io,
     std::filesystem::path working_directory,
     Command command,
     stdexec::inplace_stop_token stop) {
+  MB_TRACE_THREAD_NAME("build worker");
+
   // A `copy` rule names a file rather than a command: nothing is run, the
   // output is that file's bytes, and the file itself is the build's one input -
   // so a copy tracks its source even on a platform where command tracing is
@@ -196,32 +193,6 @@ exec::task<BuildResult> run_shell_command(
       .bytes = capture ? std::move(result->standard_output)
                        : read_file(out_path).value_or(std::string{}),
       .inputs = relativize(result->inputs, working_directory)};
-}
-
-}  // namespace
-
-ShellRunner::ShellRunner(std::filesystem::path working_directory,
-                         IoContext& io,
-                         exec::static_thread_pool::scheduler workers)
-    : m_working_directory(std::move(working_directory)),
-      m_io(&io),
-      m_workers(workers) {}
-
-BuildDirectoryTree::BuildSender ShellRunner::operator()(Command command) const {
-  // Started on the pool, where the task then resumes after each wait, so its
-  // synchronous steps never run on the IoContext's thread. Spelled as
-  // schedule-then-let_value because stdexec cannot type-erase a starts_on onto
-  // a static_thread_pool.
-  return stdexec::schedule(m_workers) |
-         stdexec::let_value([io = m_io, working_directory = m_working_directory,
-                             command = std::move(command)]() mutable {
-           return stdexec::read_env(stdexec::get_stop_token) |
-                  stdexec::let_value([&](stdexec::inplace_stop_token stop) {
-                    MB_TRACE_THREAD_NAME("build worker");
-                    return run_shell_command(*io, working_directory,
-                                             std::move(command), stop);
-                  });
-         });
 }
 
 }  // namespace makebelieve

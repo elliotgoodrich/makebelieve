@@ -10,6 +10,7 @@
 #include <chrono>
 #include <concepts>
 #include <condition_variable>
+#include <exception>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -124,6 +125,43 @@ TEST(BuildQueue, CompletesAsTheWorkDoes) {
                     ex::upon_stopped([]() noexcept { return true; }));
   ASSERT_TRUE(stopped.has_value());
   EXPECT_TRUE(std::get<0>(*stopped));
+}
+
+// A slot comes back when the work completes, not when its operation state is
+// destroyed: within when_all the first piece's state lives until the second
+// has completed, which needs that slot.
+TEST(BuildQueue, ASlotComesBackWhenTheWorkCompletes) {
+  exec::static_thread_pool pool(1);
+  BuildQueue queue(1, pool.get_scheduler());
+  const auto both = ex::sync_wait(
+      ex::when_all(queue.schedule(ex::just(1)), queue.schedule(ex::just(2))));
+  ASSERT_TRUE(both.has_value());
+  EXPECT_EQ(*both, std::tuple(1, 2));
+}
+
+// Records how a piece of work completed, leaving its operation state alive.
+struct Recorder {
+  using receiver_concept = ex::receiver_t;
+  bool* completed;
+  void set_value() noexcept { *completed = true; }
+  void set_stopped() noexcept { *completed = true; }
+  void set_error(std::exception_ptr) noexcept { *completed = true; }
+};
+
+TEST(BuildQueue, ACompletedOperationKeptAliveHoldsNoSlot) {
+  exec::static_thread_pool pool(1);
+  BuildQueue queue(1, pool.get_scheduler());
+
+  bool first = false;
+  auto kept = ex::connect(queue.schedule(ex::just()), Recorder{&first});
+  ex::start(kept);
+  ASSERT_TRUE(first);
+
+  // The slot is free again, so this starts, and completes, inline.
+  bool second = false;
+  auto next = ex::connect(queue.schedule(ex::just()), Recorder{&second});
+  ex::start(next);
+  EXPECT_TRUE(second);
 }
 
 TEST(BuildQueue, RunsNoMoreThanItsLimitAtOnce) {

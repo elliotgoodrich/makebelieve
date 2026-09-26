@@ -94,7 +94,7 @@ int mount(const char* mountpoint_arg) {
   // Presents the manifest's declared outputs, building each lazily.
   const BuildDirectoryTree build_tree(
       tree,
-      [&run, &builds](BuildDirectoryTree::Command command) {
+      [&run, &builds](Command command) {
         return builds.schedule(run(std::move(command)));
       },
       [](const std::string& problems) {

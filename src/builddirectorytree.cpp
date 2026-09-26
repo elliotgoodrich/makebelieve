@@ -107,12 +107,6 @@ void remove_with_empty_parents(InMemoryDirectoryTree& tree,
   }
 }
 
-// One output, its action and that action's argument, as the runner receives it.
-using Command = BuildDirectoryTree::Command;
-
-using BuildOutput = BuildDirectoryTree::BuildOutput;
-using BuildResult = BuildDirectoryTree::BuildResult;
-
 // The name of @a action as a manifest spells it.
 std::string_view to_string(Manifest::Action action) {
   switch (action) {

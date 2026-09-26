@@ -59,6 +59,7 @@ class ProcessUtil : public ::testing::Test {
   }
 
   void TearDown() override {
+    makebelieve::ProcessUtilTestUtil::reset();
     std::error_code ec;
     std::filesystem::remove_all(work, ec);
   }
@@ -246,5 +247,85 @@ TEST_F(ProcessUtil, TerminatesARunningCommandWhenStopIsRequested) {
   // Returned promptly on cancellation rather than waiting out the full sleep.
   EXPECT_LT(elapsed, 10s);
 }
+
+// --- When a command cannot be traced ---------------------------------------
+//
+// Tracing is required, so each of these fails the run - and must leave nothing
+// behind: no command still running, no callback outliving what it uses (which
+// the sanitizer builds would catch), and nothing to stop the next run working.
+
+using Failure = makebelieve::ProcessUtilTestUtil::Failure;
+
+// Where a command leaves a marker if it ever runs: outside the working
+// directory, which under tracing on Linux is a read-only view.
+std::filesystem::path marker_path() {
+  return std::filesystem::temp_directory_path() /
+         ("makebelieve-marker-" +
+          std::string(
+              ::testing::UnitTest::GetInstance()->current_test_info()->name()));
+}
+
+std::string touch_command(const std::filesystem::path& path) {
+  return "cmake -E touch \"" + path.string() + "\"";
+}
+
+TEST_F(ProcessUtil, ACommandThatCannotBeTracedNeverRuns) {
+  const std::filesystem::path marker = marker_path();
+  std::error_code ec;
+  std::filesystem::remove(marker, ec);
+  makebelieve::ProcessUtilTestUtil::fail_next(
+      Failure::tracing_setup,
+      std::make_error_code(std::errc::permission_denied));
+
+  const makebelieve::ProcessUtil::Result result = run(touch_command(marker));
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), std::errc::permission_denied);
+  EXPECT_FALSE(std::filesystem::exists(marker));
+
+  // Nothing is left behind to trouble the next run.
+  EXPECT_TRUE(run(touch_command(marker)).has_value());
+  EXPECT_TRUE(std::filesystem::exists(marker));
+  std::filesystem::remove(marker, ec);
+}
+
+#ifdef __linux__
+// Servicing the mount failing loses reads, so the build fails - and the
+// command, which would otherwise block on its unserved mount for ever, is
+// ended rather than waited out.
+TEST_F(ProcessUtil, ATracingFailureWhileRunningFailsTheRunAndEndsTheCommand) {
+  write_input("input.txt", "hello world");
+  makebelieve::ProcessUtilTestUtil::fail_next(
+      Failure::tracing_service, std::make_error_code(std::errc::io_error));
+
+  const auto start = std::chrono::steady_clock::now();
+  const makebelieve::ProcessUtil::Result result =
+      run(print_file_command("input.txt") + " && " + sleep_command(20));
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), std::errc::io_error);
+  EXPECT_LT(elapsed, 10s);
+
+  EXPECT_TRUE(run(print_file_command("input.txt")).has_value());
+}
+#endif
+
+#ifdef _WIN32
+// A trace log that cannot be read back is an error, never an empty list of
+// dependencies.
+TEST_F(ProcessUtil, ATraceLogThatCannotBeReadFailsTheRun) {
+  write_input("input.txt", "hello world");
+  makebelieve::ProcessUtilTestUtil::fail_next(Failure::trace_log);
+
+  const makebelieve::ProcessUtil::Result result =
+      run(print_file_command("input.txt"));
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), std::errc::no_such_file_or_directory);
+
+  EXPECT_TRUE(run(print_file_command("input.txt")).has_value());
+}
+#endif
 
 }  // namespace
