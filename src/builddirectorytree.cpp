@@ -16,20 +16,15 @@
 #include <expected>
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <functional>
-#include <ios>
 #include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
-#include <random>
 #include <set>
-#include <sstream>
 #include <stdexcept>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -45,95 +40,11 @@ namespace {
 // The default entry point.
 constexpr std::string_view k_manifest_name = "build.makebelieve";
 
-// The placeholder in a command that is replaced with the output's path.
-constexpr std::string_view k_out_placeholder = "%out";
-
 // The content an output holds before it has ever been built: a single null
 // byte. Viewing a named char rather than a string literal keeps the length and
 // the storage in step (a `string_view("", 1)` reads as out-of-bounds).
 constexpr char k_null_byte = '\0';
 constexpr std::string_view k_placeholder_content(&k_null_byte, 1);
-
-// Removes a directory and everything beneath it on destruction, so a command's
-// scratch space does not outlive the build it was created for.
-class TempDirectory {
-  std::filesystem::path m_path;
-
- public:
-  explicit TempDirectory(std::filesystem::path path)
-      : m_path(std::move(path)) {}
-
-  ~TempDirectory() {
-    std::error_code ec;
-    std::filesystem::remove_all(m_path, ec);
-  }
-
-  TempDirectory(const TempDirectory&) = delete;
-  TempDirectory& operator=(const TempDirectory&) = delete;
-  TempDirectory(TempDirectory&&) = delete;
-  TempDirectory& operator=(TempDirectory&&) = delete;
-
-  [[nodiscard]] const std::filesystem::path& path() const { return m_path; }
-};
-
-std::filesystem::path make_temp_directory() {
-  std::random_device device;
-  std::uniform_int_distribution<unsigned> digit(0, 0xffffffU);
-  const std::filesystem::path base = std::filesystem::temp_directory_path();
-  while (true) {
-    const std::filesystem::path candidate =
-        base / ("makebelieve-build-" + std::to_string(digit(device)));
-    std::error_code ec;
-    if (std::filesystem::create_directory(candidate, ec)) {
-      return candidate;
-    }
-  }
-}
-
-// Replaces every `%out` in @a command with @a out_path, quoted so paths
-// containing spaces survive the shell.
-std::string substitute_out(std::string_view command,
-                           const std::filesystem::path& out_path) {
-  const std::string replacement = "\"" + out_path.string() + "\"";
-  std::string result;
-  std::size_t pos = 0;
-  while (true) {
-    const std::size_t found = command.find(k_out_placeholder, pos);
-    if (found == std::string_view::npos) {
-      result += command.substr(pos);
-      return result;
-    }
-    result += command.substr(pos, found - pos);
-    result += replacement;
-    pos = found + k_out_placeholder.size();
-  }
-}
-
-// Reads the whole of @a path, or the error that stopped it. ifstream does not
-// say why it would not open, so the filesystem is asked instead.
-std::expected<std::string, std::error_code> read_file(
-    const std::filesystem::path& path) {
-  const std::ifstream stream(path, std::ios::binary);
-  if (!stream) {
-    std::error_code ec;
-    const std::filesystem::file_status status =
-        std::filesystem::status(path, ec);
-    if (ec) {
-      return std::unexpected(ec);
-    }
-    if (!std::filesystem::exists(status)) {
-      return std::unexpected(
-          std::make_error_code(std::errc::no_such_file_or_directory));
-    }
-    if (std::filesystem::is_directory(status)) {
-      return std::unexpected(std::make_error_code(std::errc::is_a_directory));
-    }
-    return std::unexpected(std::make_error_code(std::errc::io_error));
-  }
-  std::ostringstream buffer;
-  buffer << stream.rdbuf();
-  return buffer.str();
-}
 
 // Reads the whole of @a path out of @a tree, or the error that stopped it.
 // read() promises only "up to size bytes" per call, so this loops until a
@@ -162,39 +73,6 @@ std::expected<std::string, std::error_code> read_all(
       return content;
     }
   }
-}
-
-// Recasts absolute traced input paths into paths relative to @a root, dropping
-// any that fall outside it.
-std::vector<std::filesystem::path> relativize(
-    const std::vector<std::filesystem::path>& inputs,
-    const std::filesystem::path& root) {
-  // relative() is lexical, so it only cancels root against an input whose
-  // leading components match exactly. Traced inputs are canonicalised and can
-  // differ in case from root as given, so canonicalise root to match.
-  std::error_code ec;
-  std::filesystem::path canonical_root =
-      std::filesystem::weakly_canonical(root, ec);
-  if (ec) {
-    canonical_root = root;
-  }
-
-  std::vector<std::filesystem::path> result;
-  result.reserve(inputs.size());
-  for (const std::filesystem::path& input : inputs) {
-    std::error_code relative_ec;
-    const std::filesystem::path relative =
-        std::filesystem::relative(input, canonical_root, relative_ec);
-    if (relative_ec || relative.empty()) {
-      continue;
-    }
-    const std::filesystem::path normal = relative.lexically_normal();
-    if (normal.begin() != normal.end() && *normal.begin() == "..") {
-      continue;  // escapes the root
-    }
-    result.push_back(normal);
-  }
-  return result;
 }
 
 // Creates every missing directory on the way to @a output's parent inside
@@ -267,67 +145,6 @@ std::error_code to_error_code(const std::exception_ptr& error) noexcept {
 // nothing is being traced.
 std::string trace_snapshot() {
   return g_tracer != nullptr ? g_tracer->snapshot() : std::string("[]\n");
-}
-
-// Carries out @a command as `BuildDirectoryTree::shell_runner` describes,
-// blocking until it is done. @a stop cancels a command still running.
-BuildResult run_shell_command(const std::filesystem::path& working_directory,
-                              const Command& command,
-                              stdexec::inplace_stop_token stop) {
-  // A `copy` rule names a file rather than a command: nothing is run, the
-  // output is that file's bytes, and the file itself is the build's one input -
-  // so a copy tracks its source even on a platform where command tracing is
-  // unavailable. The parser has already held the path to one inside the
-  // working directory.
-  if (command.action == Manifest::Action::Copy) {
-    const std::filesystem::path source = command.text;
-    std::expected<std::string, std::error_code> bytes =
-        read_file(working_directory / source);
-    if (!bytes.has_value()) {
-      return std::unexpected(bytes.error());
-    }
-    return BuildOutput{.bytes = std::move(*bytes), .inputs = {source}};
-  }
-
-  const bool capture = command.action == Manifest::Action::Capture;
-
-  // A `run` command gets a private file to write its output to - with the
-  // output's own file name, since plenty of tools (pandoc and friends) pick
-  // their format from the extension - with that path substituted in for %out.
-  // The directory is fresh per build, so the name cannot collide. Its build
-  // output is whatever it left in that file - not ProcessUtil's captured
-  // stdout, which a `> %out` rule leaves empty. A `capture` command has no
-  // output file: its stdout is the output.
-  std::optional<TempDirectory> scratch;
-  std::filesystem::path out_path;
-  if (!capture) {
-    scratch.emplace(make_temp_directory());
-    out_path = scratch->path() / command.output.filename();
-  }
-
-  // ProcessUtil is cancelled through a std::stop_token, so the build's own
-  // cancellation is forwarded to one.
-  std::stop_source cancel;
-  const auto request_cancel = [&cancel]() noexcept { cancel.request_stop(); };
-  const stdexec::inplace_stop_callback<decltype(request_cancel)> forward(
-      stop, request_cancel);
-
-  BuildResult built =
-      std::unexpected(std::make_error_code(std::errc::io_error));
-  ProcessUtil::run(
-      working_directory,
-      capture ? command.text : substitute_out(command.text, out_path),
-      cancel.get_token(), [&](ProcessUtil::Result result) {
-        if (!result.has_value()) {
-          built = std::unexpected(result.error());
-          return;
-        }
-        built = BuildOutput{
-            .bytes = capture ? std::move(result->standard_output)
-                             : read_file(out_path).value_or(std::string{}),
-            .inputs = relativize(result->inputs, working_directory)};
-      });
-  return built;
 }
 
 // Reads the rules of the manifest in @a source, mapping each output to its
@@ -927,26 +744,6 @@ BuildDirectoryTree::BuildDirectoryTree(const DirectoryTree& source,
                                     std::move(on_manifest_error))) {}
 
 BuildDirectoryTree::~BuildDirectoryTree() = default;
-
-BuildDirectoryTree::CommandRunner BuildDirectoryTree::shell_runner(
-    std::filesystem::path working_directory,
-    exec::static_thread_pool::scheduler scheduler) {
-  return [working_directory = std::move(working_directory),
-          scheduler](Command command) -> BuildSender {
-    // Spelled as schedule-then-let_value because stdexec cannot type-erase a
-    // starts_on (or continues_on) onto a static_thread_pool.
-    return stdexec::schedule(scheduler) |
-           stdexec::let_value(
-               [working_directory, command = std::move(command)]() {
-                 return stdexec::read_env(stdexec::get_stop_token) |
-                        stdexec::then([&](stdexec::inplace_stop_token stop) {
-                          MB_TRACE_THREAD_NAME("build worker");
-                          return run_shell_command(working_directory, command,
-                                                   stop);
-                        });
-               });
-  };
-}
 
 std::expected<EntryInfo, std::error_code> BuildDirectoryTree::status(
     const std::filesystem::path& path) const {

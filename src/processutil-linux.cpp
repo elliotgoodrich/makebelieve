@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 #include "processutil.hpp"
 
+#include <exec/task.hpp>
+#include <exec/when_any.hpp>
+#include <stdexec/execution.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -21,7 +25,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -29,11 +32,11 @@
 #include <fuse_lowlevel.h>
 
 #include <fcntl.h>
-#include <poll.h>
 #include <sched.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -419,65 +422,102 @@ struct Supervision {
       false;  // true if it was terminated because stop was requested
 };
 
-// Drains @a child's stdout from @a read_fd until it exits, terminating its
-// process group if @a stop is requested. Takes ownership of @a read_fd and
-// closes it. @a child must lead its own process group.
-// NOLINTBEGIN(bugprone-easily-swappable-parameters)
-Supervision supervise(pid_t child, int read_fd, const std::stop_token& stop) {
-  // NOLINTEND(bugprone-easily-swappable-parameters)
-  // Read without blocking so a grandchild that inherited the pipe cannot keep
-  // us waiting once our direct child has exited.
-  ::fcntl(read_fd, F_SETFL, ::fcntl(read_fd, F_GETFL) | O_NONBLOCK);
+// Kills the process group @a child leads, and @a child itself.
+struct Kill {
+  pid_t child;
 
-  // Terminate the whole command group on stop. The callback runs synchronously
-  // from the constructor if @a stop is already requested.
-  const std::stop_callback on_stop(stop, [child] {
+  void operator()() const noexcept {
     ::kill(-child, SIGKILL);
     ::kill(child, SIGKILL);
-  });
+  }
+};
 
-  std::string output;
+// Reaps @a child, which has exited or is about to.
+void reap(pid_t child) {
+  int status = 0;
+  while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+  }
+}
+
+// Collects @a child's stdout from @a read_fd until it exits, then reaps it,
+// terminating its process group if @a stop is requested. Waits on both
+// through @a io. @a child must lead its own process group.
+exec::task<Supervision> supervise(IoContext& io,
+                                  pid_t child,
+                                  UniqueFd read_fd,
+                                  stdexec::inplace_stop_token stop) {
+  Supervision result;
+
+  // Readable once the child has exited.
+  const UniqueFd exited(static_cast<int>(::syscall(SYS_pidfd_open, child, 0)));
+  if (!exited) {
+    result.error = last_error_code();
+    Kill{child}();
+    reap(child);
+    co_return result;
+  }
+
+  // Terminate the whole command group on stop. The callback runs at once if
+  // @a stop is already requested.
+  const stdexec::inplace_stop_callback<Kill> on_stop(stop, Kill{child});
+
+  // Non-blocking, so draining stops at what is there now.
+  ::fcntl(read_fd.get(), F_SETFL, ::fcntl(read_fd.get(), F_GETFL) | O_NONBLOCK);
   std::array<char, 4096> buffer{};
-  const auto drain = [&] {
+  // Reads what the pipe holds now; false once it has reached end of file.
+  const auto drain = [&]() {
     while (true) {
-      const ssize_t count = ::read(read_fd, buffer.data(), buffer.size());
-      if (count <= 0) {
-        return;  // No data available right now, or end of file.
+      const ssize_t count = ::read(read_fd.get(), buffer.data(), buffer.size());
+      if (count > 0) {
+        result.output.append(buffer.data(), static_cast<std::size_t>(count));
+      } else if (count == 0) {
+        return false;
+      } else if (errno != EINTR) {
+        return errno == EAGAIN;
       }
-      output.append(buffer.data(), static_cast<std::size_t>(count));
     }
   };
 
-  // Drain the pipe until the direct child exits. Waiting on the child rather
-  // than on pipe end-of-file is what keeps an inherited-pipe grandchild from
-  // wedging us, and draining as we go keeps a full pipe from blocking writes.
+  // Collect output until the direct child exits. Waiting on the child rather
+  // than on the pipe closing is what keeps a grandchild that inherited the
+  // pipe from wedging us, and reading as it arrives keeps a full pipe from
+  // blocking the command.
   std::error_code wait_error;
+  const auto failed = [&wait_error](std::error_code error) noexcept {
+    wait_error = error;
+    return -1;
+  };
+  constexpr int k_output = 0;
+  constexpr int k_exited = 1;
+  bool open = true;
   while (true) {
-    pollfd descriptor{.fd = read_fd, .events = POLLIN, .revents = 0};
-    ::poll(&descriptor, 1,
-           100);  // Wake on data or hangup, or re-check at 100ms.
-    drain();
-
-    int status = 0;
-    const pid_t reaped = ::waitpid(child, &status, WNOHANG);
-    if (reaped == child) {
+    auto child_exited = io.async_wait(exited.get()) |
+                        stdexec::then([]() noexcept { return k_exited; }) |
+                        stdexec::upon_error(failed);
+    const int which =
+        open ? co_await exec::when_any(
+                   io.async_wait(read_fd.get()) | stdexec::then([]() noexcept {
+                     return k_output;
+                   }) | stdexec::upon_error(failed),
+                   child_exited)
+             : co_await child_exited;
+    if (which != k_output) {
       break;
     }
-    if (reaped < 0 && errno != EINTR) {
-      wait_error = last_error_code();
-      break;
-    }
+    open = drain();
   }
-  drain();  // Whatever the child buffered just before it exited.
-  ::close(read_fd);
 
-  Supervision result{.output = std::move(output)};
   if (wait_error) {
-    result.error = wait_error;
-  } else if (stop.stop_requested()) {
-    result.canceled = true;
+    Kill{child}();
   }
-  return result;
+  reap(child);
+  if (open) {
+    drain();  // Whatever the child wrote just before it exited.
+  }
+
+  result.error = wait_error;
+  result.canceled = !wait_error && stop.stop_requested();
+  co_return result;
 }
 
 // Turns a Supervision into the reported Result. @a inputs is empty on a
@@ -494,23 +534,59 @@ ProcessUtil::Result to_result(Supervision supervision,
                              .inputs = std::move(inputs)};
 }
 
+// Services a tracing session's requests from its non-blocking descriptor.
+class Servicing {
+  fuse_session* m_session;
+  fuse_buf m_buffer{};
+
+ public:
+  explicit Servicing(fuse_session* session) : m_session(session) {}
+
+  // Allocated by libfuse on the first receive.
+  ~Servicing() { std::free(m_buffer.mem); }
+
+  Servicing(const Servicing&) = delete;
+  Servicing& operator=(const Servicing&) = delete;
+  Servicing(Servicing&&) = delete;
+  Servicing& operator=(Servicing&&) = delete;
+
+  // Handles every request waiting; false once the session has ended.
+  bool process() noexcept {
+    while (!fuse_session_exited(m_session)) {
+      const int received = fuse_session_receive_buf(m_session, &m_buffer);
+      if (received == -EAGAIN) {
+        return true;
+      }
+      if (received == -EINTR) {
+        continue;
+      }
+      if (received <= 0) {
+        return false;
+      }
+      fuse_session_process_buf(m_session, &m_buffer);
+    }
+    return false;
+  }
+};
+
 // Runs @a command under a FUSE passthrough on @a root, returning the absolute
 // paths it read under @a root. std::nullopt means the tracer could not be set
 // up (e.g. no user namespaces), so the caller falls back to an untraced run.
-std::optional<ProcessUtil::Result> run_with_tracing(
-    const std::filesystem::path& root,
-    const std::string& command,
-    const std::stop_token& stop) {
+exec::task<std::optional<ProcessUtil::Result>> run_with_tracing(
+    IoContext& io,
+    std::filesystem::path root,
+    std::string command,
+    stdexec::inplace_stop_token stop) {
   std::array<int, 2> out_pipe{-1, -1};
   if (::pipe(out_pipe.data()) != 0) {
-    return std::nullopt;
+    co_return std::nullopt;
   }
   UniqueFd out_read(out_pipe[0]);
   UniqueFd out_write(out_pipe[1]);
 
   std::array<int, 2> sv{-1, -1};
   if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv.data()) != 0) {
-    return std::nullopt;
+    co_return std::nullopt;
   }
   UniqueFd parent_socket(sv[0]);
   UniqueFd child_socket(sv[1]);
@@ -522,7 +598,7 @@ std::optional<ProcessUtil::Result> run_with_tracing(
 
   const pid_t pid = ::fork();
   if (pid < 0) {
-    return std::nullopt;
+    co_return std::nullopt;
   }
   if (pid == 0) {
     parent_socket.reset();
@@ -535,11 +611,9 @@ std::optional<ProcessUtil::Result> run_with_tracing(
 
   // Reaps the child after a setup failure: it is exiting, or blocked on the ack
   // that will now never come, so a kill unblocks it either way.
-  const auto reap = [pid] {
-    ::kill(-pid, SIGKILL);
-    ::kill(pid, SIGKILL);
-    int status = 0;
-    ::waitpid(pid, &status, 0);
+  const auto give_up = [pid] {
+    Kill{pid}();
+    reap(pid);
   };
 
   // Keep parent_socket open until the ack is sent: the child blocks reading it,
@@ -547,8 +621,8 @@ std::optional<ProcessUtil::Result> run_with_tracing(
   UniqueFd fuse_fd(recv_result(parent_socket.get()));
   if (!fuse_fd) {
     parent_socket.reset();
-    reap();
-    return std::nullopt;  // Child's namespace/mount setup failed.
+    give_up();
+    co_return std::nullopt;  // Child's namespace/mount setup failed.
   }
 
   // The parent's own passthrough root, resolved in the parent's namespace and
@@ -556,8 +630,8 @@ std::optional<ProcessUtil::Result> run_with_tracing(
   const int root_fd = ::open(root.c_str(), O_PATH | O_DIRECTORY);
   if (root_fd < 0) {
     parent_socket.reset();
-    reap();
-    return std::nullopt;
+    give_up();
+    co_return std::nullopt;
   }
   Tracer tracer(root_fd, root);
 
@@ -569,20 +643,32 @@ std::optional<ProcessUtil::Result> run_with_tracing(
       fuse_session_new(&args, &k_ops, sizeof(fuse_lowlevel_ops), &tracer);
   if (se == nullptr) {
     parent_socket.reset();
-    reap();
-    return std::nullopt;
+    give_up();
+    co_return std::nullopt;
   }
   const std::unique_ptr session_guard =
       make_scope_ptr(se, &fuse_session_destroy);
 
-  if (fuse_session_custom_io(se, &k_io, fuse_fd.get()) != 0) {
+  // Non-blocking, so servicing it stops at the requests there are now.
+  const int fuse_descriptor = fuse_fd.get();
+  ::fcntl(fuse_descriptor, F_SETFL,
+          ::fcntl(fuse_descriptor, F_GETFL) | O_NONBLOCK);
+  if (fuse_session_custom_io(se, &k_io, fuse_descriptor) != 0) {
     parent_socket.reset();
-    reap();
-    return std::nullopt;
+    give_up();
+    co_return std::nullopt;
   }
   fuse_fd.release();  // Owned by `se` on success.
 
-  std::thread servicing([se] { fuse_session_loop(se); });
+  // Serviced on the IoContext's thread whenever a request is waiting. The
+  // callbacks are brief - openat, fstat, pread on the real files.
+  Servicing servicing(se);
+  stdexec::counting_scope serving;
+  io.spawn_watch(fuse_descriptor, serving, [&servicing, &serving]() noexcept {
+    if (!servicing.process()) {
+      serving.request_stop();  // Ended: the descriptor stays readable.
+    }
+  });
 
   // Tell the child it is now safe to resolve paths through the mount.
   const char ack = 1;
@@ -590,14 +676,16 @@ std::optional<ProcessUtil::Result> run_with_tracing(
   static_cast<void>(acked);
   parent_socket.reset();
 
-  Supervision supervision = supervise(pid, out_read.release(), stop);
+  Supervision supervision =
+      co_await supervise(io, pid, std::move(out_read), stop);
 
-  // The mount tears down once every process in the namespace has exited, which
-  // unblocks the servicing thread. Kill any straggler so that happens even if a
-  // descendant outlived the shell.
+  // The mount tears down once every process in the namespace has exited. Kill
+  // any straggler so that happens even if a descendant outlived the shell, and
+  // stop servicing before the session goes.
   ::kill(-pid, SIGKILL);
-  fuse_session_exit(se);  // A no-op if the loop already returned.
-  servicing.join();
+  fuse_session_exit(se);
+  serving.request_stop();
+  co_await serving.join();
 
   std::vector<std::filesystem::path> inputs;
   if (!supervision.error && !supervision.canceled) {
@@ -605,24 +693,25 @@ std::optional<ProcessUtil::Result> run_with_tracing(
     std::ranges::sort(inputs);
     inputs.erase(std::ranges::unique(inputs).begin(), inputs.end());
   }
-  return to_result(std::move(supervision), std::move(inputs));
+  co_return to_result(std::move(supervision), std::move(inputs));
 }
 
 // Runs @a command without tracing, reporting no inputs. Used when the tracer
 // could not be set up.
-ProcessUtil::Result run_untraced(const std::filesystem::path& root,
-                                 const std::string& command,
-                                 const std::stop_token& stop) {
+exec::task<ProcessUtil::Result> run_untraced(IoContext& io,
+                                             std::filesystem::path root,
+                                             std::string command,
+                                             stdexec::inplace_stop_token stop) {
   std::array<int, 2> out_pipe{-1, -1};
   if (::pipe(out_pipe.data()) != 0) {
-    return std::unexpected(last_error_code());
+    co_return std::unexpected(last_error_code());
   }
   UniqueFd out_read(out_pipe[0]);
   UniqueFd out_write(out_pipe[1]);
 
   const pid_t pid = ::fork();
   if (pid < 0) {
-    return std::unexpected(last_error_code());
+    co_return std::unexpected(last_error_code());
   }
   if (pid == 0) {
     out_read.reset();
@@ -637,19 +726,20 @@ ProcessUtil::Result run_untraced(const std::filesystem::path& root,
   }
   out_write.reset();  // Only the child writes.
 
-  return to_result(supervise(pid, out_read.release(), stop), {});
+  co_return to_result(co_await supervise(io, pid, std::move(out_read), stop),
+                      {});
 }
 
 }  // namespace
 
-void ProcessUtil::run(const std::filesystem::path& working_directory,
-                      const std::string& command,
-                      const std::stop_token& stop,
-                      Complete on_done) {
+exec::task<ProcessUtil::Result> ProcessUtil::run_task(
+    IoContext& io,
+    std::filesystem::path working_directory,
+    std::string command,
+    stdexec::inplace_stop_token stop) {
   if (stop.stop_requested()) {
-    on_done(
-        std::unexpected(std::make_error_code(std::errc::operation_canceled)));
-    return;
+    co_return std::unexpected(
+        std::make_error_code(std::errc::operation_canceled));
   }
 
   // Canonicalize the root so the reported paths line up when the working
@@ -662,14 +752,15 @@ void ProcessUtil::run(const std::filesystem::path& working_directory,
     root = working_directory;
   }
 
-  if (std::optional<Result> traced = run_with_tracing(root, command, stop)) {
-    on_done(std::move(*traced));
-    return;
+  if (std::optional<Result> traced =
+          co_await run_with_tracing(io, root, command, stop)) {
+    co_return std::move(*traced);
   }
 
   // The tracer could not attach; run untraced, reporting no inputs (an empty
   // list is a valid best-effort result).
-  on_done(run_untraced(root, command, stop));
+  co_return co_await run_untraced(io, std::move(root), std::move(command),
+                                  stop);
 }
 
 namespace {

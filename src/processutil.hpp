@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include "iocontext.hpp"
+
+#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
+
 #include <cstdint>
 #include <expected>
 #include <filesystem>
-#include <functional>
-#include <stop_token>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace makebelieve {
@@ -33,9 +37,6 @@ struct ProcessUtil {
   /// run to completion.
   using Result = std::expected<Output, std::error_code>;
 
-  /// Reports the outcome of a single command.
-  using Complete = std::move_only_function<void(Result)>;
-
   /// This process's own id.
   [[nodiscard]] static std::uint32_t self();
 
@@ -43,22 +44,35 @@ struct ProcessUtil {
   /// where it has exited or this process may not query it.
   [[nodiscard]] static std::string name_of(std::uint32_t pid);
 
-  /// Runs @a command through the system shell with the working directory set
-  /// to @a working_directory, captures its standard output and the files it
-  /// read (see Output::inputs), and reports both through @a on_done. If @a stop
-  /// is requested a best-effort attempt is made to terminate the command.
+  /// Returns a sender that runs @a command through the system shell with the
+  /// working directory set to @a working_directory, and completes with its
+  /// standard output and the files it read (see Output::inputs) once it has
+  /// run to completion, whatever its exit status. It completes with
+  /// `std::errc::operation_canceled` if @a stop was requested, in which case
+  /// the command and everything it started are terminated first, or with the
+  /// platform error if the command could not be started or waited on.
   ///
-  /// @a on_done receives the Output once the command has run to completion
-  /// (whatever its exit status), `std::errc::operation_canceled` if it was
-  /// terminated because @a stop was requested, or the platform error if it
-  /// could not be launched or waited on. It is called exactly once,
-  /// synchronously, before this returns.
-  ///
-  /// Note this currently blocks and should be improved later on.
-  static void run(const std::filesystem::path& working_directory,
-                  const std::string& command,
-                  const std::stop_token& stop,
-                  Complete on_done);
+  /// The sender does its brief synchronous work - starting the command,
+  /// reading back what it traced - on whatever thread it is started on, and
+  /// waits on the command through @a io without holding a thread, resuming
+  /// where it started. It ignores stop requests from whatever awaits it:
+  /// cancelling is @a stop's job, so that it always completes only once the
+  /// command has gone.
+  /// @pre @a io outlives the sender's run, as does the source of @a stop.
+  [[nodiscard]] static auto run(IoContext& io,
+                                std::filesystem::path working_directory,
+                                std::string command,
+                                stdexec::inplace_stop_token stop = {}) {
+    return stdexec::write_env(
+        run_task(io, std::move(working_directory), std::move(command), stop),
+        stdexec::prop{stdexec::get_stop_token, stdexec::never_stop_token{}});
+  }
+
+ private:
+  static exec::task<Result> run_task(IoContext& io,
+                                     std::filesystem::path working_directory,
+                                     std::string command,
+                                     stdexec::inplace_stop_token stop);
 };
 
 }  // namespace makebelieve

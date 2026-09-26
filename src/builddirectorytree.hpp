@@ -5,7 +5,6 @@
 #include "manifest.hpp"
 
 #include <exec/any_sender_of.hpp>
-#include <exec/static_thread_pool.hpp>
 #include <stdexec/execution.hpp>
 
 #include <cstddef>
@@ -137,25 +136,6 @@ class BuildDirectoryTree : public DirectoryTree {
   BuildDirectoryTree& operator=(const BuildDirectoryTree&) = delete;
   BuildDirectoryTree(BuildDirectoryTree&&) = delete;
   BuildDirectoryTree& operator=(BuildDirectoryTree&&) = delete;
-
-  /// Returns a `CommandRunner` that runs a rule's command through the system
-  /// shell on @a scheduler, with the working directory set to
-  /// @a working_directory (so relative inputs resolve against it). A `Run`
-  /// command has `%out` substituted with a scratch file - with the same file
-  /// name as the output it builds, so a tool that chooses its format from the
-  /// extension needs no extra flag - and produces the bytes it wrote there; a
-  /// `Capture` command produces the bytes it wrote to standard output. A
-  /// `Copy` rule runs no command at all: it produces the bytes of the file it
-  /// names, read from under @a working_directory, and reports that file as its
-  /// one input, so a copy is tracked even where command tracing is
-  /// unavailable. Running a command blocks the @a scheduler thread it runs on
-  /// until the command exits. Traced inputs are reported relative to
-  /// @a working_directory, so for dependency tracking to line up it should be
-  /// the filesystem root that @a source mirrors.
-  /// @pre The pool behind @a scheduler outlives every tree using the runner.
-  [[nodiscard]] static CommandRunner shell_runner(
-      std::filesystem::path working_directory,
-      exec::static_thread_pool::scheduler scheduler);
 
   [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
       const std::filesystem::path& path) const override;

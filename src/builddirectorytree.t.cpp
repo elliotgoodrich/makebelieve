@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "builddirectorytree.hpp"
 
+#include "shellrunner.hpp"
+
 #include "inmemorydirectorytree.hpp"
 #include "iocontext.hpp"
 #include "realdirectorytree.hpp"
@@ -269,17 +271,21 @@ class BuildDirectoryTreeTest : public ::testing::Test {
  protected:
   InMemoryDirectoryTree source;
 
-  // Where the shell runner's commands run, and what a real source is watched
-  // through. Declared before (and so outliving) every tree a test makes.
+  // What the tests driving real commands run them with, and what a real source
+  // is watched through. Declared before (and so outliving) every tree a test
+  // makes.
   exec::static_thread_pool pool{2};
   IoContext io;
 
-  // A real, throwaway directory for the tests that drive the real shell runner.
+  // A real, throwaway directory for the tests that drive real commands.
   std::filesystem::path work =
       std::filesystem::temp_directory_path() /
       ("makebelieve-test-" +
        std::string(
            ::testing::UnitTest::GetInstance()->current_test_info()->name()));
+
+  // Runs real commands in `work`.
+  ShellRunner shell{work, io, pool.get_scheduler()};
 
   void SetUp() override {
     std::error_code ec;
@@ -611,8 +617,7 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerBuildsLazilyThroughTheShell) {
   write_input("input.txt", "hello world");
   write_manifest("@/output.txt = run cmake -E copy input.txt %out\n");
 
-  const BuildDirectoryTree tree(
-      source, BuildDirectoryTree::shell_runner(work, pool.get_scheduler()));
+  const BuildDirectoryTree tree(source, shell);
 
   EXPECT_EQ(output_size(tree, "output.txt"), 1U);  // unbuilt until opened
   EXPECT_EQ(read_output(tree, "output.txt"), "hello world");
@@ -626,8 +631,7 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerBuildsLazilyThroughTheShell) {
 TEST_F(BuildDirectoryTreeTest, ShellRunnerGivesOutTheOutputsName) {
   write_manifest("@/docs/report.pdf = run cmake -E echo %out > %out\n");
 
-  const BuildDirectoryTree tree(
-      source, BuildDirectoryTree::shell_runner(work, pool.get_scheduler()));
+  const BuildDirectoryTree tree(source, shell);
 
   const std::filesystem::path scratch =
       trimmed_path(read_output(tree, "docs/report.pdf"));
@@ -639,8 +643,7 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerGivesOutTheOutputsName) {
 TEST_F(BuildDirectoryTreeTest, ShellRunnerAddsNoExtensionToABareOutput) {
   write_manifest("@/report = run cmake -E echo %out > %out\n");
 
-  const BuildDirectoryTree tree(
-      source, BuildDirectoryTree::shell_runner(work, pool.get_scheduler()));
+  const BuildDirectoryTree tree(source, shell);
 
   const std::filesystem::path scratch =
       trimmed_path(read_output(tree, "report"));
@@ -654,8 +657,7 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerCapturesStandardOutput) {
   write_input("input.txt", "hello world");
   write_manifest("@/output.txt = capture cmake -E cat input.txt\n");
 
-  const BuildDirectoryTree tree(
-      source, BuildDirectoryTree::shell_runner(work, pool.get_scheduler()));
+  const BuildDirectoryTree tree(source, shell);
 
   EXPECT_EQ(output_size(tree, "output.txt"), 1U);  // unbuilt until opened
   EXPECT_EQ(read_output(tree, "output.txt"), "hello world");
@@ -667,8 +669,7 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerCopiesAFileWithoutAShell) {
   write_input("input.txt", "hello world");
   write_manifest("@/output.txt = copy input.txt\n");
 
-  const BuildDirectoryTree tree(
-      source, BuildDirectoryTree::shell_runner(work, pool.get_scheduler()));
+  const BuildDirectoryTree tree(source, shell);
 
   EXPECT_EQ(output_size(tree, "output.txt"), 1U);  // unbuilt until opened
   EXPECT_EQ(read_output(tree, "output.txt"), "hello world");
@@ -681,8 +682,7 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerCopiesBytesVerbatim) {
   write_input("input.bin", binary);
   write_manifest("@/output.bin = copy input.bin\n");
 
-  const BuildDirectoryTree tree(
-      source, BuildDirectoryTree::shell_runner(work, pool.get_scheduler()));
+  const BuildDirectoryTree tree(source, shell);
 
   EXPECT_EQ(read_output(tree, "output.bin"), binary);
 }
@@ -692,8 +692,7 @@ TEST_F(BuildDirectoryTreeTest, ShellRunnerCopiesBytesVerbatim) {
 TEST_F(BuildDirectoryTreeTest, ShellRunnerFailsACopyOfAMissingFile) {
   write_manifest("@/output.txt = copy missing.txt\n");
 
-  const BuildDirectoryTree tree(
-      source, BuildDirectoryTree::shell_runner(work, pool.get_scheduler()));
+  const BuildDirectoryTree tree(source, shell);
 
   const std::expected<FileInfo, std::error_code> opened =
       tree.open("output.txt");
@@ -1314,8 +1313,7 @@ TEST_F(BuildDirectoryTreeTest, RebuildsThroughRealTracingWhenAnInputChanges) {
       << "@/output.txt = run cmake -E copy input.txt %out\n";
 
   const RealDirectoryTree real_source(work, io);
-  const BuildDirectoryTree tree(real_source, BuildDirectoryTree::shell_runner(
-                                                 work, pool.get_scheduler()));
+  const BuildDirectoryTree tree(real_source, shell);
 
   // First read builds it and traces input.txt as a dependency.
   EXPECT_EQ(read_output(tree, "output.txt"), "v1");
@@ -1345,8 +1343,7 @@ TEST_F(BuildDirectoryTreeTest, RebuildsACopyWhenItsSourceChanges) {
       << "@/output.txt = copy input.txt\n";
 
   const RealDirectoryTree real_source(work, io);
-  const BuildDirectoryTree tree(real_source, BuildDirectoryTree::shell_runner(
-                                                 work, pool.get_scheduler()));
+  const BuildDirectoryTree tree(real_source, shell);
 
   EXPECT_EQ(read_output(tree, "output.txt"), "v1");
 
@@ -1373,8 +1370,7 @@ TEST_F(BuildDirectoryTreeTest, ReloadsTheManifestWhenItChangesOnDisk) {
       << "@/old.txt = run cmake -E echo_append old > %out\n";
 
   const RealDirectoryTree real_source(work, io);
-  const BuildDirectoryTree tree(real_source, BuildDirectoryTree::shell_runner(
-                                                 work, pool.get_scheduler()));
+  const BuildDirectoryTree tree(real_source, shell);
   ASSERT_TRUE(tree.status("old.txt").has_value());
 
   // The watcher arms asynchronously, so a single early write can go unseen;

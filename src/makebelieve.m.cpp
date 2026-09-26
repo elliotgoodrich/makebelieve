@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 #include "builddirectorytree.hpp"
+#include "buildqueue.hpp"
 #include "consoleinterrupthandler.hpp"
 #include "filesystemutil.hpp"
 #include "iocontext.hpp"
 #include "realdirectorytree.hpp"
+#include "shellrunner.hpp"
 #include "tracer.hpp"
 #include "unmountchannel.hpp"
 #include "virtualfilesystem.hpp"
@@ -59,11 +61,11 @@ int mount(const char* mountpoint_arg) {
   // requests - happens on this context's one thread.
   IoContext io;
 
-  // Where builds and mount notifications run: one thread per core, a build
-  // blocking its thread for as long as the command it runs. Outlives
-  // everything below, which waits out its work on the pool when it goes.
-  exec::static_thread_pool workers(
-      std::max(1U, std::thread::hardware_concurrency()));
+  // Where the brief synchronous steps of builds, and mount notifications,
+  // run. Outlives everything below, which waits out its work on the pool when
+  // it goes.
+  const unsigned cores = std::max(1U, std::thread::hardware_concurrency());
+  exec::static_thread_pool workers(cores);
 
   const ConsoleInterruptHandler interrupt(io);
 
@@ -81,11 +83,20 @@ int mount(const char* mountpoint_arg) {
 
   const RealDirectoryTree tree(source, io);
 
-  // Presents the manifest's declared outputs, building each lazily through
-  // the shell. The runner's working directory is the source root, so the
-  // inputs it traces line up with the source's own change notifications.
+  // Runs each build through the shell. Its working directory is the source
+  // root, so the inputs it traces line up with the source's own change
+  // notifications.
+  const ShellRunner run(source, io, workers.get_scheduler());
+
+  // How many builds run at once: one per core.
+  BuildQueue builds(cores, workers.get_scheduler());
+
+  // Presents the manifest's declared outputs, building each lazily.
   const BuildDirectoryTree build_tree(
-      tree, BuildDirectoryTree::shell_runner(source, workers.get_scheduler()),
+      tree,
+      [&run, &builds](BuildDirectoryTree::Command command) {
+        return builds.schedule(run(std::move(command)));
+      },
       [](const std::string& problems) {
         // Best-effort, as this runs on the IoContext's thread.
         try {

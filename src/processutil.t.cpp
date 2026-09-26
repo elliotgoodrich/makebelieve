@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 #include "processutil.hpp"
 
+#include "iocontext.hpp"
+
+#include <stdexec/execution.hpp>
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -8,11 +12,11 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 #ifdef _WIN32
@@ -64,18 +68,25 @@ class ProcessUtil : public ::testing::Test {
     stream << content;
   }
 
-  // Runs @a command and returns the single Result it reports.
+  makebelieve::IoContext io;
+
+  // Runs @a command in @a working_directory and returns what it completes
+  // with.
+  makebelieve::ProcessUtil::Result run_in(
+      const std::filesystem::path& working_directory,
+      const std::string& command,
+      stdexec::inplace_stop_token stop = {}) {
+    return std::get<0>(
+        stdexec::sync_wait(
+            makebelieve::ProcessUtil::run(io, working_directory, command, stop))
+            .value());
+  }
+
+  // Runs @a command in the working directory and returns what it completes
+  // with.
   makebelieve::ProcessUtil::Result run(const std::string& command,
-                                       std::stop_token stop = {}) {
-    makebelieve::ProcessUtil::Result result;
-    bool called = false;
-    makebelieve::ProcessUtil::run(work, command, std::move(stop),
-                                  [&](makebelieve::ProcessUtil::Result r) {
-                                    result = std::move(r);
-                                    called = true;
-                                  });
-    EXPECT_TRUE(called);  // reported synchronously, exactly once
-    return result;
+                                       stdexec::inplace_stop_token stop = {}) {
+    return run_in(work, command, stop);
   }
 };
 
@@ -131,10 +142,8 @@ TEST_F(ProcessUtil, TracesInputsWhenWorkingDirectoryIsAShortPath) {
     GTEST_SKIP() << "8.3 short names unavailable on this volume";
   }
 
-  makebelieve::ProcessUtil::Result result;
-  makebelieve::ProcessUtil::run(
-      short_work, print_file_command("input.txt"), {},
-      [&](makebelieve::ProcessUtil::Result r) { result = std::move(r); });
+  const makebelieve::ProcessUtil::Result result =
+      run_in(short_work, print_file_command("input.txt"));
 
   ASSERT_TRUE(result.has_value());
   const bool found =
@@ -165,10 +174,8 @@ TEST_F(ProcessUtil, TracesInputsWhenWorkingDirectoryIsSymlinked) {
     GTEST_SKIP() << "could not create a directory symlink on this platform";
   }
 
-  makebelieve::ProcessUtil::Result result;
-  makebelieve::ProcessUtil::run(
-      link, print_file_command("input.txt"), {},
-      [&](makebelieve::ProcessUtil::Result r) { result = std::move(r); });
+  const makebelieve::ProcessUtil::Result result =
+      run_in(link, print_file_command("input.txt"));
   std::filesystem::remove(link, ec);
 
   ASSERT_TRUE(result.has_value());
@@ -182,8 +189,35 @@ TEST_F(ProcessUtil, TracesInputsWhenWorkingDirectoryIsSymlinked) {
 }
 #endif
 
+// Waiting on a command holds no thread: ten one-second commands started from
+// one thread finish together rather than one after another.
+TEST_F(ProcessUtil, RunsCommandsAtOnceWithoutAThreadEach) {
+  const auto start = std::chrono::steady_clock::now();
+  const auto results = stdexec::sync_wait(stdexec::when_all(
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1))));
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  ASSERT_TRUE(results.has_value());
+  const int succeeded = std::apply(
+      [](const auto&... result) {
+        return (static_cast<int>(result.has_value()) + ...);
+      },
+      *results);
+  EXPECT_EQ(succeeded, 10);
+  EXPECT_LT(elapsed, 6s);
+}
+
 TEST_F(ProcessUtil, ReportsCancellationWhenStopIsAlreadyRequested) {
-  std::stop_source source;
+  stdexec::inplace_stop_source source;
   source.request_stop();
 
   const makebelieve::ProcessUtil::Result result =
@@ -195,7 +229,7 @@ TEST_F(ProcessUtil, ReportsCancellationWhenStopIsAlreadyRequested) {
 }
 
 TEST_F(ProcessUtil, TerminatesARunningCommandWhenStopIsRequested) {
-  std::stop_source source;
+  stdexec::inplace_stop_source source;
   std::jthread stopper([&source] {
     std::this_thread::sleep_for(200ms);
     source.request_stop();

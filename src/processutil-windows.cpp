@@ -3,17 +3,21 @@
 
 #include "stringutil.hpp"
 
+#include <exec/when_any.hpp>
+#include <stdexec/execution.hpp>
+
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <ios>
 #include <mutex>
 #include <optional>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -51,6 +55,14 @@ class ScopedHandle {
   }
 
   [[nodiscard]] HANDLE get() const { return m_handle; }
+
+  // Closes the handle held, if any, and holds @a handle instead.
+  void reset(HANDLE handle) {
+    if (m_handle != nullptr) {
+      CloseHandle(m_handle);
+    }
+    m_handle = handle;
+  }
 
   ScopedHandle(const ScopedHandle&) = delete;
   ScopedHandle& operator=(const ScopedHandle&) = delete;
@@ -214,35 +226,178 @@ HANDLE create_kill_on_close_job() {
   return job;
 }
 
-}  // namespace
+// The size of the pipe a command's output goes through, and of each read from
+// it.
+constexpr DWORD k_pipe_bytes = 64 * 1024;
 
-void ProcessUtil::run(const std::filesystem::path& working_directory,
-                      const std::string& command,
-                      const std::stop_token& stop,
-                      Complete on_done) {
-  // A pipe carries the child's standard output back to us; the write end is
-  // inheritable so the child receives it, the read end is not.
-  SECURITY_ATTRIBUTES attributes = {
-      .nLength = sizeof(attributes),
+// Creates the pipe a command writes its standard output to: @a read, ours,
+// opened for overlapped reads and kept out of the command, and @a write, the
+// command's, inheritable. Anonymous pipes cannot be read asynchronously, so it
+// is a named pipe with a name no other can take.
+std::error_code make_output_pipe(ScopedHandle& read, ScopedHandle& write) {
+  static std::atomic<std::uint64_t> next_id{0};
+  const std::wstring name = std::format(L"\\\\.\\pipe\\makebelieve-{}-{}",
+                                        GetCurrentProcessId(), ++next_id);
+  const HANDLE server =
+      CreateNamedPipeW(name.c_str(),
+                       PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED |
+                           FILE_FLAG_FIRST_PIPE_INSTANCE,
+                       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
+                           PIPE_REJECT_REMOTE_CLIENTS,
+                       1, 0, k_pipe_bytes, 0, nullptr);
+  if (server == INVALID_HANDLE_VALUE) {
+    return last_error_code();
+  }
+  read.reset(server);
+
+  SECURITY_ATTRIBUTES inheritable = {
+      .nLength = sizeof(inheritable),
       .bInheritHandle = TRUE,
   };
-
-  HANDLE read_raw = nullptr;
-  HANDLE write_raw = nullptr;
-  if (!CreatePipe(&read_raw, &write_raw, &attributes, 0)) {
-    on_done(std::unexpected(last_error_code()));
-    return;
+  const HANDLE client =
+      CreateFileW(name.c_str(), GENERIC_WRITE, 0, &inheritable, OPEN_EXISTING,
+                  FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (client == INVALID_HANDLE_VALUE) {
+    return last_error_code();
   }
-  const ScopedHandle read_handle(read_raw);
-  SetHandleInformation(read_raw, HANDLE_FLAG_INHERIT, 0);
+  write.reset(client);
+  return {};
+}
+
+// Collects a command's output from our end of its pipe, keeping one
+// overlapped read outstanding at a time and signalling event() whenever it
+// completes.
+class OutputReader {
+  HANDLE m_pipe;
+  ScopedHandle m_event;
+  OVERLAPPED m_overlapped{};
+  std::vector<char> m_buffer = std::vector<char>(k_pipe_bytes);
+  bool m_pending = false;
+  bool m_open = true;
+  std::string m_output;
+
+  // Stops the outstanding read, keeping whatever it delivered first.
+  void cancel() {
+    if (!m_pending) {
+      return;
+    }
+    CancelIoEx(m_pipe, &m_overlapped);
+    DWORD bytes = 0;
+    if (GetOverlappedResult(m_pipe, &m_overlapped, &bytes, TRUE)) {
+      m_output.append(m_buffer.data(), bytes);
+    }
+    m_pending = false;
+  }
+
+ public:
+  // Manual reset, so a read that completes before the wait on it starts is
+  // not missed.
+  explicit OutputReader(HANDLE pipe)
+      : m_pipe(pipe), m_event(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
+
+  // The kernel may yet write into m_buffer, so no read may outlive it.
+  ~OutputReader() { cancel(); }
+
+  OutputReader(const OutputReader&) = delete;
+  OutputReader& operator=(const OutputReader&) = delete;
+  OutputReader(OutputReader&&) = delete;
+  OutputReader& operator=(OutputReader&&) = delete;
+
+  [[nodiscard]] bool valid() const { return m_event.get() != nullptr; }
+
+  // Signalled whenever the outstanding read completes.
+  [[nodiscard]] HANDLE event() const { return m_event.get(); }
+
+  // Whether the command's end of the pipe is still open.
+  [[nodiscard]] bool open() const { return m_open; }
+
+  // Keeps what completed reads delivered and issues the next, until one is
+  // left outstanding or the pipe has closed.
+  void pump() {
+    while (m_open) {
+      if (m_pending) {
+        DWORD bytes = 0;
+        if (!GetOverlappedResult(m_pipe, &m_overlapped, &bytes, FALSE)) {
+          if (GetLastError() == ERROR_IO_INCOMPLETE) {
+            return;  // Still outstanding.
+          }
+          // ERROR_BROKEN_PIPE is end of file; anything else ends reading too.
+          m_pending = false;
+          m_open = false;
+          return;
+        }
+        m_pending = false;
+        m_output.append(m_buffer.data(), bytes);
+      }
+      ResetEvent(m_event.get());
+      m_overlapped = OVERLAPPED{};
+      m_overlapped.hEvent = m_event.get();
+      if (!ReadFile(m_pipe, m_buffer.data(),
+                    static_cast<DWORD>(m_buffer.size()), nullptr,
+                    &m_overlapped) &&
+          GetLastError() != ERROR_IO_PENDING) {
+        m_open = false;
+        return;
+      }
+      // Finished at once or not, GetOverlappedResult() reports it.
+      m_pending = true;
+    }
+  }
+
+  // Once the command has exited: keeps what the pipe still holds, without
+  // waiting on anything it started that still has the pipe open.
+  void finish() {
+    pump();
+    cancel();
+  }
+
+  [[nodiscard]] std::string take() && { return std::move(m_output); }
+};
+
+// Ends a command on stop: through its job, the whole tree it spawned, else
+// cmd.exe alone.
+struct Terminate {
+  HANDLE process;
+  HANDLE job;
+  bool in_job;
+
+  void operator()() const noexcept {
+    if (in_job) {
+      TerminateJobObject(job, 1);
+    } else {
+      TerminateProcess(process, 1);
+    }
+  }
+};
+
+}  // namespace
+
+exec::task<ProcessUtil::Result> ProcessUtil::run_task(
+    IoContext& io,
+    std::filesystem::path working_directory,
+    std::string command,
+    stdexec::inplace_stop_token stop) {
+  if (stop.stop_requested()) {
+    co_return std::unexpected(
+        std::make_error_code(std::errc::operation_canceled));
+  }
+
+  ScopedHandle read_end(nullptr);
+  ScopedHandle write_end(nullptr);
+  if (const std::error_code error = make_output_pipe(read_end, write_end)) {
+    co_return std::unexpected(error);
+  }
+  OutputReader reader(read_end.get());
+  if (!reader.valid()) {
+    co_return std::unexpected(last_error_code());
+  }
 
   // CreateProcessW takes a mutable command-line buffer, so this must be a
   // writable std::wstring rather than a literal.
   std::expected<std::wstring, std::error_code> wcommand =
       StringUtil::to_wide(command);
   if (!wcommand) {
-    on_done(std::unexpected(wcommand.error()));
-    return;
+    co_return std::unexpected(wcommand.error());
   }
 
   // Launch with the hook DLL injected to trace the command's reads. Both the
@@ -251,20 +406,15 @@ void ProcessUtil::run(const std::filesystem::path& working_directory,
   const std::expected<std::filesystem::path, std::error_code> hook =
       find_hook_dll();
   if (!hook.has_value()) {
-    on_done(std::unexpected(hook.error()));
-    return;
+    co_return std::unexpected(hook.error());
   }
-  std::expected<std::filesystem::path, std::error_code> trace_log =
+  const std::expected<std::filesystem::path, std::error_code> trace_log =
       make_trace_log();
   if (!trace_log.has_value()) {
-    on_done(std::unexpected(trace_log.error()));
-    return;
+    co_return std::unexpected(trace_log.error());
   }
   const ScopedFile log_cleanup(*trace_log);
 
-  // The hook reports each read in canonical form, so hand it the root in the
-  // same form or its under-the-root filter drops everything on a caller whose
-  // working directory carries an 8.3 short component.
   // The hook reports each read in canonical form, so hand it the root in the
   // same form or its under-the-root filter drops everything on a caller whose
   // working directory carries an 8.3 short component.
@@ -281,14 +431,14 @@ void ProcessUtil::run(const std::filesystem::path& working_directory,
       .cb = sizeof(startup),
       .dwFlags = STARTF_USESTDHANDLES,
       .hStdInput = GetStdHandle(STD_INPUT_HANDLE),
-      .hStdOutput = write_raw,
+      .hStdOutput = write_end.get(),
       .hStdError = GetStdHandle(STD_ERROR_HANDLE),
   };
 
   // Suspended, so the child is enrolled in the job before its code runs.
   // Detours injects into the suspended process and, given CREATE_SUSPENDED,
   // leaves the resume to us.
-  DWORD creation_flags =
+  const DWORD creation_flags =
       CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
 
   PROCESS_INFORMATION process{};
@@ -301,12 +451,11 @@ void ProcessUtil::run(const std::filesystem::path& working_directory,
       hook_utf8.c_str(), nullptr);
   const std::error_code create_error =
       created ? std::error_code{} : last_error_code();
-  // Close our copy of the write end so the pipe reports end of file once the
-  // child exits, and so only the child can write to it.
-  CloseHandle(write_raw);
+  // Close our copy of the command's end, so only it can write to the pipe and
+  // the pipe closes once it has gone.
+  write_end.reset(nullptr);
   if (!created) {
-    on_done(std::unexpected(create_error));
-    return;
+    co_return std::unexpected(create_error);
   }
 
   const ScopedHandle thread(process.hThread);
@@ -318,65 +467,56 @@ void ProcessUtil::run(const std::filesystem::path& working_directory,
                       AssignProcessToJobObject(job.get(), process.hProcess);
   ResumeThread(process.hThread);
 
-  // Terminate on stop: the job tears down the whole tree, else just cmd.exe.
-  // The callback is declared after the handles so it can no longer fire once
-  // they close, avoiding a reused-id race. Runs synchronously if stop is
-  // already set.
-  const std::stop_callback on_stop(stop, [process, job = job.get(), in_job] {
-    if (in_job) {
-      TerminateJobObject(job, 1);
-    } else {
-      TerminateProcess(process.hProcess, 1);
-    }
-  });
+  // Declared after the handles so it can no longer fire once they close,
+  // avoiding a reused-id race. Runs at once if stop is already set.
+  const stdexec::inplace_stop_callback<Terminate> on_stop(
+      stop,
+      Terminate{
+          .process = process.hProcess, .job = job.get(), .in_job = in_job});
 
-  std::string output;
-  std::array<char, 4096> buffer{};
-  const auto drain = [&] {
-    while (true) {
-      DWORD available = 0;
-      if (!PeekNamedPipe(read_raw, nullptr, 0, nullptr, &available, nullptr) ||
-          available == 0) {
-        return;
-      }
-      const DWORD want = std::min(available, static_cast<DWORD>(buffer.size()));
-      DWORD read_bytes = 0;
-      if (!ReadFile(read_raw, buffer.data(), want, &read_bytes, nullptr) ||
-          read_bytes == 0) {
-        return;
-      }
-      output.append(buffer.data(), read_bytes);
-    }
-  };
-
-  // Drain the pipe until the direct child exits. Waiting on the process rather
-  // than on pipe end-of-file is what keeps an inherited-pipe grandchild from
-  // wedging us, and draining as we go keeps a full pipe from blocking writes.
+  // Collect output until the direct child exits. Waiting on the process
+  // rather than on the pipe closing is what keeps a grandchild that inherited
+  // the pipe from wedging us, and reading as it arrives keeps a full pipe from
+  // blocking the command.
   std::error_code wait_error;
+  const auto failed = [&wait_error](std::error_code error) noexcept {
+    wait_error = error;
+    return -1;
+  };
+  constexpr int k_output = 0;
+  constexpr int k_exited = 1;
+  reader.pump();
   while (true) {
-    drain();
-    const DWORD waited = WaitForSingleObject(process.hProcess, 50);
-    if (waited == WAIT_OBJECT_0) {
-      drain();  // Whatever the child buffered just before it exited.
+    auto exited = io.async_wait(process.hProcess) |
+                  stdexec::then([]() noexcept { return k_exited; }) |
+                  stdexec::upon_error(failed);
+    const int which =
+        reader.open()
+            ? co_await exec::when_any(
+                  io.async_wait(reader.event()) | stdexec::then([]() noexcept {
+                    return k_output;
+                  }) | stdexec::upon_error(failed),
+                  exited)
+            : co_await exited;
+    if (which != k_output) {
       break;
     }
-    if (waited == WAIT_FAILED) {
-      wait_error = last_error_code();
-      break;
-    }
+    reader.pump();
   }
+  // Whatever the child wrote just before it exited.
+  reader.finish();
 
   if (wait_error) {
-    on_done(std::unexpected(wait_error));
-  } else if (stop.stop_requested()) {
-    on_done(
-        std::unexpected(std::make_error_code(std::errc::operation_canceled)));
-  } else {
-    // cmd.exe has waited for the command, so every traced process' synchronous
-    // appends are already on disk.
-    on_done(Output{.standard_output = std::move(output),
-                   .inputs = read_trace_log(*trace_log)});
+    co_return std::unexpected(wait_error);
   }
+  if (stop.stop_requested()) {
+    co_return std::unexpected(
+        std::make_error_code(std::errc::operation_canceled));
+  }
+  // cmd.exe has waited for the command, so every traced process' synchronous
+  // appends are already on disk.
+  co_return Output{.standard_output = std::move(reader).take(),
+                   .inputs = read_trace_log(*trace_log)};
 }
 
 namespace {

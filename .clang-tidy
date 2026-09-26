@@ -16,6 +16,7 @@ Checks: "bugprone-*,
          -readability-magic-numbers,
          -readability-named-parameter,
          -readability-qualified-auto,
+         -readability-static-accessed-through-instance,
 "
 WarningsAsErrors: "bugprone-*,
                    misc-*,
@@ -35,6 +36,7 @@ WarningsAsErrors: "bugprone-*,
                    -readability-magic-numbers,
                    -readability-named-parameter,
                    -readability-qualified-auto,
+                   -readability-static-accessed-through-instance,
 "
 HeaderFilterRegex: 'experiments/.*\.hpp$'
 FormatStyle: none
