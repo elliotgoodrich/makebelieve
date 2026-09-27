@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "buildqueue.hpp"
 
+#include <exec/single_thread_context.hpp>
 #include <exec/static_thread_pool.hpp>
 #include <stdexec/execution.hpp>
 
@@ -11,6 +12,7 @@
 #include <concepts>
 #include <condition_variable>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -19,6 +21,7 @@
 #include <thread>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -37,15 +40,26 @@ class Held {
   std::set<int> m_released;
   int m_stopped = 0;
 
-  // Runs the blocking part on a pool of its own, so waiting here holds none of
-  // the threads the queue's own completions need.
-  exec::static_thread_pool m_runners{8};
+  // Runs each one's blocking part on a thread of its own, so waiting here
+  // holds none of the threads the queue's own completions need, nor any other
+  // work's. Not a shared pool: static_thread_pool queues work scheduled from
+  // outside it on a random thread, which alone runs it, so it could wait behind
+  // work that is being held.
+  std::unordered_map<int, std::unique_ptr<exec::single_thread_context>>
+      m_runners;
 
  public:
   // Work that records @a who as started, then waits to be released.
   [[nodiscard]] auto work(int who) {
-    return ex::schedule(m_runners.get_scheduler()) |
-           ex::then([this, who]() noexcept {
+    const auto runner = [&] {
+      const std::lock_guard lock(m_mutex);
+      auto& context = m_runners[who];
+      if (context == nullptr) {
+        context = std::make_unique<exec::single_thread_context>();
+      }
+      return context->get_scheduler();
+    }();
+    return ex::schedule(runner) | ex::then([this, who]() noexcept {
              std::unique_lock lock(m_mutex);
              m_started.push_back(who);
              m_changed.notify_all();
