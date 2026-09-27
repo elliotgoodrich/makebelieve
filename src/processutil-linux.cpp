@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: MIT
 #include "processutil.hpp"
 
+#include "iocontext.hpp"
+#include "processutilinternal.hpp"
+
+#include <exec/task.hpp>
+#include <exec/when_any.hpp>
+#include <stdexec/execution.hpp>
+
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <csignal>
@@ -21,7 +29,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -29,11 +36,11 @@
 #include <fuse_lowlevel.h>
 
 #include <fcntl.h>
-#include <poll.h>
 #include <sched.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -87,15 +94,20 @@ class UniqueFd {
 
 // The /dev/fuse fd must be opened inside the child's new mount namespace - a
 // pre-fork fd makes mount(2) fail with EINVAL - so the child hands it back over
-// a socketpair via SCM_RIGHTS. The one-byte payload also signals setup success:
-// kHandoffOk carries the fd; kHandoffFailed means none follows.
-constexpr char k_handoff_ok = 1;
-constexpr char k_handoff_failed = 0;
+// a socketpair via SCM_RIGHTS. The payload says whether setup succeeded, and if
+// not, the errno of the step that failed: tracing is required, so that reason
+// is what the run fails with.
+struct Handoff {
+  bool ok;
+  int error;
+};
 
+// Sends @a fd, or - when @a fd is negative - that setup failed with @a error.
+// Runs post-fork, so it allocates nothing.
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-void send_result(int sock, int fd) {
-  char payload = fd >= 0 ? k_handoff_ok : k_handoff_failed;
-  iovec iov{.iov_base = &payload, .iov_len = 1};
+void send_result(int sock, int fd, int error) {
+  Handoff payload{.ok = fd >= 0, .error = error};
+  iovec iov{.iov_base = &payload, .iov_len = sizeof(payload)};
   msghdr msg{.msg_iov = &iov, .msg_iovlen = 1};
 
   std::array<char, CMSG_SPACE(sizeof(int))> control{};
@@ -112,27 +124,31 @@ void send_result(int sock, int fd) {
   ::sendmsg(sock, &msg, 0);
 }
 
-// Returns the received fd, or -1 if the child reported failure or the handoff
-// protocol was otherwise violated.
-int recv_result(int sock) {
-  char payload = 0;
-  iovec iov{.iov_base = &payload, .iov_len = 1};
+// The fd the child handed over, or why it could not: the error it reported, or
+// EPROTO if the handoff itself went wrong.
+std::expected<UniqueFd, std::error_code> recv_result(int sock) {
+  Handoff payload{.ok = false, .error = EPROTO};
+  iovec iov{.iov_base = &payload, .iov_len = sizeof(payload)};
   std::array<char, CMSG_SPACE(sizeof(int))> control{};
   msghdr msg{.msg_iov = &iov,
              .msg_iovlen = 1,
              .msg_control = control.data(),
              .msg_controllen = control.size()};
 
-  if (::recvmsg(sock, &msg, 0) <= 0 || payload != k_handoff_ok) {
-    return -1;
+  if (::recvmsg(sock, &msg, 0) != static_cast<ssize_t>(sizeof(payload))) {
+    return std::unexpected(std::make_error_code(std::errc::protocol_error));
+  }
+  if (!payload.ok) {
+    return std::unexpected(
+        std::error_code(payload.error, std::system_category()));
   }
   cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
   if (cmsg == nullptr || cmsg->cmsg_type != SCM_RIGHTS) {
-    return -1;
+    return std::unexpected(std::make_error_code(std::errc::protocol_error));
   }
   int fd = -1;
   std::memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
-  return fd;
+  return UniqueFd(fd);
 }
 
 // By view so nothing is allocated here: this runs post-fork, where allocating
@@ -162,6 +178,9 @@ struct Inode {
 class Tracer {
   std::mutex m_mutex;
   std::vector<std::filesystem::path> m_read_files;
+
+  // Set when a request could not be handled, which may have lost a read.
+  std::atomic<bool> m_failed = false;
   std::unordered_map<fuse_ino_t, Inode> m_inodes;
   std::map<std::pair<dev_t, ino_t>, fuse_ino_t> m_by_dev_ino;
   fuse_ino_t m_next_ino = FUSE_ROOT_ID + 1;
@@ -279,7 +298,16 @@ class Tracer {
     fuse_reply_err(req, 0);
   }
 
-  std::vector<std::filesystem::path> take_read_files() && {
+  // Records that a request could not be handled.
+  void fail() noexcept { m_failed = true; }
+
+  // The files the command opened for reading, or EIO if a request could not
+  // be handled - which may have lost one.
+  std::expected<std::vector<std::filesystem::path>, std::error_code>
+  take_read_files() && {
+    if (m_failed) {
+      return std::unexpected(std::make_error_code(std::errc::io_error));
+    }
     return std::move(m_read_files);
   }
 
@@ -298,10 +326,11 @@ struct Trampoline;
 template <typename... Args, void (Tracer::*MemFn)(fuse_req_t, Args...)>
 struct Trampoline<MemFn> {
   static void call(fuse_req_t req, Args... args) {
+    auto* tracer = static_cast<Tracer*>(fuse_req_userdata(req));
     try {
-      auto* tracer = static_cast<Tracer*>(fuse_req_userdata(req));
       (tracer->*MemFn)(req, args...);
     } catch (...) {
+      tracer->fail();
       fuse_reply_err(req, EIO);
     }
   }
@@ -333,11 +362,6 @@ constexpr fuse_custom_io k_io = {
     .splice_send = nullptr,
 };
 
-template <typename T, typename D>
-std::unique_ptr<T, D> make_scope_ptr(T* p, D deleter) {
-  return std::unique_ptr<T, D>(p, deleter);
-}
-
 // Points stdout at the pipe and puts the command in its own process group, so a
 // stop can signal the whole tree it spawns. Returns false on failure.
 bool prepare_child_io(int stdout_fd) {
@@ -360,11 +384,21 @@ bool prepare_child_io(int stdout_fd) {
                                    int stdout_fd,
                                    std::string_view uid_map,
                                    std::string_view gid_map,
-                                   int handoff_sock) {
+                                   int handoff_sock,
+                                   int forced_error) {
   // NOLINTEND(bugprone-easily-swappable-parameters)
-  if (!prepare_child_io(stdout_fd)) {
-    send_result(handoff_sock, -1);
+  // Reports why setup failed - read errno first, before anything can clobber
+  // it - and exits.
+  const auto fail = [handoff_sock](int error) {
+    send_result(handoff_sock, -1, error);
     _exit(125);
+  };
+
+  if (forced_error != 0) {
+    fail(forced_error);  // ProcessUtilTestUtil's tracing_setup.
+  }
+  if (!prepare_child_io(stdout_fd)) {
+    fail(errno);
   }
 
   // A fresh user + mount namespace, so the mount below is invisible elsewhere
@@ -375,25 +409,26 @@ bool prepare_child_io(int stdout_fd) {
       !write_whole_file("/proc/self/gid_map", gid_map) ||
       // Detach mount propagation so nothing here leaks to or from the host.
       ::mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
-    send_result(handoff_sock, -1);
-    _exit(125);
+    fail(errno);
   }
 
   // Opened fresh, post-unshare - a pre-fork-opened /dev/fuse fd inherited from
   // the parent fails the mount(2) below with EINVAL.
   const int fuse_fd = ::open("/dev/fuse", O_RDWR);
+  if (fuse_fd < 0) {
+    fail(errno);
+  }
   std::array<char, 256> mount_data{};
   std::snprintf(mount_data.data(), mount_data.size(),
                 "fd=%d,rootmode=040000,user_id=0,group_id=0", fuse_fd);
-  if (fuse_fd < 0 || ::mount("makebelieve-trace", cwd.c_str(), "fuse",
-                             MS_NOSUID | MS_NODEV, mount_data.data()) != 0) {
-    send_result(handoff_sock, -1);
-    _exit(125);
+  if (::mount("makebelieve-trace", cwd.c_str(), "fuse", MS_NOSUID | MS_NODEV,
+              mount_data.data()) != 0) {
+    fail(errno);
   }
 
   // Hand the fd off before resolving any path through the mount (chdir() does):
   // until the parent services it, such a lookup would hang forever.
-  send_result(handoff_sock, fuse_fd);
+  send_result(handoff_sock, fuse_fd, 0);
   ::close(fuse_fd);
 
   // Wait until the parent is servicing the mount before resolving a path
@@ -411,73 +446,197 @@ bool prepare_child_io(int stdout_fd) {
   _exit(127);  // Only reached if exec failed.
 }
 
+// A running command, leading its own process group. terminate() kills that
+// group and waits for the command itself to exit, through the IoContext,
+// before reaping it. Destroying one that has not been reaped does the same,
+// blocking, as a last resort. Whatever else is in the group is only asked to
+// exit: those processes are not our children, so their exit is neither
+// waited for nor reaped, and anything that has left the group is not killed.
+class ChildProcess {
+  pid_t m_pid;
+
+  // Readable once the command has exited; invalid if the kernel could not
+  // open it.
+  UniqueFd m_exited;
+
+  bool m_reaped = false;
+  int m_status = 0;
+
+ public:
+  explicit ChildProcess(pid_t pid)
+      : m_pid(pid),
+        m_exited(static_cast<int>(::syscall(SYS_pidfd_open, pid, 0))) {}
+
+  ~ChildProcess() {
+    if (!m_reaped) {
+      signal();
+      reap();
+    }
+  }
+
+  ChildProcess(const ChildProcess&) = delete;
+  ChildProcess& operator=(const ChildProcess&) = delete;
+  ChildProcess(ChildProcess&&) = delete;
+  ChildProcess& operator=(ChildProcess&&) = delete;
+
+  // Readable once the command has exited; -1 if the kernel could not say.
+  [[nodiscard]] int exited() const noexcept { return m_exited.get(); }
+
+  // Kills the command and whatever is in its process group. Touches nothing
+  // but the numbers it was started with, so it is safe from any thread -
+  // until the command is reaped, after which its id may be reused.
+  // @pre The command has not been reaped.
+  void signal() const noexcept {
+    ::kill(-m_pid, SIGKILL);
+    ::kill(m_pid, SIGKILL);
+  }
+
+  // Once the command has been reaped: kills whatever it left in its process
+  // group - requested, not confirmed, since those processes are not our
+  // children.
+  void kill_leftovers() const noexcept { ::kill(-m_pid, SIGKILL); }
+
+  // Waits for the command, which has exited or been killed, recording how it
+  // ended.
+  void reap() noexcept {
+    while (::waitpid(m_pid, &m_status, 0) < 0 && errno == EINTR) {
+    }
+    m_reaped = true;
+  }
+
+  // How the command ended, as a shell reports it: its exit status, or 128
+  // plus the signal that ended it. @pre It has been reaped.
+  [[nodiscard]] int exit_status() const noexcept {
+    if (WIFEXITED(m_status)) {
+      return WEXITSTATUS(m_status);
+    }
+    if (WIFSIGNALED(m_status)) {
+      return 128 + WTERMSIG(m_status);
+    }
+    return 0;
+  }
+
+  // Kills the command and what is in its group, then waits for it to exit
+  // through @a io and reaps it - which then no longer blocks.
+  exec::task<void> terminate(IoContext& io) {
+    if (m_reaped) {
+      co_return;
+    }
+    signal();
+    if (m_exited) {
+      co_await (stdexec::write_env(io.async_wait(m_exited.get()),
+                                   stdexec::prop{stdexec::get_stop_token,
+                                                 stdexec::never_stop_token{}}) |
+                stdexec::upon_error([](std::error_code) noexcept {}));
+    }
+    reap();
+  }
+};
+
+// Kills @a child when a stop is requested. Only ever registered while the
+// child has yet to be reaped.
+struct Kill {
+  const ChildProcess* child;
+
+  void operator()() const noexcept { child->signal(); }
+};
+
 // What supervising a running command produced: its stdout, plus how it ended.
 struct Supervision {
   std::string output;
   std::error_code error;  // set if waiting on the child failed
   bool canceled =
-      false;  // true if it was terminated because stop was requested
+      false;            // true if it was terminated because stop was requested
+  int exit_status = 0;  // as ChildProcess::exit_status() reports it
 };
 
-// Drains @a child's stdout from @a read_fd until it exits, terminating its
-// process group if @a stop is requested. Takes ownership of @a read_fd and
-// closes it. @a child must lead its own process group.
-// NOLINTBEGIN(bugprone-easily-swappable-parameters)
-Supervision supervise(pid_t child, int read_fd, const std::stop_token& stop) {
-  // NOLINTEND(bugprone-easily-swappable-parameters)
-  // Read without blocking so a grandchild that inherited the pipe cannot keep
-  // us waiting once our direct child has exited.
-  ::fcntl(read_fd, F_SETFL, ::fcntl(read_fd, F_GETFL) | O_NONBLOCK);
+// What ends a command early.
+struct KillOn {
+  stdexec::inplace_stop_token stop;   // the run's: it was cancelled
+  stdexec::inplace_stop_token abort;  // something found it cannot succeed
+};
 
-  // Terminate the whole command group on stop. The callback runs synchronously
-  // from the constructor if @a stop is already requested.
-  const std::stop_callback on_stop(stop, [child] {
-    ::kill(-child, SIGKILL);
-    ::kill(child, SIGKILL);
-  });
+// Collects @a child's stdout from @a read_fd until it exits, then reaps it,
+// killing it if either of @a kill_on is requested. Waits on both through
+// @a io. This is the child's one owner while it runs: nothing else signals or
+// reaps it. Knows nothing of tracing.
+exec::task<Supervision> supervise(IoContext& io,
+                                  ChildProcess& child,
+                                  UniqueFd read_fd,
+                                  KillOn kill_on) {
+  Supervision result;
+  if (child.exited() < 0) {
+    result.error = last_error_code();
+    co_return result;  // Killed and reaped by its owner.
+  }
 
-  std::string output;
+  // Non-blocking, so draining stops at what is there now.
+  ::fcntl(read_fd.get(), F_SETFL, ::fcntl(read_fd.get(), F_GETFL) | O_NONBLOCK);
   std::array<char, 4096> buffer{};
-  const auto drain = [&] {
+  // Reads what the pipe holds now; false once it has reached end of file.
+  const auto drain = [&]() {
     while (true) {
-      const ssize_t count = ::read(read_fd, buffer.data(), buffer.size());
-      if (count <= 0) {
-        return;  // No data available right now, or end of file.
+      const ssize_t count = ::read(read_fd.get(), buffer.data(), buffer.size());
+      if (count > 0) {
+        result.output.append(buffer.data(), static_cast<std::size_t>(count));
+      } else if (count == 0) {
+        return false;
+      } else if (errno != EINTR) {
+        return errno == EAGAIN;
       }
-      output.append(buffer.data(), static_cast<std::size_t>(count));
     }
   };
 
-  // Drain the pipe until the direct child exits. Waiting on the child rather
-  // than on pipe end-of-file is what keeps an inherited-pipe grandchild from
-  // wedging us, and draining as we go keeps a full pipe from blocking writes.
+  // Collect output until the direct child exits. Waiting on the child rather
+  // than on the pipe closing is what keeps a grandchild that inherited the
+  // pipe from wedging us, and reading as it arrives keeps a full pipe from
+  // blocking the command.
   std::error_code wait_error;
-  while (true) {
-    pollfd descriptor{.fd = read_fd, .events = POLLIN, .revents = 0};
-    ::poll(&descriptor, 1,
-           100);  // Wake on data or hangup, or re-check at 100ms.
-    drain();
-
-    int status = 0;
-    const pid_t reaped = ::waitpid(child, &status, WNOHANG);
-    if (reaped == child) {
-      break;
+  bool open = true;
+  {
+    // Gone before the child is reaped - their destruction waiting out one
+    // running on another thread - so neither can signal a process that has
+    // reused its id.
+    const stdexec::inplace_stop_callback<Kill> on_stop(kill_on.stop,
+                                                       Kill{&child});
+    const stdexec::inplace_stop_callback<Kill> on_abort(kill_on.abort,
+                                                        Kill{&child});
+    const auto failed = [&wait_error](std::error_code error) noexcept {
+      wait_error = error;
+      return -1;
+    };
+    constexpr int k_output = 0;
+    constexpr int k_exited = 1;
+    while (true) {
+      auto child_exited = io.async_wait(child.exited()) |
+                          stdexec::then([]() noexcept { return k_exited; }) |
+                          stdexec::upon_error(failed);
+      const int which =
+          open ? co_await exec::when_any(
+                     io.async_wait(read_fd.get()) |
+                         stdexec::then([]() noexcept { return k_output; }) |
+                         stdexec::upon_error(failed),
+                     child_exited)
+               : co_await child_exited;
+      if (which != k_output) {
+        break;
+      }
+      open = drain();
     }
-    if (reaped < 0 && errno != EINTR) {
-      wait_error = last_error_code();
-      break;
+    if (wait_error) {
+      child.signal();
     }
   }
-  drain();  // Whatever the child buffered just before it exited.
-  ::close(read_fd);
 
-  Supervision result{.output = std::move(output)};
-  if (wait_error) {
-    result.error = wait_error;
-  } else if (stop.stop_requested()) {
-    result.canceled = true;
+  child.reap();
+  result.exit_status = child.exit_status();
+  if (open) {
+    drain();  // Whatever the child wrote just before it exited.
   }
-  return result;
+
+  result.error = wait_error;
+  result.canceled = !wait_error && kill_on.stop.stop_requested();
+  co_return result;
 }
 
 // Turns a Supervision into the reported Result. @a inputs is empty on a
@@ -491,165 +650,373 @@ ProcessUtil::Result to_result(Supervision supervision,
     return std::unexpected(std::make_error_code(std::errc::operation_canceled));
   }
   return ProcessUtil::Output{.standard_output = std::move(supervision.output),
-                             .inputs = std::move(inputs)};
+                             .inputs = std::move(inputs),
+                             .exit_status = supervision.exit_status};
 }
 
-// Runs @a command under a FUSE passthrough on @a root, returning the absolute
-// paths it read under @a root. std::nullopt means the tracer could not be set
-// up (e.g. no user namespaces), so the caller falls back to an untraced run.
-std::optional<ProcessUtil::Result> run_with_tracing(
-    const std::filesystem::path& root,
-    const std::string& command,
-    const std::stop_token& stop) {
+// Traces the files one command reads under a root: the FUSE session behind the
+// mount the command's own namespace sees there, answering its requests as a
+// read-only passthrough and recording what it opens.
+class TracingSession {
+  Tracer m_tracer;
+  std::string m_program = "makebelieve-trace";
+  std::array<char*, 1> m_argv{m_program.data()};
+  fuse_args m_args = FUSE_ARGS_INIT(1, m_argv.data());
+  fuse_session* m_session = nullptr;
+  int m_descriptor;
+
+  // Allocated by libfuse on the first receive.
+  fuse_buf m_buffer{};
+
+  // ProcessUtilTestUtil's tracing_service, due at the first request.
+  std::optional<std::error_code> m_forced_error;
+
+  TracingSession(int root_fd, std::filesystem::path root, int descriptor)
+      : m_tracer(root_fd, std::move(root)), m_descriptor(descriptor) {}
+
+  // Whether a session has more requests to come.
+  enum class Serving : bool { more, ended };
+
+  // Handles every request waiting, reporting whether more may come - or why
+  // serving failed, in which case requests may have gone unanswered and reads
+  // unrecorded. (The mount going away with the command reads as the session
+  // ending, not as an error.)
+  std::expected<Serving, std::error_code> process() noexcept {
+    if (m_forced_error.has_value()) {
+      const std::error_code forced = *m_forced_error;
+      m_forced_error.reset();
+      return std::unexpected(forced);
+    }
+    while (!fuse_session_exited(m_session)) {
+      const int received = fuse_session_receive_buf(m_session, &m_buffer);
+      if (received == -EAGAIN) {
+        return Serving::more;
+      }
+      if (received == -EINTR) {
+        continue;
+      }
+      if (received < 0) {
+        return std::unexpected(
+            std::error_code(-received, std::system_category()));
+      }
+      if (received == 0) {
+        return Serving::ended;
+      }
+      fuse_session_process_buf(m_session, &m_buffer);
+    }
+    return Serving::ended;
+  }
+
+ public:
+  // Serves the mount behind @a fuse_fd as a passthrough onto @a root, or says
+  // why it cannot.
+  static std::expected<std::unique_ptr<TracingSession>, std::error_code> open(
+      const std::filesystem::path& root,
+      UniqueFd fuse_fd) {
+    // The parent's own passthrough root, resolved in the parent's namespace
+    // and so unaffected by the child's private mount.
+    const int root_fd = ::open(root.c_str(), O_PATH | O_DIRECTORY);
+    if (root_fd < 0) {
+      return std::unexpected(last_error_code());
+    }
+    std::unique_ptr<TracingSession> session(
+        new TracingSession(root_fd, root, fuse_fd.get()));
+
+    session->m_session =
+        fuse_session_new(&session->m_args, &k_ops, sizeof(fuse_lowlevel_ops),
+                         &session->m_tracer);
+    if (session->m_session == nullptr) {
+      return std::unexpected(std::make_error_code(std::errc::io_error));
+    }
+    // Non-blocking, so serving stops at the requests there are now.
+    ::fcntl(fuse_fd.get(), F_SETFL,
+            ::fcntl(fuse_fd.get(), F_GETFL) | O_NONBLOCK);
+    if (const int failed =
+            fuse_session_custom_io(session->m_session, &k_io, fuse_fd.get());
+        failed != 0) {
+      return std::unexpected(
+          std::error_code(failed < 0 ? -failed : EIO, std::system_category()));
+    }
+    fuse_fd.release();  // The session's now.
+    return session;
+  }
+
+  ~TracingSession() {
+    std::free(m_buffer.mem);
+    if (m_session != nullptr) {
+      fuse_session_destroy(m_session);
+    }
+    fuse_opt_free_args(&m_args);
+  }
+
+  TracingSession(const TracingSession&) = delete;
+  TracingSession& operator=(const TracingSession&) = delete;
+  TracingSession(TracingSession&&) = delete;
+  TracingSession& operator=(TracingSession&&) = delete;
+
+  // Serves the command's requests as they arrive, until @a stop is requested
+  // or the session ends - completing with nothing - or serving fails,
+  // completing with why: waiting on the device failed, or reading from it did.
+  // Answering a request takes real filesystem calls, which slow storage can
+  // stretch out, so they run where this task resumes - a worker - rather than
+  // on the IoContext's thread, where they would hold up every other wait. One
+  // loop per session, so its requests are served one batch at a time.
+  exec::task<std::error_code> serve(IoContext& io,
+                                    stdexec::inplace_stop_token stop) {
+    while (true) {
+      std::error_code wait_error;
+      const bool stopped = co_await (
+          stdexec::write_env(io.async_wait(m_descriptor),
+                             stdexec::prop{stdexec::get_stop_token, stop}) |
+          stdexec::then([]() noexcept { return false; }) |
+          stdexec::upon_error([&wait_error](std::error_code error) noexcept {
+            wait_error = error;
+            return false;
+          }) |
+          stdexec::upon_stopped([]() noexcept { return true; }));
+      if (stopped) {
+        co_return std::error_code{};
+      }
+      if (wait_error) {
+        co_return wait_error;
+      }
+      const std::expected<Serving, std::error_code> served = process();
+      if (!served.has_value()) {
+        co_return served.error();
+      }
+      if (*served == Serving::ended) {
+        co_return std::error_code{};
+      }
+    }
+  }
+
+  // Ends the session, so that serving it ends too.
+  void end() noexcept { fuse_session_exit(m_session); }
+
+  // Makes serving fail with @a error at the first request. For
+  // ProcessUtilTestUtil.
+  void fail_at_first_request(std::error_code error) noexcept {
+    m_forced_error = error;
+  }
+
+  // The files the command opened for reading, sorted and without repeats -
+  // or why a request could not be handled, in which case what was recorded
+  // may be incomplete and is not reported at all.
+  [[nodiscard]] std::expected<std::vector<std::filesystem::path>,
+                              std::error_code>
+  take_inputs() && {
+    std::expected<std::vector<std::filesystem::path>, std::error_code> inputs =
+        std::move(m_tracer).take_read_files();
+    if (inputs.has_value()) {
+      std::ranges::sort(*inputs);
+      inputs->erase(std::ranges::unique(*inputs).begin(), inputs->end());
+    }
+    return inputs;
+  }
+};
+
+// Supervises @a child - its one owner - then ends its tracing @a session and
+// stops @a stop_serving, however supervising went, so that serving always
+// ends too.
+exec::task<Supervision> supervise_then_end(
+    IoContext& io,
+    ChildProcess& child,
+    UniqueFd read_fd,
+    KillOn kill_on,
+    TracingSession& session,
+    stdexec::inplace_stop_source& stop_serving) {
+  Supervision supervision;
+  try {
+    supervision = co_await supervise(io, child, std::move(read_fd), kill_on);
+  } catch (...) {
+    supervision.error = std::make_error_code(std::errc::not_enough_memory);
+  }
+  // Reaped by now: whatever it left behind is asked to go, so the mount tears
+  // down even if a descendant outlived the shell.
+  child.kill_leftovers();
+  session.end();
+  stop_serving.request_stop();
+  co_return supervision;
+}
+
+// Serves @a session until @a stop is requested or it ends. If serving fails,
+// records why in @a failure and requests @a abort, which has supervision end
+// the command: a command whose mount goes unserved would block on it for
+// ever, and its build has failed anyway. Never touches the child itself.
+exec::task<void> serve_or_abort(IoContext& io,
+                                TracingSession& session,
+                                stdexec::inplace_stop_token stop,
+                                stdexec::inplace_stop_source& abort,
+                                std::error_code& failure) {
+  std::error_code error;
+  try {
+    error = co_await session.serve(io, stop);
+  } catch (...) {
+    error = std::make_error_code(std::errc::not_enough_memory);
+  }
+  if (error) {
+    failure = error;
+    abort.request_stop();
+  }
+}
+
+// Setting up tracing, which spans the command's launch, since the FUSE device
+// has to be opened inside the command's own namespace:
+//
+// 1. prepare(), before the launch: a socket pair for the child to hand the
+//    device back over, and its uid and gid maps, formatted now because the
+//    child may not allocate.
+// 2. run_child(), in the child: enters a fresh namespace, mounts the device
+//    over the root, hands it back and waits.
+// 3. attach(), in the parent: serves the device it was handed, or reports why
+//    the child could not set up; then release() tells the child the session is
+//    ready, and only then does the command run.
+class TracingSetup {
+  UniqueFd m_parent;
+  UniqueFd m_child;
+  std::string m_uid_map;
+  std::string m_gid_map;
+
+  TracingSetup(UniqueFd parent, UniqueFd child)
+      : m_parent(std::move(parent)),
+        m_child(std::move(child)),
+        // Map the invoking user to root in the new user namespace.
+        m_uid_map("0 " + std::to_string(::getuid()) + " 1"),
+        m_gid_map("0 " + std::to_string(::getgid()) + " 1") {}
+
+ public:
+  static std::expected<TracingSetup, std::error_code> prepare() {
+    std::array<int, 2> sv{-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv.data()) != 0) {
+      return std::unexpected(last_error_code());
+    }
+    return TracingSetup(UniqueFd(sv[0]), UniqueFd(sv[1]));
+  }
+
+  // In the child: sets up tracing under @a root and, once released, runs
+  // @a command with its standard output on @a stdout_fd - or, if
+  // @a forced_error is set, fails setup with it first. Never returns.
+  [[noreturn]] void run_child(const std::filesystem::path& root,
+                              const std::string& command,
+                              int stdout_fd,
+                              int forced_error) {
+    m_parent.reset();
+    run_traced_child(root, command, stdout_fd, m_uid_map, m_gid_map,
+                     m_child.release(), forced_error);
+  }
+
+  // In the parent, once the child is launched: lets go of its end.
+  void launched() noexcept { m_child.reset(); }
+
+  // Serves the device the child handed back as a passthrough onto @a root, or
+  // reports why the child could not set up.
+  std::expected<std::unique_ptr<TracingSession>, std::error_code> attach(
+      const std::filesystem::path& root) {
+    std::expected<UniqueFd, std::error_code> fuse_fd =
+        recv_result(m_parent.get());
+    if (!fuse_fd.has_value()) {
+      return std::unexpected(fuse_fd.error());
+    }
+    return TracingSession::open(root, std::move(*fuse_fd));
+  }
+
+  // Tells the child the session is ready, so its command may run.
+  void release() noexcept {
+    const char ack = 1;
+    const ssize_t acked = ::write(m_parent.get(), &ack, 1);
+    static_cast<void>(acked);
+    m_parent.reset();
+  }
+};
+
+// Runs @a command under a FUSE passthrough on @a root, reporting the absolute
+// paths it read under @a root. Tracing is required: if it cannot be set up -
+// no unprivileged user namespaces, say - or fails while the command runs, the
+// run fails with the reason rather than reporting no inputs.
+exec::task<ProcessUtil::Result> run_traced(IoContext& io,
+                                           std::filesystem::path root,
+                                           std::string command,
+                                           stdexec::inplace_stop_token stop) {
   std::array<int, 2> out_pipe{-1, -1};
   if (::pipe(out_pipe.data()) != 0) {
-    return std::nullopt;
+    co_return std::unexpected(last_error_code());
   }
   UniqueFd out_read(out_pipe[0]);
   UniqueFd out_write(out_pipe[1]);
 
-  std::array<int, 2> sv{-1, -1};
-  if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv.data()) != 0) {
-    return std::nullopt;
+  std::expected<TracingSetup, std::error_code> setup = TracingSetup::prepare();
+  if (!setup.has_value()) {
+    co_return std::unexpected(setup.error());
   }
-  UniqueFd parent_socket(sv[0]);
-  UniqueFd child_socket(sv[1]);
 
-  // Map the invoking user to root in the new user namespace, formatted before
-  // the fork so the child need not allocate.
-  const std::string uid_map = "0 " + std::to_string(::getuid()) + " 1";
-  const std::string gid_map = "0 " + std::to_string(::getgid()) + " 1";
+  // Taken before the fork, so the parent consumes it and the child sees it.
+  const int forced_setup_error =
+      detail::take_forced_failure(ProcessUtilTestUtil::Failure::tracing_setup)
+          .value_or(std::error_code{})
+          .value();
 
   const pid_t pid = ::fork();
   if (pid < 0) {
-    return std::nullopt;
+    co_return std::unexpected(last_error_code());
   }
   if (pid == 0) {
-    parent_socket.reset();
     out_read.reset();
-    run_traced_child(root, command, out_write.get(), uid_map, gid_map,
-                     child_socket.release());
+    setup->run_child(root, command, out_write.get(), forced_setup_error);
   }
-  child_socket.reset();
+  ChildProcess child(pid);
+  setup->launched();
   out_write.reset();  // Only the child writes stdout.
 
-  // Reaps the child after a setup failure: it is exiting, or blocked on the ack
-  // that will now never come, so a kill unblocks it either way.
-  const auto reap = [pid] {
-    ::kill(-pid, SIGKILL);
-    ::kill(pid, SIGKILL);
-    int status = 0;
-    ::waitpid(pid, &status, 0);
-  };
+  std::expected<std::unique_ptr<TracingSession>, std::error_code> session =
+      setup->attach(root);
+  if (!session.has_value()) {
+    co_await child.terminate(io);
+    co_return std::unexpected(session.error());
+  }
+  if (const std::optional<std::error_code> forced = detail::take_forced_failure(
+          ProcessUtilTestUtil::Failure::tracing_service)) {
+    (*session)->fail_at_first_request(*forced);
+  }
+  setup->release();
 
-  // Keep parent_socket open until the ack is sent: the child blocks reading it,
-  // so closing it early (on failure) unblocks the child via EOF.
-  UniqueFd fuse_fd(recv_result(parent_socket.get()));
-  if (!fuse_fd) {
-    parent_socket.reset();
-    reap();
-    return std::nullopt;  // Child's namespace/mount setup failed.
+  // Supervise the command and serve its requests side by side. Supervision
+  // alone owns the child; serving that fails tells it to end the command
+  // through `abort`. Serving has ended, and so is done with the session, by
+  // the time both have completed.
+  stdexec::inplace_stop_source stop_serving;
+  stdexec::inplace_stop_source abort;
+  std::error_code tracing_failure;
+  Supervision supervision = co_await stdexec::when_all(
+      supervise_then_end(io, child, std::move(out_read),
+                         {.stop = stop, .abort = abort.get_token()}, **session,
+                         stop_serving),
+      serve_or_abort(io, **session, stop_serving.get_token(), abort,
+                     tracing_failure));
+  if (tracing_failure) {
+    co_return std::unexpected(tracing_failure);
+  }
+  if (supervision.error || supervision.canceled) {
+    co_return to_result(std::move(supervision), {});
   }
 
-  // The parent's own passthrough root, resolved in the parent's namespace and
-  // so unaffected by the child's private mount.
-  const int root_fd = ::open(root.c_str(), O_PATH | O_DIRECTORY);
-  if (root_fd < 0) {
-    parent_socket.reset();
-    reap();
-    return std::nullopt;
+  std::expected<std::vector<std::filesystem::path>, std::error_code> inputs =
+      std::move(**session).take_inputs();
+  if (!inputs.has_value()) {
+    co_return std::unexpected(inputs.error());
   }
-  Tracer tracer(root_fd, root);
-
-  std::string program = "makebelieve-trace";
-  std::array<char*, 1> fuse_argv = {program.data()};
-  fuse_args args = FUSE_ARGS_INIT(1, fuse_argv.data());
-  const std::unique_ptr args_guard = make_scope_ptr(&args, &fuse_opt_free_args);
-  fuse_session* se =
-      fuse_session_new(&args, &k_ops, sizeof(fuse_lowlevel_ops), &tracer);
-  if (se == nullptr) {
-    parent_socket.reset();
-    reap();
-    return std::nullopt;
-  }
-  const std::unique_ptr session_guard =
-      make_scope_ptr(se, &fuse_session_destroy);
-
-  if (fuse_session_custom_io(se, &k_io, fuse_fd.get()) != 0) {
-    parent_socket.reset();
-    reap();
-    return std::nullopt;
-  }
-  fuse_fd.release();  // Owned by `se` on success.
-
-  std::thread servicing([se] { fuse_session_loop(se); });
-
-  // Tell the child it is now safe to resolve paths through the mount.
-  const char ack = 1;
-  const ssize_t acked = ::write(parent_socket.get(), &ack, 1);
-  static_cast<void>(acked);
-  parent_socket.reset();
-
-  Supervision supervision = supervise(pid, out_read.release(), stop);
-
-  // The mount tears down once every process in the namespace has exited, which
-  // unblocks the servicing thread. Kill any straggler so that happens even if a
-  // descendant outlived the shell.
-  ::kill(-pid, SIGKILL);
-  fuse_session_exit(se);  // A no-op if the loop already returned.
-  servicing.join();
-
-  std::vector<std::filesystem::path> inputs;
-  if (!supervision.error && !supervision.canceled) {
-    inputs = std::move(tracer).take_read_files();
-    std::ranges::sort(inputs);
-    inputs.erase(std::ranges::unique(inputs).begin(), inputs.end());
-  }
-  return to_result(std::move(supervision), std::move(inputs));
-}
-
-// Runs @a command without tracing, reporting no inputs. Used when the tracer
-// could not be set up.
-ProcessUtil::Result run_untraced(const std::filesystem::path& root,
-                                 const std::string& command,
-                                 const std::stop_token& stop) {
-  std::array<int, 2> out_pipe{-1, -1};
-  if (::pipe(out_pipe.data()) != 0) {
-    return std::unexpected(last_error_code());
-  }
-  UniqueFd out_read(out_pipe[0]);
-  UniqueFd out_write(out_pipe[1]);
-
-  const pid_t pid = ::fork();
-  if (pid < 0) {
-    return std::unexpected(last_error_code());
-  }
-  if (pid == 0) {
-    out_read.reset();
-    if (!prepare_child_io(out_write.get())) {
-      _exit(127);
-    }
-    if (::chdir(root.c_str()) != 0) {
-      _exit(127);
-    }
-    ::execl("/bin/sh", "sh", "-c", command.c_str(), nullptr);
-    _exit(127);  // Only reached if exec failed.
-  }
-  out_write.reset();  // Only the child writes.
-
-  return to_result(supervise(pid, out_read.release(), stop), {});
+  co_return to_result(std::move(supervision), std::move(*inputs));
 }
 
 }  // namespace
 
-void ProcessUtil::run(const std::filesystem::path& working_directory,
-                      const std::string& command,
-                      const std::stop_token& stop,
-                      Complete on_done) {
+exec::task<ProcessUtil::Result> ProcessUtil::run_task(
+    IoContext& io,
+    std::filesystem::path working_directory,
+    std::string command,
+    stdexec::inplace_stop_token stop) {
   if (stop.stop_requested()) {
-    on_done(
-        std::unexpected(std::make_error_code(std::errc::operation_canceled)));
-    return;
+    co_return std::unexpected(
+        std::make_error_code(std::errc::operation_canceled));
   }
 
   // Canonicalize the root so the reported paths line up when the working
@@ -661,46 +1028,7 @@ void ProcessUtil::run(const std::filesystem::path& working_directory,
   if (ec) {
     root = working_directory;
   }
-
-  if (std::optional<Result> traced = run_with_tracing(root, command, stop)) {
-    on_done(std::move(*traced));
-    return;
-  }
-
-  // The tracer could not attach; run untraced, reporting no inputs (an empty
-  // list is a valid best-effort result).
-  on_done(run_untraced(root, command, stop));
-}
-
-namespace {
-
-// What `/proc/<id>/status` says about @a field, or nothing when the file or
-// the field is missing - which is what a process that exited between the
-// request and this lookup gives.
-std::optional<std::string> read_proc_status(std::uint32_t id,
-                                            std::string_view field) {
-  std::ifstream status("/proc/" + std::to_string(id) + "/status");
-  std::string line;
-  while (std::getline(status, line)) {
-    if (!line.starts_with(field)) {
-      continue;
-    }
-    const std::size_t start = line.find_first_not_of(" \t", field.size());
-    if (start != std::string::npos) {
-      return line.substr(start);
-    }
-  }
-  return std::nullopt;
-}
-
-}  // namespace
-
-std::uint32_t ProcessUtil::self() {
-  return static_cast<std::uint32_t>(::getpid());
-}
-
-std::string ProcessUtil::name_of(std::uint32_t pid) {
-  return read_proc_status(pid, "Name:").value_or("unknown");
+  co_return co_await run_traced(io, std::move(root), std::move(command), stop);
 }
 
 }  // namespace makebelieve

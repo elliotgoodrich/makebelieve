@@ -13,16 +13,13 @@
 
 namespace makebelieve {
 
-using detail::Task;
-using detail::Wait;
-
 class IoContext::Impl {
   IoContextPoller m_poller;
 
   // Guards the queues below, which any thread may add to.
   std::mutex m_mutex;
-  Task* m_first_task = nullptr;
-  Task* m_last_task = nullptr;
+  IntrusiveTask* m_first_task = nullptr;
+  IntrusiveTask* m_last_task = nullptr;
   Wait* m_cancels = nullptr;
   bool m_stopping = false;
 
@@ -50,7 +47,7 @@ class IoContext::Impl {
   Impl(Impl&&) = delete;
   Impl& operator=(Impl&&) = delete;
 
-  void submit(Task& task) noexcept {
+  void submit(IntrusiveTask& task) noexcept {
     {
       const std::lock_guard lock(m_mutex);
       task.next = nullptr;
@@ -102,7 +99,7 @@ class IoContext::Impl {
     MB_TRACE_THREAD_NAME("io");
     std::vector<IoContextPoller::Ready> ready;
     while (true) {
-      Task* tasks = nullptr;
+      IntrusiveTask* tasks = nullptr;
       Wait* cancels = nullptr;
       bool stopping = false;
       {
@@ -119,8 +116,8 @@ class IoContext::Impl {
       // Read each link before running the task, which may complete and free
       // it.
       while (tasks != nullptr) {
-        Task* const task = std::exchange(tasks, tasks->next);
-        task->execute();
+        IntrusiveTask* const task = std::exchange(tasks, tasks->next);
+        (*task)();
       }
 
       // A cancellation queued by a stop callback that fires while its wait is
@@ -179,15 +176,15 @@ IoContext::IoContext() : m_impl(std::make_unique<Impl>()) {}
 
 IoContext::~IoContext() = default;
 
-void IoContext::submit(detail::Task& task) noexcept {
+void IoContext::submit(IntrusiveTask& task) noexcept {
   m_impl->submit(task);
 }
 
-void IoContext::cancel(detail::Wait& wait) noexcept {
+void IoContext::cancel(Wait& wait) noexcept {
   m_impl->cancel(wait);
 }
 
-void IoContext::begin_wait(detail::Wait& wait) noexcept {
+void IoContext::begin_wait(Wait& wait) noexcept {
   m_impl->begin_wait(wait);
 }
 

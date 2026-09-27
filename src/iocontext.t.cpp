@@ -5,9 +5,11 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <system_error>
@@ -15,6 +17,7 @@
 #include <tuple>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -238,6 +241,36 @@ TEST(IoContext, SpawnWatchCallsBackEachTimeUntilStopped) {
   std::this_thread::sleep_for(50ms);
   const std::lock_guard lock(mutex);
   EXPECT_EQ(wakes, 3);
+}
+
+// Far more than the 63 handles one WaitForMultipleObjects can watch.
+TEST(IoContext, WaitsOnManyHandlesAtOnce) {
+  IoContext io;
+  constexpr int k_handles = 200;
+  std::vector<std::unique_ptr<Signal>> signals;
+  for (int i = 0; i < k_handles; ++i) {
+    signals.push_back(std::make_unique<Signal>());
+  }
+
+  std::atomic<int> ready = 0;
+  ex::counting_scope scope;
+  for (const std::unique_ptr<Signal>& signal : signals) {
+    ex::spawn(io.async_wait(signal->handle()) | ex::then([&ready]() noexcept {
+                ++ready;
+              }) | ex::upon_error([](std::error_code) noexcept {}),
+              scope.get_token());
+  }
+  for (const std::unique_ptr<Signal>& signal : signals) {
+    signal->set();
+  }
+
+  const auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (ready < k_handles && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  EXPECT_EQ(ready.load(), k_handles);
+  scope.request_stop();
+  ex::sync_wait(scope.join());
 }
 
 TEST(IoContext, AnUnwaitableHandleFailsTheWait) {

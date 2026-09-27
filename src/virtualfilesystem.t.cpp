@@ -346,6 +346,11 @@ std::error_code native_access_denied() {
   return {ERROR_ACCESS_DENIED, std::system_category()};
 }
 
+// The platform's own spelling of an I/O error.
+std::error_code native_io_error() {
+  return {ERROR_IO_DEVICE, std::system_category()};
+}
+
 FileMapper::FileMapper() = default;
 FileMapper::~FileMapper() = default;
 
@@ -465,6 +470,10 @@ std::error_code read_error(const std::filesystem::path& path) {
 
 std::error_code native_access_denied() {
   return {EACCES, std::system_category()};
+}
+
+std::error_code native_io_error() {
+  return {EIO, std::system_category()};
 }
 
 // The largest path a request carries and file a reply carries.
@@ -1078,6 +1087,20 @@ TEST_F(VirtualFileSystem, AnOpenThatWaitsDoesNotHoldUpOtherRequests) {
   EXPECT_TRUE(fast_finished) << "a waiting open held up another file";
   EXPECT_EQ(fast.get(), "fast");
   EXPECT_EQ(slow.get(), "slow");
+}
+
+// An error from a category that is no platform's - a command's exit status,
+// say - reaches the reader as an I/O error, not as whatever platform error
+// shares its number (4 would read as EINTR on Linux).
+TEST_F(VirtualFileSystem, SurfacesAnErrorWithNoPlatformMeaningAsAnIoError) {
+  tree().write_file("a.txt", "abc");
+  const FailingReadTree failing(
+      tree(), std::make_error_code(std::future_errc::broken_promise));
+  const std::filesystem::path at = scratch() / "failing";
+  const makebelieve::VirtualFileSystem vfs(failing, at, notifier());
+  const std::error_code error = read_error(at / "a.txt");
+  EXPECT_EQ(error, native_io_error())
+      << error.value() << ": " << error.message();
 }
 
 // An error the tree reports should reach the reader as that error, whichever

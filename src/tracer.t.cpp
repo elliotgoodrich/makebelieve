@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "tracer.hpp"
 
-#include "processutil.hpp"
+#include "processinfo.hpp"
 
 #include <gtest/gtest.h>
 
@@ -192,7 +192,7 @@ TEST(TracerTest, RecordsACompleteEventWithItsArguments) {
   const std::string trace = tracer.snapshot();
   EXPECT_TRUE(JsonChecker::is_valid(trace)) << trace;
   EXPECT_TRUE(trace.contains(R"({"ph":"X","cat":"vfs","name":"open","pid":)" +
-                             std::to_string(ProcessUtil::self())));
+                             std::to_string(ProcessInfo::self())));
   EXPECT_TRUE(trace.contains(
       R"("dur":5.000,"args":{"path":"a.txt","size":42,"ok":true}})"));
   EXPECT_TRUE(trace.contains(R"("name":"thread_name")"));
@@ -219,7 +219,7 @@ TEST(TracerTest, RunsSeveralValuesTogetherIntoOne) {
 // the lane.
 TEST(TracerTest, RecordsALaneWithAFlowIntoIt) {
   Tracer tracer;
-  const TraceLane lane = tracer.lane(ProcessUtil::self(), "out.txt");
+  const TraceLane lane = tracer.lane(ProcessInfo::self(), "out.txt");
   const Tracer::Clock::time_point start = Tracer::Clock::now();
 
   tracer.complete("vfs", "open out.txt", start, Tracer::Clock::now());
@@ -258,13 +258,13 @@ TEST(TracerTest, RowsBelongToTheProcessTheyCarryWorkFor) {
 
   const std::string trace = tracer.snapshot();
   EXPECT_TRUE(JsonChecker::is_valid(trace)) << trace;
-  EXPECT_NE(ProcessUtil::self(), k_client);
+  EXPECT_NE(ProcessInfo::self(), k_client);
   EXPECT_TRUE(trace.contains(R"("name":"process_name","pid":)" +
                              std::to_string(k_client) +
                              R"(,"args":{"name":"reader.exe"})"))
       << trace;
   EXPECT_TRUE(trace.contains(R"("name":"process_name","pid":)" +
-                             std::to_string(ProcessUtil::self()) +
+                             std::to_string(ProcessInfo::self()) +
                              R"(,"args":{"name":"makebelieve"})"))
       << trace;
   // The client's span sits under the client, and ours under us.
@@ -272,7 +272,7 @@ TEST(TracerTest, RowsBelongToTheProcessTheyCarryWorkFor) {
                              std::to_string(k_client)))
       << trace;
   EXPECT_TRUE(trace.contains(R"("name":"ours","pid":)" +
-                             std::to_string(ProcessUtil::self())))
+                             std::to_string(ProcessInfo::self())))
       << trace;
 
   // A process keeps the first name it was given, and says so, which is how a
@@ -294,16 +294,16 @@ TEST(TracerTest, ALanePoolReusesItsRows) {
   Tracer tracer;
   TraceLanePool pool("client");
 
-  const TraceLane first = pool.take(tracer, ProcessUtil::self());
-  const TraceLane second = pool.take(tracer, ProcessUtil::self());
+  const TraceLane first = pool.take(tracer, ProcessInfo::self());
+  const TraceLane second = pool.take(tracer, ProcessInfo::self());
   EXPECT_NE(first, second);
 
   pool.give_back(first);
-  EXPECT_EQ(pool.take(tracer, ProcessUtil::self()), first);
+  EXPECT_EQ(pool.take(tracer, ProcessInfo::self()), first);
 
   pool.give_back(second);
   pool.give_back(first);
-  EXPECT_EQ(pool.take(tracer, ProcessUtil::self()), std::min(first, second));
+  EXPECT_EQ(pool.take(tracer, ProcessInfo::self()), std::min(first, second));
 
   // Another process's work gets rows of its own rather than sharing these.
   constexpr std::uint32_t k_other = 99;

@@ -2,7 +2,7 @@
 #include "virtualfilesystem.hpp"
 
 #include "directorytree.hpp"
-#include "processutil.hpp"
+#include "processinfo.hpp"
 #include "tracer.hpp"
 
 #include <stdexec/execution.hpp>
@@ -41,6 +41,19 @@
 namespace makebelieve {
 
 namespace {
+
+// The errno a tree error reaches FUSE as. Only the errno categories carry
+// errno values; any other - a command's exit status, say - is a failure this
+// filesystem has no errno for, and reads as an I/O error rather than as
+// whatever errno shares its number.
+int to_errno(const std::error_code& error) {
+  if ((error.category() == std::generic_category() ||
+       error.category() == std::system_category()) &&
+      error.value() > 0) {
+    return error.value();
+  }
+  return EIO;
+}
 
 // The process the thread @a thread belongs to, read from `/proc`. FUSE names
 // the calling thread rather than the program behind it, and it is the program
@@ -92,7 +105,7 @@ TraceProcess calling_process(std::uint32_t thread) {
   return {.id = process,
           .name = g_tracer->knows_process(process)
                       ? std::string()
-                      : ProcessUtil::name_of(process)};
+                      : ProcessInfo::name_of(process)};
 }
 
 // Turns a FUSE path (absolute, from the mount root) into the tree-relative
@@ -346,8 +359,7 @@ class VirtualFileSystem::Impl {
         // Everything this filesystem talks to deals in errno values, so a
         // code that escaped as an exception is handed back the same way
         // op_read hands back the ones the tree returns.
-        const int code = error.code().value();
-        return code > 0 ? -code : -EIO;
+        return -to_errno(error.code());
       } catch (...) {
         return -EIO;
       }
@@ -511,8 +523,7 @@ class VirtualFileSystem::Impl {
     if (const std::expected<FileInfo, std::error_code> opened =
             m_tree.open(relative);
         !opened.has_value()) {
-      const int code = opened.error().value();
-      return code > 0 ? -code : -EIO;
+      return -to_errno(opened.error());
     }
     return 0;
   }
@@ -527,10 +538,7 @@ class VirtualFileSystem::Impl {
     const std::expected<std::string, std::error_code> bytes =
         m_tree.read(to_tree_path(path), static_cast<Offset>(offset), size);
     if (!bytes.has_value()) {
-      // The tree's error codes are errno values; hand them straight back as
-      // the negative errno FUSE expects, falling back to EIO for anything odd.
-      const int code = bytes.error().value();
-      return code > 0 ? -code : -EIO;
+      return -to_errno(bytes.error());
     }
 
     const size_t count = std::min(size, bytes->size());
