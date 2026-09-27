@@ -318,6 +318,18 @@ class BuildDirectoryTreeTest : public ::testing::Test {
   }
 };
 
+// A tracer installed to `g_tracer` for as long as the fixture's threads run.
+struct InstalledTracer {
+  Tracer tracer;
+  TracerInstallation installed{tracer};
+};
+
+// As `BuildDirectoryTreeTest`, recording to `tracer`. A base installs it so
+// that it is installed before the fixture's threads start and is uninstalled
+// only after they have finished, as `g_tracer` requires.
+class BuildDirectoryTreeTracingTest : protected InstalledTracer,
+                                      public BuildDirectoryTreeTest {};
+
 TEST_F(BuildDirectoryTreeTest, NoManifestYieldsAnEmptyTree) {
   int runs = 0;
   const BuildDirectoryTree tree(source, [&runs](Command) {
@@ -1047,13 +1059,11 @@ TEST_F(BuildDirectoryTreeTest, ARemovedRuleForgetsItsDependencies) {
 
 // A `tracing` output is the installed tracer's trace, served by the tree
 // without involving the runner, and it shows the builds that went before.
-TEST_F(BuildDirectoryTreeTest, ATracingOutputServesTheTrace) {
+TEST_F(BuildDirectoryTreeTracingTest, ATracingOutputServesTheTrace) {
   write_manifest(
       "@/trace.json = tracing\n"
       "@/output.txt = run build %out\n");
 
-  Tracer tracer;
-  const TracerInstallation installed(tracer);
   int runs = 0;
   const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
 
@@ -1080,13 +1090,11 @@ TEST_F(BuildDirectoryTreeTest, ATracingOutputServesTheTrace) {
 
 // Every open takes a fresh snapshot, so the trace includes whatever happened
 // since the last one.
-TEST_F(BuildDirectoryTreeTest, ATracingOutputIsFreshOnEveryOpen) {
+TEST_F(BuildDirectoryTreeTracingTest, ATracingOutputIsFreshOnEveryOpen) {
   write_manifest(
       "@/trace.json = tracing\n"
       "@/output.txt = run build %out\n");
 
-  Tracer tracer;
-  const TracerInstallation installed(tracer);
   int runs = 0;
   const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
 
@@ -1113,14 +1121,12 @@ TEST_F(BuildDirectoryTreeTest, ATracingOutputWithoutATracerIsAnEmptyTrace) {
 // Builds share a pool of rows in the trace: one row each while they overlap,
 // and a row goes back in the pool for the next build once its own span is
 // closed.
-TEST_F(BuildDirectoryTreeTest, BuildsShareRowsInTheTrace) {
+TEST_F(BuildDirectoryTreeTracingTest, BuildsShareRowsInTheTrace) {
   write_manifest(
       "@/a.txt = run build a %out\n"
       "@/b.txt = run build b %out\n"
       "@/c.txt = run build c %out\n");
 
-  Tracer tracer;
-  const TracerInstallation installed(tracer);
   const DeferredRunner runner;
   const BuildDirectoryTree tree(source, runner.runner());
 
@@ -1155,11 +1161,9 @@ TEST_F(BuildDirectoryTreeTest, BuildsShareRowsInTheTrace) {
 // Reading the trace rewrites it; announcing that would have a watcher that
 // rereads changed files reread the trace forever. Adding the output is still
 // announced.
-TEST_F(BuildDirectoryTreeTest, RewritingATracingOutputIsNotAnnounced) {
+TEST_F(BuildDirectoryTreeTracingTest, RewritingATracingOutputIsNotAnnounced) {
   write_manifest("@/output.txt = run build %out\n");
 
-  Tracer tracer;
-  const TracerInstallation installed(tracer);
   int runs = 0;
   const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
 
