@@ -40,8 +40,11 @@ add_library(makebelieve_core STATIC
   iocontext.cpp
   iocontext-${MAKEBELIEVE_PLATFORM}.cpp
   manifest.cpp
+  processinfo-${MAKEBELIEVE_PLATFORM}.cpp
   processutil-${MAKEBELIEVE_PLATFORM}.cpp
+  processutil-common.cpp
   realdirectorytree-${MAKEBELIEVE_PLATFORM}.cpp
+  shellrunner.cpp
   stringutil.cpp
   tracer.cpp
   unmountchannel-${MAKEBELIEVE_PLATFORM}.cpp
@@ -152,11 +155,16 @@ if(BUILD_TESTING)
   makebelieve_add_test(manifest)
   makebelieve_add_test(processutil)
   makebelieve_add_test(realdirectorytree)
+  makebelieve_add_test(shellrunner)
   makebelieve_add_test(tracer)
   makebelieve_add_test(inmemorydirectorytree)
+  makebelieve_add_test(buildqueue)
   makebelieve_add_test(iocontext)
   makebelieve_add_test(directorytreeutil)
   makebelieve_add_test(virtualfilesystem)
+  if(WIN32)
+    makebelieve_add_test(tracingenvironment)
+  endif()
 
   add_executable(consoleinterrupthandler_test consoleinterrupthandler.t.cpp)
   target_link_libraries(consoleinterrupthandler_test PRIVATE

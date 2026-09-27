@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 #include "processutil.hpp"
 
+#include "iocontext.hpp"
+
+#include <stdexec/execution.hpp>
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -8,11 +12,11 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 #ifdef _WIN32
@@ -55,6 +59,7 @@ class ProcessUtil : public ::testing::Test {
   }
 
   void TearDown() override {
+    makebelieve::ProcessUtilTestUtil::reset();
     std::error_code ec;
     std::filesystem::remove_all(work, ec);
   }
@@ -64,18 +69,25 @@ class ProcessUtil : public ::testing::Test {
     stream << content;
   }
 
-  // Runs @a command and returns the single Result it reports.
+  makebelieve::IoContext io;
+
+  // Runs @a command in @a working_directory and returns what it completes
+  // with.
+  makebelieve::ProcessUtil::Result run_in(
+      const std::filesystem::path& working_directory,
+      const std::string& command,
+      stdexec::inplace_stop_token stop = {}) {
+    return std::get<0>(
+        stdexec::sync_wait(
+            makebelieve::ProcessUtil::run(io, working_directory, command, stop))
+            .value());
+  }
+
+  // Runs @a command in the working directory and returns what it completes
+  // with.
   makebelieve::ProcessUtil::Result run(const std::string& command,
-                                       std::stop_token stop = {}) {
-    makebelieve::ProcessUtil::Result result;
-    bool called = false;
-    makebelieve::ProcessUtil::run(work, command, std::move(stop),
-                                  [&](makebelieve::ProcessUtil::Result r) {
-                                    result = std::move(r);
-                                    called = true;
-                                  });
-    EXPECT_TRUE(called);  // reported synchronously, exactly once
-    return result;
+                                       stdexec::inplace_stop_token stop = {}) {
+    return run_in(work, command, stop);
   }
 };
 
@@ -131,10 +143,8 @@ TEST_F(ProcessUtil, TracesInputsWhenWorkingDirectoryIsAShortPath) {
     GTEST_SKIP() << "8.3 short names unavailable on this volume";
   }
 
-  makebelieve::ProcessUtil::Result result;
-  makebelieve::ProcessUtil::run(
-      short_work, print_file_command("input.txt"), {},
-      [&](makebelieve::ProcessUtil::Result r) { result = std::move(r); });
+  const makebelieve::ProcessUtil::Result result =
+      run_in(short_work, print_file_command("input.txt"));
 
   ASSERT_TRUE(result.has_value());
   const bool found =
@@ -165,10 +175,8 @@ TEST_F(ProcessUtil, TracesInputsWhenWorkingDirectoryIsSymlinked) {
     GTEST_SKIP() << "could not create a directory symlink on this platform";
   }
 
-  makebelieve::ProcessUtil::Result result;
-  makebelieve::ProcessUtil::run(
-      link, print_file_command("input.txt"), {},
-      [&](makebelieve::ProcessUtil::Result r) { result = std::move(r); });
+  const makebelieve::ProcessUtil::Result result =
+      run_in(link, print_file_command("input.txt"));
   std::filesystem::remove(link, ec);
 
   ASSERT_TRUE(result.has_value());
@@ -182,8 +190,35 @@ TEST_F(ProcessUtil, TracesInputsWhenWorkingDirectoryIsSymlinked) {
 }
 #endif
 
+// Waiting on a command holds no thread: ten one-second commands started from
+// one thread finish together rather than one after another.
+TEST_F(ProcessUtil, RunsCommandsAtOnceWithoutAThreadEach) {
+  const auto start = std::chrono::steady_clock::now();
+  const auto results = stdexec::sync_wait(stdexec::when_all(
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1))));
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  ASSERT_TRUE(results.has_value());
+  const int succeeded = std::apply(
+      [](const auto&... result) {
+        return (static_cast<int>(result.has_value()) + ...);
+      },
+      *results);
+  EXPECT_EQ(succeeded, 10);
+  EXPECT_LT(elapsed, 6s);
+}
+
 TEST_F(ProcessUtil, ReportsCancellationWhenStopIsAlreadyRequested) {
-  std::stop_source source;
+  stdexec::inplace_stop_source source;
   source.request_stop();
 
   const makebelieve::ProcessUtil::Result result =
@@ -195,7 +230,7 @@ TEST_F(ProcessUtil, ReportsCancellationWhenStopIsAlreadyRequested) {
 }
 
 TEST_F(ProcessUtil, TerminatesARunningCommandWhenStopIsRequested) {
-  std::stop_source source;
+  stdexec::inplace_stop_source source;
   std::jthread stopper([&source] {
     std::this_thread::sleep_for(200ms);
     source.request_stop();
@@ -212,5 +247,220 @@ TEST_F(ProcessUtil, TerminatesARunningCommandWhenStopIsRequested) {
   // Returned promptly on cancellation rather than waiting out the full sleep.
   EXPECT_LT(elapsed, 10s);
 }
+
+TEST_F(ProcessUtil, ReportsTheStatusACommandExitedWith) {
+  write_input("input.txt", "hello world");
+
+  const makebelieve::ProcessUtil::Result result =
+      run(print_file_command("input.txt") + " && exit 3");
+
+  // A nonzero status is the caller's to judge; what the command did is still
+  // reported in full.
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->exit_status, 3);
+  EXPECT_EQ(result->standard_output, "hello world");
+  EXPECT_FALSE(result->inputs.empty());
+}
+
+#ifdef __linux__
+TEST_F(ProcessUtil, ReportsACommandKilledByASignalAsTheShellWould) {
+  const makebelieve::ProcessUtil::Result result = run("kill -KILL $$");
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->exit_status, 128 + 9);
+}
+#endif
+
+// --- When a command cannot be traced ---------------------------------------
+//
+// Tracing is required, so each of these fails the run - and must leave nothing
+// behind: no command still running, no callback outliving what it uses (which
+// the sanitizer builds would catch), and nothing to stop the next run working.
+
+using Failure = makebelieve::ProcessUtilTestUtil::Failure;
+
+// Where a command leaves a marker if it ever runs: outside the working
+// directory, which under tracing on Linux is a read-only view.
+std::filesystem::path marker_path() {
+  return std::filesystem::temp_directory_path() /
+         ("makebelieve-marker-" +
+          std::string(
+              ::testing::UnitTest::GetInstance()->current_test_info()->name()));
+}
+
+std::string touch_command(const std::filesystem::path& path) {
+  return "cmake -E touch \"" + path.string() + "\"";
+}
+
+TEST_F(ProcessUtil, ACommandThatCannotBeTracedNeverRuns) {
+  const std::filesystem::path marker = marker_path();
+  std::error_code ec;
+  std::filesystem::remove(marker, ec);
+  makebelieve::ProcessUtilTestUtil::fail_next(
+      Failure::tracing_setup,
+      std::make_error_code(std::errc::permission_denied));
+
+  const makebelieve::ProcessUtil::Result result = run(touch_command(marker));
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), std::errc::permission_denied);
+  EXPECT_FALSE(std::filesystem::exists(marker));
+
+  // Nothing is left behind to trouble the next run.
+  EXPECT_TRUE(run(touch_command(marker)).has_value());
+  EXPECT_TRUE(std::filesystem::exists(marker));
+  std::filesystem::remove(marker, ec);
+}
+
+#ifdef __linux__
+// Servicing the mount failing loses reads, so the build fails - and the
+// command, which would otherwise block on its unserved mount for ever, is
+// ended rather than waited out.
+TEST_F(ProcessUtil, ATracingFailureWhileRunningFailsTheRunAndEndsTheCommand) {
+  write_input("input.txt", "hello world");
+  makebelieve::ProcessUtilTestUtil::fail_next(
+      Failure::tracing_service, std::make_error_code(std::errc::io_error));
+
+  const auto start = std::chrono::steady_clock::now();
+  const makebelieve::ProcessUtil::Result result =
+      run(print_file_command("input.txt") + " && " + sleep_command(20));
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), std::errc::io_error);
+  EXPECT_LT(elapsed, 10s);
+
+  EXPECT_TRUE(run(print_file_command("input.txt")).has_value());
+}
+#endif
+
+#ifdef _WIN32
+// A trace log that cannot be read back is an error, never an empty list of
+// dependencies.
+TEST_F(ProcessUtil, ATraceLogThatCannotBeReadFailsTheRun) {
+  write_input("input.txt", "hello world");
+  makebelieve::ProcessUtilTestUtil::fail_next(Failure::trace_log);
+
+  const makebelieve::ProcessUtil::Result result =
+      run(print_file_command("input.txt"));
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), std::errc::no_such_file_or_directory);
+
+  EXPECT_TRUE(run(print_file_command("input.txt")).has_value());
+}
+
+// A read the hook cannot append to the log is a lost dependency, so the run
+// fails rather than succeeding with fewer inputs. Here the command itself
+// locks the log against writers while it reads.
+TEST_F(ProcessUtil, AReadThatCannotBeLoggedFailsTheRun) {
+  write_input("input.txt", "hello world");
+
+  const makebelieve::ProcessUtil::Result result = run(
+      R"cmd(powershell.exe -NoProfile -NonInteractive -Command "$lock = [IO.File]::Open($env:MAKEBELIEVE_TRACE_LOG, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read); try { [Console]::Write([IO.File]::ReadAllText((Join-Path (Get-Location) 'input.txt'))) } finally { $lock.Dispose() }")cmd");
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), std::errc::io_error);
+
+  EXPECT_TRUE(run(print_file_command("input.txt")).has_value());
+}
+
+// Tracing is mandatory, so a process whose hook cannot install never runs its
+// own code - and the run fails.
+TEST_F(ProcessUtil, ACommandWhoseHookCannotInstallNeverRuns) {
+  const std::filesystem::path marker = marker_path();
+  std::error_code ec;
+  std::filesystem::remove(marker, ec);
+  makebelieve::ProcessUtilTestUtil::fail_next(Failure::trace_hook_install);
+
+  const makebelieve::ProcessUtil::Result result = run(touch_command(marker));
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), std::errc::io_error);
+  EXPECT_FALSE(std::filesystem::exists(marker));
+
+  EXPECT_TRUE(run(touch_command(marker)).has_value());
+  std::filesystem::remove(marker, ec);
+}
+
+// An empty log from a command no hook ever ran in says nothing about what it
+// read, so the run fails rather than reporting no inputs.
+TEST_F(ProcessUtil, AHookThatNeverRunsFailsTheRun) {
+  write_input("input.txt", "hello world");
+  makebelieve::ProcessUtilTestUtil::fail_next(Failure::trace_hook_absent);
+
+  const makebelieve::ProcessUtil::Result result =
+      run(print_file_command("input.txt"));
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), std::errc::operation_not_supported);
+
+  EXPECT_TRUE(run(print_file_command("input.txt")).has_value());
+}
+
+// Every process is accounted for, not just some: a child that runs untraced
+// fails the run even though the command itself was traced.
+TEST_F(ProcessUtil, AChildThatRunsUntracedFailsTheRun) {
+  write_input("input.txt", "hello world");
+  makebelieve::ProcessUtilTestUtil::fail_next(
+      Failure::trace_hook_absent_in_children);
+
+  // cmd.exe, which is traced, starts cmake, which is not.
+  const makebelieve::ProcessUtil::Result result =
+      run(print_file_command("input.txt"));
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), std::errc::operation_not_supported);
+
+  EXPECT_TRUE(run(print_file_command("input.txt")).has_value());
+}
+
+// A child handed a tracing variable of its own, in a case other than ours, is
+// traced under this run's value rather than its own.
+TEST_F(ProcessUtil, TracesAChildGivenATracingVariableInAnotherCase) {
+  write_input("input.txt", "hello world");
+
+  const makebelieve::ProcessUtil::Result result = run(
+      R"cmd(powershell.exe -NoProfile -NonInteractive -Command "$s = New-Object System.Diagnostics.ProcessStartInfo; $s.FileName = 'cmake.exe'; $s.Arguments = '-E cat input.txt'; $s.WorkingDirectory = (Get-Location).Path; $s.UseShellExecute = $false; $s.RedirectStandardOutput = $true; $s.EnvironmentVariables.Remove('MAKEBELIEVE_TRACE_ROOT'); $s.EnvironmentVariables['makebelieve_trace_root'] = 'C:\unrelated-root'; $p = [Diagnostics.Process]::Start($s); [Console]::Write($p.StandardOutput.ReadToEnd()); $p.WaitForExit(); exit $p.ExitCode")cmd");
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->standard_output, "hello world");
+  EXPECT_TRUE(std::ranges::any_of(result->inputs,
+                                  [](const std::filesystem::path& path) {
+                                    return path.filename() == "input.txt";
+                                  }));
+}
+
+// Once a read cannot be recorded the command has lost a dependency, so it is
+// ended then rather than left to run on.
+TEST_F(ProcessUtil, AReadThatCannotBeLoggedEndsTheCommand) {
+  write_input("input.txt", "hello world");
+
+  const auto start = std::chrono::steady_clock::now();
+  const makebelieve::ProcessUtil::Result result = run(
+      R"cmd(powershell.exe -NoProfile -NonInteractive -Command "$lock = [IO.File]::Open($env:MAKEBELIEVE_TRACE_LOG, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read); try { [IO.File]::ReadAllText((Join-Path (Get-Location) 'input.txt')) | Out-Null; Start-Sleep -Seconds 20 } finally { $lock.Dispose() }")cmd");
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), std::errc::io_error);
+  EXPECT_LT(elapsed, 10s);
+}
+
+// A child started with an environment of its own - here, one without any of
+// the tracing variables - is still traced.
+TEST_F(ProcessUtil, TracesAChildGivenAnEnvironmentWithoutTracing) {
+  write_input("input.txt", "hello world");
+
+  const makebelieve::ProcessUtil::Result result = run(
+      R"cmd(powershell.exe -NoProfile -NonInteractive -Command "$s = New-Object System.Diagnostics.ProcessStartInfo; $s.FileName = 'cmake.exe'; $s.Arguments = '-E cat input.txt'; $s.WorkingDirectory = (Get-Location).Path; $s.UseShellExecute = $false; $s.RedirectStandardOutput = $true; $s.EnvironmentVariables.Remove('MAKEBELIEVE_TRACE_STATUS'); $s.EnvironmentVariables.Remove('MAKEBELIEVE_TRACE_LOG'); $s.EnvironmentVariables.Remove('MAKEBELIEVE_TRACE_ROOT'); $p = [Diagnostics.Process]::Start($s); [Console]::Write($p.StandardOutput.ReadToEnd()); $p.WaitForExit(); exit $p.ExitCode")cmd");
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->standard_output, "hello world");
+  EXPECT_TRUE(std::ranges::any_of(result->inputs,
+                                  [](const std::filesystem::path& path) {
+                                    return path.filename() == "input.txt";
+                                  }));
+}
+#endif
 
 }  // namespace

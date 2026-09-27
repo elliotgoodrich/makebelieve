@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "tracer.hpp"
 
-#include "processutil.hpp"
+#include "processinfo.hpp"
 
 #include <algorithm>
 #include <array>
@@ -205,7 +205,7 @@ void TraceText::append(std::string& out, const std::filesystem::path& value) {
 }
 
 Tracer::Tracer(std::size_t capacity)
-    : m_process(ProcessUtil::self()),
+    : m_process(ProcessInfo::self()),
       m_capacity(capacity),
       m_slice_size(std::max<std::size_t>(capacity / 16, 1)) {
   name_process(m_process, "makebelieve");

@@ -2,7 +2,7 @@
 #include "virtualfilesystem.hpp"
 
 #include "directorytree.hpp"
-#include "processutil.hpp"
+#include "processinfo.hpp"
 #include "tracer.hpp"
 
 #include <stdexec/execution.hpp>
@@ -50,7 +50,7 @@ TraceProcess calling_process(std::uint32_t process) {
   return {.id = process,
           .name = g_tracer->knows_process(process)
                       ? std::string()
-                      : ProcessUtil::name_of(process)};
+                      : ProcessInfo::name_of(process)};
 }
 
 // A nominal capacity to report for the volume. Nothing is ever written here,
@@ -222,7 +222,8 @@ constexpr std::array k_errc_statuses{
 // RealDirectoryTree hands back Win32 codes, the in-memory trees hand back
 // std::errc - so each is translated on its own terms rather than feeding a
 // POSIX errno to a function that expects a Win32 error. Anything else is
-// matched by the portable condition it is equivalent to.
+// matched by the portable condition it is equivalent to, and a category with
+// none - a command's exit status, say - reads as an I/O error.
 NTSTATUS to_ntstatus(const std::error_code& error) {
   if (error.category() == std::system_category()) {
     return FspNtStatusFromWin32(static_cast<DWORD>(error.value()));
@@ -232,7 +233,7 @@ NTSTATUS to_ntstatus(const std::error_code& error) {
       return entry.status;
     }
   }
-  return STATUS_UNSUCCESSFUL;
+  return STATUS_IO_DEVICE_ERROR;
 }
 
 // An absolute mountpoint with no trailing separator. `mnt\` names the same
