@@ -119,3 +119,23 @@ makebelieve unmount <mountpoint>
 
 `unmount` signals the instance serving that mountpoint to shut down and
 blocks until it has fully torn down.
+
+By default, at most one build per core holds a place to run at a time;
+`-j <builds>` sets another limit:
+
+```sh
+makebelieve mount -j 2 <mountpoint>
+```
+
+A build's command may itself read other outputs through the mount - a PDF
+built from generated Markdown, say. While it waits for one to build, its
+build gives up its place, so a chain of such outputs longer than the limit
+still completes. Its other threads and processes keep running meanwhile, so
+`-j` limits how many builds hold a place, not how many processes are
+runnable or how much CPU they use; a command that never reads another output
+keeps its place until it finishes.
+
+Opening an output that would wait on a cycle of builds - including a command
+reading its own output - fails with `EDEADLK`, and every build on the cycle
+fails. At most 64 opens can wait on builds at once; another fails with
+`EAGAIN` rather than wait.

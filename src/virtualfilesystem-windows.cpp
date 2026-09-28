@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "virtualfilesystem.hpp"
 
+#include "admission.hpp"
 #include "directorytree.hpp"
 #include "processinfo.hpp"
 #include "tracer.hpp"
@@ -23,6 +24,7 @@
 #include <cstring>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <functional>
 #include <map>
 #include <memory>
@@ -206,6 +208,12 @@ constexpr std::array k_errc_statuses{
                .status = STATUS_TOO_MANY_OPENED_FILES},
     ErrcStatus{.condition = std::errc::operation_canceled,
                .status = STATUS_CANCELLED},
+    // An open that would wait on a cycle of builds.
+    ErrcStatus{.condition = std::errc::resource_deadlock_would_occur,
+               .status = STATUS_POSSIBLE_DEADLOCK},
+    // An open that would block with no dispatcher thread left to park.
+    ErrcStatus{.condition = std::errc::resource_unavailable_try_again,
+               .status = STATUS_INSUFFICIENT_RESOURCES},
     ErrcStatus{.condition = std::errc::timed_out, .status = STATUS_IO_TIMEOUT},
     ErrcStatus{.condition = std::errc::io_error,
                .status = STATUS_IO_DEVICE_ERROR},
@@ -419,13 +427,21 @@ class VirtualFileSystem::Impl {
     }
     m_mounted = true;
 
-    // 0 asks for WinFsp's default thread count, which is what every sample
-    // uses and scales with the machine.
-    if (const NTSTATUS status = FspFileSystemStartDispatcher(m_filesystem, 0);
+    // Exactly as many threads as the admission budget is sized against: its
+    // default is the processor count, which a few parked opens would exhaust.
+    if (const NTSTATUS status = FspFileSystemStartDispatcher(
+            m_filesystem, static_cast<ULONG>(k_dispatcher_threads));
         !NT_SUCCESS(status)) {
       throw_status(status, "FspFileSystemStartDispatcher failed");
     }
     m_dispatching = true;
+    if (m_filesystem->DispatcherThreadCount != k_dispatcher_threads) {
+      throw std::system_error(
+          std::make_error_code(std::errc::resource_unavailable_try_again),
+          std::format("WinFsp started {} dispatcher threads, not {}",
+                      m_filesystem->DispatcherThreadCount,
+                      k_dispatcher_threads));
+    }
 
     // The subscription is taken last so no notification can arrive before
     // there is a filesystem to announce it through.
@@ -646,7 +662,9 @@ class VirtualFileSystem::Impl {
     }
     if (std::holds_alternative<FileInfo>(*status) &&
         (granted_access & (FILE_READ_DATA | FILE_EXECUTE)) != 0) {
-      const std::expected<FileInfo, std::error_code> opened = m_tree.open(path);
+      const std::expected<FileInfo, std::error_code> opened = m_tree.open(
+          path,
+          OpenContext{.requester_pid = caller, .admission = &m_admission});
       if (!opened.has_value()) {
         return to_ntstatus(opened.error());
       }
@@ -1105,6 +1123,10 @@ class VirtualFileSystem::Impl {
   // several times over. Consulted before every notification and drained by
   // cleanup().
   std::mutex m_open_mutex;
+
+  // What an open must reserve before the tree may block it, so parked opens
+  // never take the dispatcher threads other requests need.
+  AdmissionBudget m_admission{k_blocking_opens};
   std::map<std::filesystem::path, int> m_open_counts;
 
   // The queue on_tree_changed hands the notifier. m_pending coalesces: a path

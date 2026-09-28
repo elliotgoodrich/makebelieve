@@ -11,7 +11,9 @@
 #include <chrono>
 #include <concepts>
 #include <condition_variable>
+#include <deque>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -103,6 +105,97 @@ void spawn_held(Queue& queue, ex::counting_scope& scope, Held& held, int who) {
                 ex::upon_stopped([&held]() noexcept { held.stopped(); }) |
                 ex::upon_error([](const auto&) noexcept {}),
             scope.get_token());
+}
+
+// Leased work driven a step at a time by the test, each step run with its
+// lease on a thread of the work's own, until told to finish.
+template <class Queue>
+class Driven {
+ public:
+  using Lease = typename Queue::Lease;
+  using Step = std::function<void(Lease&)>;
+
+ private:
+  std::mutex m_mutex;
+  std::condition_variable m_changed;
+  std::deque<Step> m_steps;
+  int m_steps_done = 0;
+  bool m_started = false;
+  bool m_finish = false;
+  exec::single_thread_context m_runner;
+
+  void run(Lease& lease) {
+    std::unique_lock lock(m_mutex);
+    m_started = true;
+    m_changed.notify_all();
+    while (true) {
+      m_changed.wait(lock, [&] { return m_finish || !m_steps.empty(); });
+      if (m_steps.empty()) {
+        return;
+      }
+      Step step = std::move(m_steps.front());
+      m_steps.pop_front();
+      lock.unlock();
+      step(lease);
+      lock.lock();
+      ++m_steps_done;
+      m_changed.notify_all();
+    }
+  }
+
+ public:
+  // Starts the work through @a queue, in @a scope.
+  void spawn(Queue& queue, ex::counting_scope& scope) {
+    ex::spawn(queue.schedule_leased([this](Lease& lease) {
+      return ex::schedule(m_runner.get_scheduler()) |
+             ex::then([this, &lease]() noexcept { run(lease); });
+    }) | ex::upon_stopped([]() noexcept {}) |
+                  ex::upon_error([](const auto&) noexcept {}),
+              scope.get_token());
+  }
+
+  // Queues @a step for the work to run.
+  void post(Step step) {
+    {
+      const std::lock_guard lock(m_mutex);
+      m_steps.push_back(std::move(step));
+    }
+    m_changed.notify_all();
+  }
+
+  // Waits (bounded) until the work has started and run @a steps steps.
+  [[nodiscard]] bool wait_until(int steps) {
+    std::unique_lock lock(m_mutex);
+    return m_changed.wait_for(
+        lock, 10s, [&] { return m_started && m_steps_done >= steps; });
+  }
+
+  // Lets the work complete once its steps are done.
+  void finish() {
+    {
+      const std::lock_guard lock(m_mutex);
+      m_finish = true;
+    }
+    m_changed.notify_all();
+  }
+};
+
+// Checks @a queue runs exactly @a slots pieces of work at once: that many
+// start, and one more does not until one of them finishes.
+template <class Queue>
+void expect_slots(Queue& queue, int slots) {
+  Held held;
+  ex::counting_scope scope;
+  for (int i = 0; i <= slots; ++i) {
+    spawn_held(queue, scope, held, i);
+  }
+  EXPECT_TRUE(held.wait_until(slots));
+  std::this_thread::sleep_for(50ms);
+  EXPECT_EQ(held.started().size(), static_cast<std::size_t>(slots));
+  for (int i = 0; i <= slots; ++i) {
+    held.release(i);
+  }
+  ex::sync_wait(scope.join());
 }
 
 std::thread::id thread_of(exec::static_thread_pool& pool) {
@@ -376,6 +469,160 @@ TEST(BuildQueue, StartsWorkThatWaitedOnItsHandoffScheduler) {
   held.release(1);
   ex::sync_wait(scope.join());
   EXPECT_EQ(started_on, thread_of(pool));
+}
+
+using PoolQueue = BuildQueue<exec::static_thread_pool::scheduler>;
+
+// Giving a lease's slot back starts work waiting for one at once, and taking
+// it back waits for that work to finish.
+TEST(BuildQueue, ReleasingALeaseStartsAQueuedWaiterAtOnce) {
+  exec::static_thread_pool pool(1);
+  PoolQueue queue(1, pool.get_scheduler());
+  Driven<PoolQueue> leased;
+  Held held;
+  ex::counting_scope scope;
+  leased.spawn(queue, scope);
+  ASSERT_TRUE(leased.wait_until(0));
+  spawn_held(queue, scope, held, 1);
+  std::this_thread::sleep_for(50ms);
+  EXPECT_TRUE(held.started().empty());
+
+  leased.post([](PoolQueue::Lease& lease) { lease.release(); });
+  ASSERT_TRUE(held.wait_until(1));
+
+  std::atomic<bool> reacquired = false;
+  std::atomic<bool> held_after = false;
+  leased.post([&](PoolQueue::Lease& lease) {
+    reacquired = ex::sync_wait(lease.reacquire()).has_value();
+    held_after = lease.held();
+  });
+  std::this_thread::sleep_for(50ms);
+  EXPECT_FALSE(reacquired);
+  held.release(1);
+  ASSERT_TRUE(leased.wait_until(2));
+  EXPECT_TRUE(reacquired);
+  EXPECT_TRUE(held_after);
+  leased.finish();
+  ex::sync_wait(scope.join());
+  expect_slots(queue, 1);
+}
+
+// A lease taking its slot back goes ahead of new work that was queued first.
+TEST(BuildQueue, AReacquireIsServedBeforeNewWork) {
+  exec::static_thread_pool pool(1);
+  PoolQueue queue(1, pool.get_scheduler());
+  Driven<PoolQueue> leased;
+  Held held;
+  ex::counting_scope scope;
+  leased.spawn(queue, scope);
+  ASSERT_TRUE(leased.wait_until(0));
+  leased.post([](PoolQueue::Lease& lease) { lease.release(); });
+  spawn_held(queue, scope, held, 1);
+  ASSERT_TRUE(held.wait_until(1));
+
+  // New work queues first, then the lease asks for its slot back.
+  spawn_held(queue, scope, held, 2);
+  std::atomic<bool> reacquired = false;
+  leased.post([&](PoolQueue::Lease& lease) {
+    reacquired = ex::sync_wait(lease.reacquire()).has_value();
+  });
+  std::this_thread::sleep_for(50ms);
+
+  held.release(1);
+  ASSERT_TRUE(leased.wait_until(2));
+  EXPECT_TRUE(reacquired);
+  std::this_thread::sleep_for(50ms);
+  EXPECT_EQ(held.started(), (std::vector<int>{1}));
+
+  leased.finish();
+  ASSERT_TRUE(held.wait_until(2));
+  held.release(2);
+  ex::sync_wait(scope.join());
+  expect_slots(queue, 1);
+}
+
+// A reacquire stopped while it waits completes stopped on the handoff
+// scheduler, holding nothing, and no slot goes missing.
+TEST(BuildQueue, AStoppedReacquireCompletesStoppedOnHandoffLeakingNothing) {
+  exec::static_thread_pool pool(1);
+  PoolQueue queue(1, pool.get_scheduler());
+  Driven<PoolQueue> leased;
+  Held held;
+  ex::counting_scope scope;
+  leased.spawn(queue, scope);
+  ASSERT_TRUE(leased.wait_until(0));
+  leased.post([](PoolQueue::Lease& lease) { lease.release(); });
+  spawn_held(queue, scope, held, 1);
+  ASSERT_TRUE(held.wait_until(1));
+
+  ex::inplace_stop_source stop;
+  std::optional<std::thread::id> stopped_on;
+  std::atomic<bool> held_after = true;
+  leased.post([&](PoolQueue::Lease& lease) {
+    const auto result = ex::sync_wait(
+        ex::write_env(lease.reacquire(),
+                      ex::prop{ex::get_stop_token, stop.get_token()}) |
+        ex::upon_stopped(
+            [&]() noexcept { stopped_on = std::this_thread::get_id(); }));
+    static_cast<void>(result);
+    held_after = lease.held();
+  });
+  std::this_thread::sleep_for(50ms);
+  stop.request_stop();
+  ASSERT_TRUE(leased.wait_until(2));
+  EXPECT_EQ(stopped_on, thread_of(pool));
+  EXPECT_FALSE(held_after);
+
+  leased.finish();
+  held.release(1);
+  ex::sync_wait(scope.join());
+  expect_slots(queue, 1);
+}
+
+// Leases giving slots back and taking them again, racing stops that take
+// their reacquires off the queue, lose no slot and make none up.
+TEST(BuildQueue, StopsRacingReleasesAndReacquiresLoseNoSlot) {
+  exec::static_thread_pool pool(1);
+  exec::static_thread_pool runners(4);
+  constexpr int k_slots = 3;
+  PoolQueue queue(k_slots, pool.get_scheduler());
+  constexpr int k_work = 200;
+  std::atomic<int> finished = 0;
+  std::atomic<int> holding = 0;
+  std::atomic<int> most_holding = 0;
+  {
+    ex::counting_scope scope;
+    for (int i = 0; i < k_work; ++i) {
+      ex::spawn(queue.schedule_leased([&](PoolQueue::Lease& lease) {
+        // Hold the slot for a moment, give it back, take it again.
+        auto round = [&]() {
+          return ex::schedule(runners.get_scheduler()) |
+                 ex::then([&]() noexcept {
+                   const int now = ++holding;
+                   int most = most_holding.load();
+                   while (now > most &&
+                          !most_holding.compare_exchange_weak(most, now)) {
+                   }
+                   std::this_thread::sleep_for(std::chrono::microseconds(50));
+                   --holding;
+                   lease.release();
+                 }) |
+                 ex::let_value([&lease] { return lease.reacquire(); });
+        };
+        return ex::just() | ex::let_value(round) | ex::let_value(round) |
+               ex::let_value(round) | ex::let_value(round);
+      }) | ex::then([&finished]() noexcept { ++finished; }) |
+                    ex::upon_stopped([&finished]() noexcept { ++finished; }) |
+                    ex::upon_error([](const auto&) noexcept {}),
+                scope.get_token());
+    }
+    std::this_thread::sleep_for(5ms);
+    scope.request_stop();
+    ex::sync_wait(scope.join());
+  }
+  EXPECT_EQ(finished.load(), k_work);
+  EXPECT_LE(most_holding.load(), k_slots);
+  expect_slots(queue, k_slots);
 }
 
 }  // namespace

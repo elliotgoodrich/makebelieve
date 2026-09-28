@@ -17,6 +17,8 @@
 
 namespace makebelieve {
 
+class BuildCoordinator;
+
 /// @class BuildDirectoryTree
 /// A `DirectoryTree` whose contents are the outputs declared in a
 /// `build.makebelieve` manifest that lives in another `DirectoryTree`.
@@ -26,6 +28,18 @@ namespace makebelieve {
 /// an output that is unbuilt or dirty, blocking until the build its
 /// @link CommandRunner returned completes. `status` and `read` never build: an
 /// unbuilt output reports size 1, otherwise the size of its last build.
+///
+/// Each build is one generation of its output, run through a
+/// @link BuildCoordinator, which is what an `open` waits through. An open
+/// waits for the build under way if the output has not changed since that
+/// build started, and gets that build's result even if the output changes
+/// before it finishes; if it has changed, the open waits for the build after
+/// it instead. (This is deliberate, and new: an open used to wait on through
+/// build after build for as long as the output kept changing.) Content read
+/// afterwards may already be a later build's: reads are not snapshotted.
+/// Opens made by a build's own command (as the coordinator tells them apart)
+/// give its permit back while they wait, and one that would wait on a cycle of
+/// builds fails with `std::errc::resource_deadlock_would_occur`.
 ///
 /// It then observes @a source for the rest of its life, recording the inputs
 /// each build reads, so a change to one of those inputs rebuilds the outputs
@@ -68,6 +82,15 @@ class BuildDirectoryTree : public DirectoryTree {
                      CommandRunner runner,
                      ManifestErrorHandler on_manifest_error = {});
 
+  /// As above, but running and waiting on builds through @a coordinator
+  /// rather than one of its own, which places no limit on how many run at
+  /// once and attributes no request to any build.
+  /// @pre @a coordinator outlives this tree.
+  BuildDirectoryTree(const DirectoryTree& source,
+                     CommandRunner runner,
+                     BuildCoordinator& coordinator,
+                     ManifestErrorHandler on_manifest_error = {});
+
   /// Cancels every build still under way and waits for each to complete, so
   /// no build outlives the tree.
   ~BuildDirectoryTree() override;
@@ -83,10 +106,15 @@ class BuildDirectoryTree : public DirectoryTree {
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
       const std::filesystem::path& path) const override;
 
+  using DirectoryTree::open;
+
   /// Builds @a path if unbuilt or dirty (or waits for a build under way) and
-  /// returns its info once up to date, or the error of a failed build.
+  /// returns its info once up to date, or the error of the failed build it
+  /// waited on - or fails as the coordinator's `wait` does, for a request
+  /// @a context says it cannot let wait.
   [[nodiscard]] std::expected<FileInfo, std::error_code> open(
-      const std::filesystem::path& path) const override;
+      const std::filesystem::path& path,
+      const OpenContext& context) const override;
 
   [[nodiscard]] std::expected<std::string, std::error_code> read(
       const std::filesystem::path& path,

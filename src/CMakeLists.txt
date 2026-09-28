@@ -32,6 +32,7 @@ endif()
 # Split from the executable so that tests can link the daemon's guts directly
 # rather than driving it through the binary.
 add_library(makebelieve_core STATIC
+  buildcoordinator.cpp
   builddirectorytree.cpp
   consoleinterrupthandler-${MAKEBELIEVE_PLATFORM}.cpp
   directorytreeutil.cpp
@@ -40,6 +41,7 @@ add_library(makebelieve_core STATIC
   iocontext.cpp
   iocontext-${MAKEBELIEVE_PLATFORM}.cpp
   manifest.cpp
+  processattribution-${MAKEBELIEVE_PLATFORM}.cpp
   processinfo-${MAKEBELIEVE_PLATFORM}.cpp
   processutil-${MAKEBELIEVE_PLATFORM}.cpp
   processutil-common.cpp
@@ -104,7 +106,7 @@ if(NOT WIN32)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
   target_link_libraries(makebelieve_core PUBLIC PkgConfig::FUSE3)
-  target_compile_definitions(makebelieve_core PRIVATE FUSE_USE_VERSION=35)
+  target_compile_definitions(makebelieve_core PRIVATE FUSE_USE_VERSION=312)
 endif()
 
 makebelieve_apply_clang_tidy(makebelieve_core)
@@ -150,9 +152,11 @@ if(BUILD_TESTING)
     gtest_discover_tests(${name}_test PROPERTIES TIMEOUT 30)
   endfunction()
 
+  makebelieve_add_test(buildcoordinator)
   makebelieve_add_test(builddirectorytree)
   makebelieve_add_test(filesystemutil)
   makebelieve_add_test(manifest)
+  makebelieve_add_test(processattribution)
   makebelieve_add_test(processutil)
   makebelieve_add_test(realdirectorytree)
   makebelieve_add_test(shellrunner)

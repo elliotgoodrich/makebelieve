@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "virtualfilesystem.hpp"
 
+#include "admission.hpp"
 #include "directorytree.hpp"
 #include "inmemorydirectorytree.hpp"
 
@@ -351,6 +352,12 @@ std::error_code native_io_error() {
   return {ERROR_IO_DEVICE, std::system_category()};
 }
 
+// How an open refused for want of a dispatcher thread to park reaches the
+// caller: STATUS_INSUFFICIENT_RESOURCES, as Win32 reports it.
+std::error_code native_try_again() {
+  return {ERROR_NO_SYSTEM_RESOURCES, std::system_category()};
+}
+
 FileMapper::FileMapper() = default;
 FileMapper::~FileMapper() = default;
 
@@ -474,6 +481,10 @@ std::error_code native_access_denied() {
 
 std::error_code native_io_error() {
   return {EIO, std::system_category()};
+}
+
+std::error_code native_try_again() {
+  return {EAGAIN, std::system_category()};
 }
 
 // The largest path a request carries and file a reply carries.
@@ -696,10 +707,94 @@ class SettleOnOpenTree : public makebelieve::DirectoryTree {
   }
 
   [[nodiscard]] std::expected<makebelieve::FileInfo, std::error_code> open(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& context) const override {
     ++m_opens;
     m_inner.write_file(path, m_final);
-    return DirectoryTree::open(path);
+    return DirectoryTree::open(path, context);
+  }
+
+  [[nodiscard]] std::expected<std::string, std::error_code> read(
+      const std::filesystem::path& path,
+      makebelieve::Offset offset,
+      std::size_t size) const override {
+    return m_inner.read(path, offset, size);
+  }
+
+  [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
+      const std::function<void(const makebelieve::DirectoryTreeDiff&)>&
+          callback) const override {
+    return m_inner.subscribe_to_changes(callback);
+  }
+};
+
+// Forwards to an in-memory tree, but parks every open() of a file whose name
+// starts with "park", as a build would: each reserves a unit of the admission
+// budget the filesystem hands it first, and fails if none is left.
+class ParkingTree : public makebelieve::DirectoryTree {
+  const makebelieve::DirectoryTree& m_inner;
+  mutable std::mutex m_mutex;
+  mutable std::condition_variable m_changed;
+  mutable std::size_t m_parked = 0;
+  mutable bool m_budgeted = true;
+  bool m_released = false;
+
+ public:
+  explicit ParkingTree(const makebelieve::DirectoryTree& inner)
+      : m_inner(inner) {}
+
+  // Waits (bounded) until @a count opens are parked.
+  [[nodiscard]] bool wait_until_parked(std::size_t count) const {
+    std::unique_lock lock(m_mutex);
+    return m_changed.wait_for(lock, k_timeout,
+                              [&] { return m_parked >= count; });
+  }
+
+  // Whether every open came with a budget.
+  [[nodiscard]] bool budgeted() const {
+    const std::lock_guard lock(m_mutex);
+    return m_budgeted;
+  }
+
+  void release() {
+    {
+      const std::lock_guard lock(m_mutex);
+      m_released = true;
+    }
+    m_changed.notify_all();
+  }
+
+  [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
+      const std::filesystem::path& path) const override {
+    return m_inner.status(path);
+  }
+
+  [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
+                              std::error_code>
+  ls(const std::filesystem::path& path) const override {
+    return m_inner.ls(path);
+  }
+
+  [[nodiscard]] std::expected<makebelieve::FileInfo, std::error_code> open(
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& context) const override {
+    if (path.filename().string().starts_with("park")) {
+      if (context.admission == nullptr) {
+        const std::lock_guard lock(m_mutex);
+        m_budgeted = false;
+        return std::unexpected(std::make_error_code(std::errc::io_error));
+      }
+      std::expected<makebelieve::AdmissionToken, std::error_code> token =
+          context.admission->try_reserve();
+      if (!token.has_value()) {
+        return std::unexpected(token.error());
+      }
+      std::unique_lock lock(m_mutex);
+      ++m_parked;
+      m_changed.notify_all();
+      m_changed.wait(lock, [this] { return m_released; });
+    }
+    return m_inner.open(path, context);
   }
 
   [[nodiscard]] std::expected<std::string, std::error_code> read(
@@ -756,14 +851,15 @@ class GatedOpenTree : public makebelieve::DirectoryTree {
   }
 
   [[nodiscard]] std::expected<makebelieve::FileInfo, std::error_code> open(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& context) const override {
     if (path == m_gated) {
       std::unique_lock lock(m_mutex);
       m_waiting = true;
       m_changed.notify_all();
       m_changed.wait(lock, [this] { return m_released; });
     }
-    return m_inner.open(path);
+    return m_inner.open(path, context);
   }
 
   [[nodiscard]] std::expected<std::string, std::error_code> read(
@@ -1087,6 +1183,68 @@ TEST_F(VirtualFileSystem, AnOpenThatWaitsDoesNotHoldUpOtherRequests) {
   EXPECT_TRUE(fast_finished) << "a waiting open held up another file";
   EXPECT_EQ(fast.get(), "fast");
   EXPECT_EQ(slow.get(), "slow");
+}
+
+// However many opens are parked, the mount keeps serving: the admission
+// budget lets exactly k_blocking_opens park, refuses the next at once, and the
+// dispatcher threads beyond them go on answering everything else.
+TEST_F(VirtualFileSystem, ParksNoMoreOpensThanItsBudgetAndServesTheRest) {
+  constexpr std::size_t k_parked =
+      makebelieve::VirtualFileSystem::k_blocking_opens;
+  for (std::size_t i = 0; i <= k_parked; ++i) {
+    tree().write_file("park" + std::to_string(i),
+                      "parked " + std::to_string(i));
+  }
+  tree().write_file("free.txt", "free");
+  ParkingTree parking(tree());
+  const makebelieve::VirtualFileSystem vfs(parking, mountpoint(), notifier());
+
+  std::vector<std::future<std::optional<std::string>>> parked;
+  for (std::size_t i = 0; i < k_parked; ++i) {
+    parked.push_back(std::async(std::launch::async, [this, i] {
+      return read_file(mountpoint() / ("park" + std::to_string(i)));
+    }));
+  }
+  const bool all_parked = parking.wait_until_parked(k_parked);
+
+  // One more is refused at once rather than parked.
+  std::future<std::error_code> refused = std::async(std::launch::async, [&] {
+    return read_error(mountpoint() / ("park" + std::to_string(k_parked)));
+  });
+  const bool refused_in_time =
+      refused.wait_for(k_timeout) == std::future_status::ready;
+
+  // And the headroom serves everything else, several at once.
+  std::vector<std::future<std::optional<std::string>>> others;
+  for (std::size_t i = 0;
+       i < makebelieve::VirtualFileSystem::k_dispatcher_headroom; ++i) {
+    others.push_back(std::async(std::launch::async, [this] {
+      std::error_code ignored;
+      static_cast<void>(
+          std::filesystem::file_size(mountpoint() / "free.txt", ignored));
+      return read_file(mountpoint() / "free.txt");
+    }));
+  }
+  bool others_in_time = true;
+  for (auto& other : others) {
+    others_in_time = others_in_time &&
+                     other.wait_for(k_timeout) == std::future_status::ready;
+  }
+
+  // Released either way, so a failure cannot wedge the mount.
+  parking.release();
+
+  EXPECT_TRUE(all_parked);
+  EXPECT_TRUE(parking.budgeted());
+  ASSERT_TRUE(refused_in_time);
+  EXPECT_EQ(refused.get(), native_try_again());
+  EXPECT_TRUE(others_in_time);
+  for (auto& other : others) {
+    EXPECT_EQ(other.get(), "free");
+  }
+  for (std::size_t i = 0; i < k_parked; ++i) {
+    EXPECT_EQ(parked[i].get(), "parked " + std::to_string(i));
+  }
 }
 
 // An error from a category that is no platform's - a command's exit status,

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <ios>
@@ -71,6 +72,10 @@ class ProcessUtil : public ::testing::Test {
 
   makebelieve::IoContext io;
 
+  // For the runs that nothing needs to attribute.
+  const makebelieve::LaunchRegistrar none =
+      makebelieve::LaunchRegistrar::none();
+
   // Runs @a command in @a working_directory and returns what it completes
   // with.
   makebelieve::ProcessUtil::Result run_in(
@@ -78,8 +83,8 @@ class ProcessUtil : public ::testing::Test {
       const std::string& command,
       stdexec::inplace_stop_token stop = {}) {
     return std::get<0>(
-        stdexec::sync_wait(
-            makebelieve::ProcessUtil::run(io, working_directory, command, stop))
+        stdexec::sync_wait(makebelieve::ProcessUtil::run(io, working_directory,
+                                                         command, none, stop))
             .value());
   }
 
@@ -190,21 +195,93 @@ TEST_F(ProcessUtil, TracesInputsWhenWorkingDirectoryIsSymlinked) {
 }
 #endif
 
+// A file outside the working directory, which on Linux a command sees only
+// through the read-only tracing mount, for a command to create to show it ran.
+std::filesystem::path marker_file() {
+  return std::filesystem::temp_directory_path() /
+         ("makebelieve-proc-ran-" +
+          std::string(
+              ::testing::UnitTest::GetInstance()->current_test_info()->name()));
+}
+
+// Records each process it is told about, checking that the command had not yet
+// run - it creates @a marker - when it was told.
+struct RecordingRegistrar {
+  std::filesystem::path marker;
+  int registered = 0;
+  bool ran_before_registration = false;
+  bool undone = false;
+  makebelieve::LaunchedProcess process;
+
+  std::expected<makebelieve::LaunchRegistration, std::error_code> operator()(
+      const makebelieve::LaunchedProcess& launched) {
+    ++registered;
+    ran_before_registration = std::filesystem::exists(marker);
+    process = launched;
+    return makebelieve::LaunchRegistration([this] { undone = true; });
+  }
+};
+
+TEST_F(ProcessUtil, RegistersTheCommandBeforeItRunsAndUndoesItAfter) {
+  const std::filesystem::path marker = marker_file();
+  std::filesystem::remove(marker);
+  RecordingRegistrar registrar{.marker = marker};
+  const makebelieve::ProcessUtil::Result result = std::get<0>(
+      stdexec::sync_wait(makebelieve::ProcessUtil::run(
+                             io, work,
+                             "cmake -E touch \"" + marker.string() + "\"",
+                             makebelieve::LaunchRegistrar(registrar)))
+          .value());
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->exit_status, 0);
+  EXPECT_TRUE(std::filesystem::exists(marker));
+  std::filesystem::remove(marker);
+  EXPECT_EQ(registrar.registered, 1);
+  EXPECT_FALSE(registrar.ran_before_registration);
+  EXPECT_NE(registrar.process.pid, 0U);
+#ifdef _WIN32
+  EXPECT_NE(registrar.process.job, nullptr);
+#else
+  EXPECT_GE(registrar.process.pidfd, 0);
+#endif
+  EXPECT_TRUE(registrar.undone);
+}
+
+TEST_F(ProcessUtil, ACommandItsRegistrarRefusesNeverRuns) {
+  const std::error_code refusal =
+      std::make_error_code(std::errc::permission_denied);
+  auto refuse = [&](const makebelieve::LaunchedProcess&)
+      -> std::expected<makebelieve::LaunchRegistration, std::error_code> {
+    return std::unexpected(refusal);
+  };
+  const std::filesystem::path marker = marker_file();
+  std::filesystem::remove(marker);
+  const makebelieve::ProcessUtil::Result result = std::get<0>(
+      stdexec::sync_wait(makebelieve::ProcessUtil::run(
+                             io, work,
+                             "cmake -E touch \"" + marker.string() + "\"",
+                             makebelieve::LaunchRegistrar(refuse)))
+          .value());
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), refusal);
+  EXPECT_FALSE(std::filesystem::exists(marker));
+}
+
 // Waiting on a command holds no thread: ten one-second commands started from
 // one thread finish together rather than one after another.
 TEST_F(ProcessUtil, RunsCommandsAtOnceWithoutAThreadEach) {
   const auto start = std::chrono::steady_clock::now();
   const auto results = stdexec::sync_wait(stdexec::when_all(
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1)),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1))));
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none)));
   const auto elapsed = std::chrono::steady_clock::now() - start;
 
   ASSERT_TRUE(results.has_value());

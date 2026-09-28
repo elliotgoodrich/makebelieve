@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include "launchregistrar.hpp"
+
 #include <exec/task.hpp>
 #include <stdexec/execution.hpp>
 
@@ -60,6 +62,13 @@ struct ProcessUtil {
   /// killed. Waiting for every descendant there would take making this
   /// process a child subreaper, which has not been done.
   ///
+  /// The command's process is created unable to run, handed to @a registrar,
+  /// and only let run once registered - so nothing it does can come before
+  /// its registration. It then holds the registration until the command has
+  /// exited and whatever it started has been ended (see above). A registrar
+  /// that fails leaves the command never having run, and the sender completes
+  /// with its error.
+  ///
   /// The sender does its brief synchronous work - starting the command,
   /// reading back what it traced - on whatever thread it is started on, and
   /// waits on the command through @a io without holding a thread, resuming
@@ -70,9 +79,11 @@ struct ProcessUtil {
   [[nodiscard]] static auto run(IoContext& io,
                                 std::filesystem::path working_directory,
                                 std::string command,
+                                LaunchRegistrar registrar,
                                 stdexec::inplace_stop_token stop = {}) {
     return stdexec::write_env(
-        run_task(io, std::move(working_directory), std::move(command), stop),
+        run_task(io, std::move(working_directory), std::move(command),
+                 registrar, stop),
         stdexec::prop{stdexec::get_stop_token, stdexec::never_stop_token{}});
   }
 
@@ -80,6 +91,7 @@ struct ProcessUtil {
   static exec::task<Result> run_task(IoContext& io,
                                      std::filesystem::path working_directory,
                                      std::string command,
+                                     LaunchRegistrar registrar,
                                      stdexec::inplace_stop_token stop);
 };
 

@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <functional>
@@ -107,6 +108,23 @@ class Subscription {
   Subscription(const Subscription&) = delete;
 };
 
+class AdmissionBudget;
+
+/// @class OpenContext
+/// Who is asking a @link DirectoryTree::open, and how many such requests may be
+/// kept waiting, for a tree whose opens can block for a long time. Trees that
+/// never block ignore it.
+struct OpenContext {
+  /// The process (on Linux, the thread) that made the request, as the
+  /// filesystem serving it reports it; 0 when unknown.
+  std::uint32_t requester_pid = 0;
+
+  /// What a request must reserve a unit of before it blocks, failing if none
+  /// is free; null for a caller with no budget of its own, which a tree that
+  /// blocks then holds to one of its own.
+  AdmissionBudget* admission = nullptr;
+};
+
 /// @class DirectoryTree
 /// An abstract base class to describe an observable directory tree.
 class DirectoryTree {
@@ -125,9 +143,12 @@ class DirectoryTree {
 
   /// Blocks until the file at @a path is final and returns its info, or an
   /// error_code (`is_a_directory` for a directory). Unlike @link status, which
-  /// never blocks. The default reports @link status for a file.
+  /// never blocks. @a context says who is asking, for a tree whose answer
+  /// depends on it. The default reports @link status for a file.
   [[nodiscard]] virtual std::expected<FileInfo, std::error_code> open(
-      const std::filesystem::path& path) const {
+      const std::filesystem::path& path,
+      const OpenContext& context) const {
+    static_cast<void>(context);
     const std::expected<EntryInfo, std::error_code> info = status(path);
     if (!info.has_value()) {
       return std::unexpected(info.error());
@@ -136,6 +157,12 @@ class DirectoryTree {
       return *file;
     }
     return std::unexpected(std::make_error_code(std::errc::is_a_directory));
+  }
+
+  /// @link open on behalf of no one in particular.
+  [[nodiscard]] std::expected<FileInfo, std::error_code> open(
+      const std::filesystem::path& path) const {
+    return open(path, OpenContext{});
   }
 
   /// Returns up to @a size bytes of @a path starting at @a offset, or an

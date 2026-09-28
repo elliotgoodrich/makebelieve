@@ -13,6 +13,8 @@
 
 #include <chrono>
 #include <cstddef>
+#include <exception>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <ios>
@@ -79,27 +81,115 @@ class ShellRunnerTest : public ::testing::Test {
     std::ofstream(work / name, std::ios::binary) << content;
   }
 
-  // Runs @a command through @a run, stoppable through @a stop.
+  // Runs @a command through @a run, stoppable through @a stop, registering
+  // what it launches with @a registrar.
   template <class Scheduler>
   static Built build(const ShellRunner<Scheduler>& run,
                      Command command,
-                     ex::inplace_stop_token stop = {}) {
+                     ex::inplace_stop_token stop = {},
+                     LaunchRegistrar registrar = LaunchRegistrar::none()) {
     return std::get<0>(
-        ex::sync_wait(ex::write_env(run(std::move(command)),
-                                    ex::prop{ex::get_stop_token, stop}) |
-                      ex::then([](BuildResult result) {
-                        return Built{
-                            .result = std::move(result),
-                            .completed_on = std::this_thread::get_id()};
-                      }))
+        ex::sync_wait(
+            ex::write_env(run(std::move(command)),
+                          ex::env{ex::prop{ex::get_stop_token, stop},
+                                  ex::prop{get_launch_registrar, registrar}}) |
+            ex::then([](BuildResult result) {
+              return Built{.result = std::move(result),
+                           .completed_on = std::this_thread::get_id()};
+            }))
             .value());
   }
 
-  [[nodiscard]] Built build(Command command, ex::inplace_stop_token stop = {}) {
+  [[nodiscard]] Built build(
+      Command command,
+      ex::inplace_stop_token stop = {},
+      LaunchRegistrar registrar = LaunchRegistrar::none()) {
     const ShellRunner run(work, io, context.get_scheduler());
-    return build(run, std::move(command), stop);
+    return build(run, std::move(command), stop, registrar);
   }
 };
+
+// A receiver whose environment has a stop token but no registrar - as one
+// that some wrapper had dropped it from would.
+struct ReceiverWithoutRegistrar {
+  using receiver_concept = ex::receiver_t;
+  void set_value(BuildResult) noexcept {}
+  void set_error(std::exception_ptr) noexcept {}
+  void set_stopped() noexcept {}
+  [[nodiscard]] auto get_env() const noexcept {
+    return ex::prop{ex::get_stop_token, ex::inplace_stop_token{}};
+  }
+};
+
+// The same receiver with a registrar too.
+struct ReceiverWithRegistrar : ReceiverWithoutRegistrar {
+  [[nodiscard]] auto get_env() const noexcept {
+    return ex::env{ex::prop{ex::get_stop_token, ex::inplace_stop_token{}},
+                   ex::prop{get_launch_registrar, LaunchRegistrar::none()}};
+  }
+};
+
+// A build cannot run anywhere its processes would go unregistered: losing the
+// registrar on the way is a compile error, not a silent default.
+static_assert(!ex::sender_to<BuildSender, ReceiverWithoutRegistrar>);
+static_assert(ex::sender_to<BuildSender, ReceiverWithRegistrar>);
+
+// A file outside the working directory, which on Linux a command sees only
+// through the read-only tracing mount, for a command to create to show it ran.
+std::filesystem::path marker_file() {
+  return std::filesystem::temp_directory_path() /
+         ("makebelieve-shell-ran-" +
+          std::string(
+              ::testing::UnitTest::GetInstance()->current_test_info()->name()));
+}
+
+// The registrar named in the receiver's environment reaches the command
+// through the type-erased BuildSender and the hop onto the runner's scheduler,
+// and is told about the command before the command does anything.
+TEST_F(ShellRunnerTest, RegistersEachCommandBeforeItRuns) {
+  const std::filesystem::path marker = marker_file();
+  std::filesystem::remove(marker);
+  int registered = 0;
+  bool ran_first = false;
+  bool undone = false;
+  auto registrar = [&](const LaunchedProcess& process)
+      -> std::expected<LaunchRegistration, std::error_code> {
+    ++registered;
+    ran_first = std::filesystem::exists(marker);
+    EXPECT_NE(process.pid, 0U);
+    return LaunchRegistration([&undone] { undone = true; });
+  };
+  const Built built =
+      build({.output = "output.txt",
+             .action = Manifest::Action::Capture,
+             .text = "cmake -E touch \"" + marker.string() + "\""},
+            {}, LaunchRegistrar(registrar));
+  ASSERT_TRUE(built.result.has_value()) << built.result.error().message();
+  EXPECT_TRUE(std::filesystem::exists(marker));
+  std::filesystem::remove(marker);
+  EXPECT_EQ(registered, 1);
+  EXPECT_FALSE(ran_first);
+  EXPECT_TRUE(undone);
+}
+
+TEST_F(ShellRunnerTest, ACommandThatCannotBeRegisteredNeverRunsAndFails) {
+  const std::error_code refusal =
+      std::make_error_code(std::errc::resource_unavailable_try_again);
+  auto registrar = [&](const LaunchedProcess&)
+      -> std::expected<LaunchRegistration, std::error_code> {
+    return std::unexpected(refusal);
+  };
+  const std::filesystem::path marker = marker_file();
+  std::filesystem::remove(marker);
+  const Built built =
+      build({.output = "output.txt",
+             .action = Manifest::Action::Capture,
+             .text = "cmake -E touch \"" + marker.string() + "\""},
+            {}, LaunchRegistrar(registrar));
+  ASSERT_FALSE(built.result.has_value());
+  EXPECT_EQ(built.result.error(), refusal);
+  EXPECT_FALSE(std::filesystem::exists(marker));
+}
 
 TEST_F(ShellRunnerTest, CopiesTheFileACopyRuleNamesAndReportsItAsTheInput) {
   write_input("input.txt", "copied");

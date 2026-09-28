@@ -116,4 +116,13 @@ if(BUILD_TESTING)
   set_tests_properties(makebelieve_integration PROPERTIES
     SKIP_REGULAR_EXPRESSION "SKIP:"
     TIMEOUT 90)
+
+  # Builds that open each other's outputs through the mount
+  add_test(NAME makebelieve_dependencies
+    COMMAND "${CMAKE_COMMAND}"
+      "-DMAKEBELIEVE_EXE=$<TARGET_FILE:makebelieve>"
+      "-DFIXTURE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/integration/dependencies"
+      "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/integration/dependencies-work"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_dependency_test.cmake")
+  set_tests_properties(makebelieve_dependencies PROPERTIES TIMEOUT 300)
 endif()

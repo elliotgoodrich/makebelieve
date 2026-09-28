@@ -26,13 +26,14 @@ class IoContext;
 namespace detail {
 
 // Carries out @a command as `ShellRunner` describes, waiting on a command it
-// runs through @a io. Its synchronous steps run wherever the task is started,
-// and it resumes there after each wait. @a stop cancels a command still
-// running.
+// runs through @a io and registering it with @a registrar before it runs. Its
+// synchronous steps run wherever the task is started, and it resumes there
+// after each wait. @a stop cancels a command still running.
 exec::task<BuildResult> run_shell_command(
     IoContext& io,
     std::filesystem::path working_directory,
     Command command,
+    LaunchRegistrar registrar,
     stdexec::inplace_stop_token stop);
 
 }  // namespace detail
@@ -56,6 +57,8 @@ exec::task<BuildResult> run_shell_command(
 /// `Copy` rule runs no command at all: it produces the bytes of the file it
 /// names, read from under the working directory, and reports that file as its
 /// one input.
+/// Each command it runs is registered, before it runs, with the
+/// @link LaunchRegistrar its receiver's environment names.
 /// Traced inputs are reported relative to the working directory, so for
 /// dependency tracking to line up it should be the filesystem root that the
 /// tree's source mirrors.
@@ -95,10 +98,18 @@ class ShellRunner {
            stdexec::let_value([io = m_io,
                                working_directory = m_working_directory,
                                command = std::move(command)]() mutable {
-             return stdexec::read_env(stdexec::get_stop_token) |
-                    stdexec::let_value([&](stdexec::inplace_stop_token stop) {
-                      return detail::run_shell_command(
-                          *io, working_directory, std::move(command), stop);
+             return stdexec::read_env(get_launch_registrar) |
+                    stdexec::let_value([&](LaunchRegistrar registrar) {
+                      // By value: this call's parameter is gone by the time
+                      // the stop token is read.
+                      return stdexec::read_env(stdexec::get_stop_token) |
+                             stdexec::let_value(
+                                 [&,
+                                  registrar](stdexec::inplace_stop_token stop) {
+                                   return detail::run_shell_command(
+                                       *io, working_directory,
+                                       std::move(command), registrar, stop);
+                                 });
                     });
            });
   }

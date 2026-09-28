@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "virtualfilesystem.hpp"
 
+#include "admission.hpp"
 #include "directorytree.hpp"
 #include "processinfo.hpp"
 #include "tracer.hpp"
@@ -17,8 +18,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -192,6 +196,10 @@ class VirtualFileSystem::Impl {
   exec::static_thread_pool::scheduler m_scheduler;
   fuse_args m_args{};
   struct fuse* m_fuse = nullptr;
+  // How the loop runs: how many threads may serve it at once. Outlives it.
+  std::unique_ptr<fuse_loop_config, decltype(&fuse_loop_cfg_destroy)>
+      m_loop_config{nullptr, &fuse_loop_cfg_destroy};
+
   std::thread m_loop;
 
   // Entries the kernel has seen through us, by lookup or in a listing, each
@@ -224,6 +232,10 @@ class VirtualFileSystem::Impl {
   // under way. m_pending coalesces: a path repeated across diffs is announced
   // once per pass, and m_everything_dirty supersedes the lot.
   std::mutex m_notify_mutex;
+
+  // What an open must reserve before the tree may block it, so parked opens
+  // never take the worker threads other requests need.
+  AdmissionBudget m_admission{k_blocking_opens};
   Changes m_pending;
   bool m_everything_dirty = false;
   bool m_stopping = false;
@@ -283,10 +295,27 @@ class VirtualFileSystem::Impl {
 
     // Multithreaded, so an open blocked on a build (see op_open) does not hold
     // up other requests. Every callback here is safe to run concurrently.
-    m_loop = std::thread([this]() {
-      fuse_loop_config config{.clone_fd = 0, .max_idle_threads = 10};
-      fuse_loop_mt(m_fuse, &config);
-    });
+    // Exactly as many workers as the admission budget is sized against. The
+    // older loop configuration has no such setting - its max_idle_threads only
+    // says when idle workers are reaped - and caps the loop at ten workers,
+    // which ten parked opens would exhaust; so 3.12's is required.
+    if (fuse_version() < FUSE_MAKE_VERSION(3, 12)) {
+      throw std::system_error(
+          std::make_error_code(std::errc::not_supported),
+          std::format("libfuse {} cannot be given {} worker threads; 3.12 or "
+                      "later is needed",
+                      fuse_version(), k_dispatcher_threads));
+    }
+    m_loop_config.reset(fuse_loop_cfg_create());
+    if (m_loop_config == nullptr) {
+      throw std::bad_alloc();
+    }
+    fuse_loop_cfg_set_max_threads(m_loop_config.get(),
+                                  static_cast<unsigned>(k_dispatcher_threads));
+    fuse_loop_cfg_set_idle_threads(
+        m_loop_config.get(), static_cast<unsigned>(k_dispatcher_headroom));
+    m_loop =
+        std::thread([this]() { fuse_loop_mt(m_fuse, m_loop_config.get()); });
 
     // The subscription is taken last so no change can arrive before there is a
     // mount to poke.
@@ -520,8 +549,9 @@ class VirtualFileSystem::Impl {
       return 0;
     }
 
-    if (const std::expected<FileInfo, std::error_code> opened =
-            m_tree.open(relative);
+    if (const std::expected<FileInfo, std::error_code> opened = m_tree.open(
+            relative,
+            OpenContext{.requester_pid = caller, .admission = &m_admission});
         !opened.has_value()) {
       return -to_errno(opened.error());
     }
