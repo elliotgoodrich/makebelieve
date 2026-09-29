@@ -371,6 +371,43 @@ class TraceScope {
   TraceScope& operator=(TraceScope&&) = delete;
 };
 
+/// @class TraceAsyncScope
+/// A span owned by a suspended operation. Unlike TracePoolScope it never
+/// changes thread-local state, so unrelated coroutines can share an executor.
+class TraceAsyncScope {
+  Tracer* m_tracer = nullptr;
+  TraceLanePool* m_pool = nullptr;
+  TraceLane m_lane{};
+  std::filesystem::path m_name;
+
+ public:
+  /// Starts a span named @a name on a lane borrowed from @a pool in
+  /// @a process, without changing the current thread's tracing lane.
+  /// @pre Called at most once. A tracer is installed, and it and @a pool
+  /// outlive this scope.
+  void open(TraceLanePool& pool,
+            const TraceProcess& process,
+            const std::filesystem::path& name) {
+    m_name = name;
+    m_pool = &pool;
+    m_tracer = g_tracer;
+    m_tracer->name_process(process.id, process.name);
+    m_lane = pool.take(*m_tracer, process.id);
+    m_tracer->begin(m_lane, "vfs", m_name);
+  }
+  /// Ends an open span and returns its borrowed lane to the pool.
+  ~TraceAsyncScope() {
+    if (m_tracer) {
+      m_tracer->end(m_lane, "vfs", m_name);
+      m_pool->give_back(m_lane);
+    }
+  }
+  /// Creates an inactive scope; no span is recorded until @link open.
+  TraceAsyncScope() = default;
+  TraceAsyncScope(const TraceAsyncScope&) = delete;
+  TraceAsyncScope& operator=(const TraceAsyncScope&) = delete;
+};
+
 /// @class TracePoolScope
 /// A @link TraceScope on a row borrowed from a pool for the length of the
 /// scope, which anything the scope goes on to trace lands on too. Opened the

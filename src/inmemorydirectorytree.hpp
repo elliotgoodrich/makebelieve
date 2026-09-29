@@ -76,10 +76,16 @@ class InMemoryDirectoryTree : public DirectoryTree {
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
       const std::filesystem::path& path) const override;
 
-  [[nodiscard]] std::expected<std::string, std::error_code> read(
-      const std::filesystem::path& path,
-      Offset offset,
-      std::size_t size) const override;
+  /// Returns a sender reporting file metadata for @a path, or an error.
+  /// Contents are already final; @a context does not affect this tree.
+  [[nodiscard]] OpenSender open(const std::filesystem::path& path,
+                                const OpenContext& context = {}) const override;
+
+  /// Returns a sender reading up to @a size bytes at @a offset from @a path,
+  /// following the @link DirectoryTree::read contract.
+  [[nodiscard]] ReadSender read(const std::filesystem::path& path,
+                                Offset offset,
+                                std::size_t size) const override;
 
   [[nodiscard]] Subscription subscribe_to_changes(
       const std::function<void(const DirectoryTreeDiff&)>& callback)

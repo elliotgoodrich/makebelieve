@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
+#include "buildcoordinator.hpp"
 #include "builddirectorytree.hpp"
+#include "buildpermits.hpp"
 #include "buildqueue.hpp"
 #include "consoleinterrupthandler.hpp"
 #include "filesystemutil.hpp"
 #include "iocontext.hpp"
+#include "processattribution.hpp"
 #include "realdirectorytree.hpp"
 #include "shellrunner.hpp"
 #include "tracer.hpp"
@@ -14,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <concepts>
 #include <cstddef>
 #include <cstdio>
@@ -32,7 +36,11 @@ namespace {
 using namespace makebelieve;
 
 int usage(const char* program) {
-  std::println(stderr, "usage: {} mount|unmount <mountpoint>", program);
+  std::println(stderr,
+               "usage: {0} mount [-j <builds>] <mountpoint>\n"
+               "       {0} mount <mountpoint> [-j <builds>]\n"
+               "       {0} unmount <mountpoint>",
+               program);
   return 1;
 }
 
@@ -48,8 +56,9 @@ void block_until_any(const Tokens&... tokens) {
   stopped.acquire();
 }
 
-// Serves the manifest's outputs at `mountpoint`, blocking until torn down.
-int mount(const char* mountpoint_arg) {
+// Serves the manifest's outputs at `mountpoint`, with at most @a jobs builds
+// holding a permit at once (one per core if 0), blocking until torn down.
+int mount(const char* mountpoint_arg, unsigned jobs) {
   // Always recording, so a `tracing` rule added to the manifest at any point
   // shows the history leading up to it. Installed before anything below starts
   // a thread that records, and uninstalled only once they are all gone.
@@ -88,16 +97,21 @@ int mount(const char* mountpoint_arg) {
   // notifications.
   const ShellRunner run(source, io, workers.get_scheduler());
 
-  // How many builds run at once: one per core.
-  BuildQueue builds(cores, workers.get_scheduler());
+  // How many builds hold a permit at once: -j, or one per core. A build whose
+  // command waits on another output gives its permit back meanwhile, so this
+  // limits permit-holding builds, not runnable processes or CPU use.
+  BuildQueue builds(jobs != 0 ? jobs : cores, workers.get_scheduler());
+
+  // Tells the processes each build launches apart from everyone else's, so
+  // the coordinator can see which build an open comes from. Both outlive the
+  // tree and the mount, which use them until they are torn down.
+  ProcessAttribution attribution;
+  BuildCoordinator coordinator(permits_from(builds), Attribution(attribution),
+                               workers.get_scheduler());
 
   // Presents the manifest's declared outputs, building each lazily.
   const BuildDirectoryTree build_tree(
-      tree,
-      [&run, &builds](Command command) {
-        return builds.schedule(run(std::move(command)));
-      },
-      [](const std::string& problems) {
+      tree, run, coordinator, [](const std::string& problems) {
         // Best-effort, as this runs on the IoContext's thread.
         try {
           std::println(stderr,
@@ -146,15 +160,30 @@ int unmount(const char* mountpoint_arg) {
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 3) {
+    if (argc < 3) {
       return usage(argv[0]);
     }
 
     const std::string_view command = argv[1];
-    if (command == "mount") {
-      return mount(argv[2]);
+    if (command == "mount" && argc == 3) {
+      return mount(argv[2], 0);
     }
-    if (command == "unmount") {
+    if (command == "mount" && argc == 5) {
+      const bool jobs_first = std::string_view(argv[2]) == "-j";
+      if (!jobs_first && std::string_view(argv[3]) != "-j") {
+        return usage(argv[0]);
+      }
+      const std::string_view text = argv[jobs_first ? 3 : 4];
+      unsigned jobs = 0;
+      const auto [end, error] =
+          std::from_chars(text.data(), text.data() + text.size(), jobs);
+      if (error != std::errc() || end != text.data() + text.size() ||
+          jobs == 0) {
+        return usage(argv[0]);
+      }
+      return mount(argv[jobs_first ? 4 : 2], jobs);
+    }
+    if (command == "unmount" && argc == 3) {
       return unmount(argv[2]);
     }
     return usage(argv[0]);

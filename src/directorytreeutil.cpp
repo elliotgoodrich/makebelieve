@@ -72,9 +72,9 @@ std::string diff_at(const DirectoryTree& a,
   if (const auto* file_a = std::get_if<FileInfo>(&*status_a)) {
     const auto& file_b = std::get<FileInfo>(*status_b);
     const std::expected<std::string, std::error_code> content_a =
-        a.read(path, 0, file_a->size);
+        DirectoryTreeUtil::read(a, path, 0, file_a->size);
     const std::expected<std::string, std::error_code> content_b =
-        b.read(path, 0, file_b.size);
+        DirectoryTreeUtil::read(b, path, 0, file_b.size);
     if (!content_a.has_value() || !content_b.has_value()) {
       return std::format("{}: failed to read from {}", describe(path),
                          !content_a.has_value() ? "a" : "b");
@@ -112,6 +112,51 @@ std::string diff_at(const DirectoryTree& a,
 }
 
 }  // namespace
+
+OpenSender DirectoryTreeUtil::open_by_status(
+    const DirectoryTree& tree,
+    const std::filesystem::path& path) {
+  return stdexec::just() |
+         stdexec::then(
+             [&tree, path]() -> std::expected<FileInfo, std::error_code> {
+               const auto info = tree.status(path);
+               if (!info) {
+                 return std::unexpected(info.error());
+               }
+               if (const auto* file = std::get_if<FileInfo>(&*info)) {
+                 return *file;
+               }
+               return std::unexpected(
+                   std::make_error_code(std::errc::is_a_directory));
+             });
+}
+
+std::expected<FileInfo, std::error_code> DirectoryTreeUtil::open(
+    const DirectoryTree& tree,
+    const std::filesystem::path& path,
+    const OpenContext& context) {
+  auto result = stdexec::sync_wait(stdexec::write_env(
+      tree.open(path, context),
+      stdexec::prop{stdexec::get_stop_token, stdexec::inplace_stop_token{}}));
+  if (!result) {
+    return std::unexpected(std::make_error_code(std::errc::operation_canceled));
+  }
+  return std::move(std::get<0>(*result));
+}
+
+std::expected<std::string, std::error_code> DirectoryTreeUtil::read(
+    const DirectoryTree& tree,
+    const std::filesystem::path& path,
+    Offset offset,
+    std::size_t size) {
+  auto result = stdexec::sync_wait(stdexec::write_env(
+      tree.read(path, offset, size),
+      stdexec::prop{stdexec::get_stop_token, stdexec::inplace_stop_token{}}));
+  if (!result) {
+    return std::unexpected(std::make_error_code(std::errc::operation_canceled));
+  }
+  return std::move(std::get<0>(*result));
+}
 
 std::string DirectoryTreeUtil::diff(const DirectoryTree& a,
                                     const DirectoryTree& b) {

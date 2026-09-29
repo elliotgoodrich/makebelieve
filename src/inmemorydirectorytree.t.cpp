@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "inmemorydirectorytree.hpp"
 
+#include "directorytreeutil.hpp"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -103,13 +105,13 @@ TEST_P(EscapingPath, IsRejectedByEveryOperation) {
   EXPECT_EQ(listing.error(), std::errc::no_such_file_or_directory);
 
   const std::expected<std::string, std::error_code> read =
-      tree().read(c.input, 0, 4);
+      makebelieve::DirectoryTreeUtil::read(tree(), c.input, 0, 4);
   ASSERT_FALSE(read.has_value());
   EXPECT_EQ(read.error(), std::errc::no_such_file_or_directory);
 
   // Check 0-size read (that short circuits) still returns an error.
   const std::expected<std::string, std::error_code> empty_read =
-      tree().read(c.input, 0, 0);
+      makebelieve::DirectoryTreeUtil::read(tree(), c.input, 0, 0);
   ASSERT_FALSE(empty_read.has_value());
   EXPECT_EQ(empty_read.error(), std::errc::no_such_file_or_directory);
 }
@@ -261,7 +263,7 @@ class ReadSlice : public InMemoryDirectoryTree,
 TEST_P(ReadSlice, ReturnsExpectedBytes) {
   const ReadCase& c = GetParam();
   const std::expected<std::string, std::error_code> result =
-      tree().read(c.input, c.offset, c.size);
+      makebelieve::DirectoryTreeUtil::read(tree(), c.input, c.offset, c.size);
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(*result, c.expected);
 }
@@ -307,7 +309,7 @@ class ReadFailure : public InMemoryDirectoryTree,
 TEST_P(ReadFailure, FailsAsExpected) {
   const ReadFailureCase& c = GetParam();
   const std::expected<std::string, std::error_code> result =
-      tree().read(c.input, c.offset, c.size);
+      makebelieve::DirectoryTreeUtil::read(tree(), c.input, c.offset, c.size);
 
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error(), c.expected);
@@ -371,7 +373,8 @@ TEST_F(InMemoryDirectoryTreeChanges, WriteFileCreatesANewFile) {
       tree().status("new.txt");
   ASSERT_TRUE(status.has_value());
   expect_file(*status, 7);
-  EXPECT_EQ(tree().read("new.txt", 0, 7), "content");
+  EXPECT_EQ(makebelieve::DirectoryTreeUtil::read(tree(), "new.txt", 0, 7),
+            "content");
 
   ASSERT_EQ(diffs().size(), 1u);
   EXPECT_FALSE(diffs()[0].everything_dirty);
@@ -384,7 +387,8 @@ TEST_F(InMemoryDirectoryTreeChanges, WriteFileCreatesANewFile) {
 TEST_F(InMemoryDirectoryTreeChanges, WriteFileOverwritesAnExistingFile) {
   tree().write_file("hello.txt", "goodbye");
 
-  EXPECT_EQ(tree().read("hello.txt", 0, 7), "goodbye");
+  EXPECT_EQ(makebelieve::DirectoryTreeUtil::read(tree(), "hello.txt", 0, 7),
+            "goodbye");
 
   // The parent's child list did not change - only the file's own content.
   ASSERT_EQ(diffs().size(), 1u);
@@ -448,7 +452,8 @@ TEST_F(InMemoryDirectoryTreeChanges, SetMtimeUpdatesOnlyTheMtime) {
       tree().status("hello.txt");
   ASSERT_TRUE(status.has_value());
   EXPECT_EQ(std::get<makebelieve::FileInfo>(*status).mtime, updated);
-  EXPECT_EQ(tree().read("hello.txt", 0, 11), "hello world");
+  EXPECT_EQ(makebelieve::DirectoryTreeUtil::read(tree(), "hello.txt", 0, 11),
+            "hello world");
 
   ASSERT_EQ(diffs().size(), 1u);
   EXPECT_EQ(sorted_paths(diffs()[0].entries_changed),
@@ -522,7 +527,8 @@ TEST_F(InMemoryDirectoryTree, ACallbackCanReadTheTreeDuringNotification) {
   const makebelieve::Subscription subscription =
       tree().subscribe_to_changes([&](const auto&) {
         const std::expected<std::string, std::error_code> content =
-            tree().read("reentrant.txt", 0, 64);
+            makebelieve::DirectoryTreeUtil::read(tree(), "reentrant.txt", 0,
+                                                 64);
         if (content.has_value()) {
           observed = *content;
         }
@@ -576,7 +582,7 @@ TEST_F(InMemoryDirectoryTree, ConcurrentReadersAndWritersStayConsistent) {
     for (int i = 0; i < k_writes_per_thread; ++i) {
       const std::string name = name_for(w, i);
       const std::expected<std::string, std::error_code> content =
-          tree().read(name, 0, 64);
+          makebelieve::DirectoryTreeUtil::read(tree(), name, 0, 64);
       ASSERT_TRUE(content.has_value()) << name;
       EXPECT_EQ(*content, name);
     }

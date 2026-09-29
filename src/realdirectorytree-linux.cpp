@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "realdirectorytree.hpp"
 
+#include "directorytreeutil.hpp"
 #include "iocontext.hpp"
 
 #include <stdexec/execution.hpp>
@@ -518,11 +519,17 @@ std::expected<std::vector<TreeEntry>, std::error_code> RealDirectoryTree::ls(
   return m_impl->ls(path);
 }
 
-std::expected<std::string, std::error_code> RealDirectoryTree::read(
-    const std::filesystem::path& path,
-    Offset offset,
-    std::size_t size) const {
-  return m_impl->read(path, offset, size);
+OpenSender RealDirectoryTree::open(const std::filesystem::path& path,
+                                   const OpenContext&) const {
+  return DirectoryTreeUtil::open_by_status(*this, path);
+}
+
+ReadSender RealDirectoryTree::read(const std::filesystem::path& path,
+                                   Offset offset,
+                                   std::size_t size) const {
+  return stdexec::just() | stdexec::then([this, path, offset, size] {
+           return m_impl->read(path, offset, size);
+         });
 }
 
 Subscription RealDirectoryTree::subscribe_to_changes(

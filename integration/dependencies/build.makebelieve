@@ -1,0 +1,25 @@
+# Outputs whose commands open other outputs through the mount, which the
+# daemon serves from ../mnt. Every graph here is acyclic.
+
+# A chain far longer than the daemon's cap of one build, ending in a source
+# file: each command opens the next output as it runs.
+# TODO: Use @/chain2.txt (and @/ for the other generated inputs below) once
+# commands support expanding @/ paths to the mountpoint.
+@/chain1.txt = capture cmake -E cat ../mnt/chain2.txt
+@/chain2.txt = capture cmake -E cat ../mnt/chain3.txt
+@/chain3.txt = capture cmake -E cat ../mnt/chain4.txt
+@/chain4.txt = capture cmake -E cat ../mnt/chain5.txt
+@/chain5.txt = capture cmake -E cat ../mnt/chain6.txt
+@/chain6.txt = capture cmake -E cat leaf.txt
+
+# Fan-in: many outputs over one generated leaf, opened at once.
+@/fan1.txt = capture cmake -E cat ../mnt/shared.txt
+@/fan2.txt = capture cmake -E cat ../mnt/shared.txt
+@/fan3.txt = capture cmake -E cat ../mnt/shared.txt
+@/fan4.txt = capture cmake -E cat ../mnt/shared.txt
+@/shared.txt = capture cmake -E cat shared-leaf.txt
+
+# A command whose very first action is to open a generated output: attributed
+# only if it was registered before it ran.
+@/first.txt = run cmake -E copy ../mnt/firstdep.txt %out
+@/firstdep.txt = capture cmake -E cat leaf.txt

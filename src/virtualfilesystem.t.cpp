@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 #include "virtualfilesystem.hpp"
 
+#include "buildcoordinator.hpp"
 #include "directorytree.hpp"
+#include "directorytreeutil.hpp"
+#include "filetask.hpp"
 #include "inmemorydirectorytree.hpp"
 
 #include <gtest/gtest.h>
@@ -9,8 +12,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -30,10 +35,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <cerrno>
-
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -351,6 +355,9 @@ std::error_code native_io_error() {
   return {ERROR_IO_DEVICE, std::system_category()};
 }
 
+// How an open refused for want of a dispatcher thread to park reaches the
+// caller: STATUS_INSUFFICIENT_RESOURCES, as Win32 reports it.
+
 FileMapper::FileMapper() = default;
 FileMapper::~FileMapper() = default;
 
@@ -657,11 +664,18 @@ class FailingReadTree : public makebelieve::DirectoryTree {
     return m_inner.ls(path);
   }
 
-  [[nodiscard]] std::expected<std::string, std::error_code> read(
+  [[nodiscard]] makebelieve::OpenSender open(
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& context) const override {
+    return m_inner.open(path, context);
+  }
+
+  [[nodiscard]] makebelieve::ReadSender read(
       const std::filesystem::path& /*path*/,
       makebelieve::Offset /*offset*/,
       std::size_t /*size*/) const override {
-    return std::unexpected(m_error);
+    return stdexec::just(
+        std::expected<std::string, std::error_code>(std::unexpected(m_error)));
   }
 
   [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
@@ -695,17 +709,17 @@ class SettleOnOpenTree : public makebelieve::DirectoryTree {
     return m_inner.ls(path);
   }
 
-  [[nodiscard]] std::expected<makebelieve::FileInfo, std::error_code> open(
-      const std::filesystem::path& path) const override {
+  [[nodiscard]] makebelieve::OpenSender open(
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& context) const override {
     ++m_opens;
     m_inner.write_file(path, m_final);
-    return DirectoryTree::open(path);
+    return m_inner.open(path, context);
   }
 
-  [[nodiscard]] std::expected<std::string, std::error_code> read(
-      const std::filesystem::path& path,
-      makebelieve::Offset offset,
-      std::size_t size) const override {
+  [[nodiscard]] makebelieve::ReadSender read(const std::filesystem::path& path,
+                                             makebelieve::Offset offset,
+                                             std::size_t size) const override {
     return m_inner.read(path, offset, size);
   }
 
@@ -716,33 +730,32 @@ class SettleOnOpenTree : public makebelieve::DirectoryTree {
   }
 };
 
-// Forwards to an in-memory tree, but holds open() of one path until released.
-class GatedOpenTree : public makebelieve::DirectoryTree {
+// Forwards to an in-memory tree, but parks every open() of a file whose name
+// starts with "park", as a build would, without occupying a serving thread.
+class ParkingTree : public makebelieve::DirectoryTree {
   const makebelieve::DirectoryTree& m_inner;
-  std::filesystem::path m_gated;
   mutable std::mutex m_mutex;
   mutable std::condition_variable m_changed;
-  mutable bool m_waiting = false;
-  bool m_released = false;
+  mutable std::size_t m_parked = 0;
+  mutable exec::static_thread_pool m_completions{1};
+  mutable makebelieve::BuildCoordinator m_coordinator{
+      makebelieve::unlimited_permits(), makebelieve::Attribution::none(),
+      m_completions.get_scheduler()};
+  makebelieve::BuildCoordinator::AttemptPtr m_attempt =
+      m_coordinator.create_attempt();
 
  public:
-  GatedOpenTree(const makebelieve::DirectoryTree& inner,
-                std::filesystem::path gated)
-      : m_inner(inner), m_gated(std::move(gated)) {}
+  explicit ParkingTree(const makebelieve::DirectoryTree& inner)
+      : m_inner(inner) {}
 
-  // Waits (bounded) until an open() of the gated path is held.
-  [[nodiscard]] bool wait_until_held() const {
+  // Waits (bounded) until @a count opens are parked.
+  [[nodiscard]] bool wait_until_parked(std::size_t count) const {
     std::unique_lock lock(m_mutex);
-    return m_changed.wait_for(lock, k_timeout, [this] { return m_waiting; });
+    return m_changed.wait_for(lock, k_timeout,
+                              [&] { return m_parked >= count; });
   }
 
-  void release() {
-    {
-      const std::lock_guard lock(m_mutex);
-      m_released = true;
-    }
-    m_changed.notify_all();
-  }
+  void release() { m_coordinator.complete(m_attempt, {}); }
 
   [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
       const std::filesystem::path& path) const override {
@@ -755,21 +768,216 @@ class GatedOpenTree : public makebelieve::DirectoryTree {
     return m_inner.ls(path);
   }
 
-  [[nodiscard]] std::expected<makebelieve::FileInfo, std::error_code> open(
-      const std::filesystem::path& path) const override {
-    if (path == m_gated) {
-      std::unique_lock lock(m_mutex);
-      m_waiting = true;
-      m_changed.notify_all();
-      m_changed.wait(lock, [this] { return m_released; });
-    }
-    return m_inner.open(path);
+  [[nodiscard]] makebelieve::OpenSender open(
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& context) const override {
+    return makebelieve::file_task(open_task(path, context));
   }
 
-  [[nodiscard]] std::expected<std::string, std::error_code> read(
-      const std::filesystem::path& path,
+  [[nodiscard]] exec::task<
+      std::expected<makebelieve::FileInfo, std::error_code>>
+  open_task(std::filesystem::path path,
+            makebelieve::OpenContext context) const {
+    if (path.filename().string().starts_with("park")) {
+      {
+        const std::lock_guard lock(m_mutex);
+        ++m_parked;
+      }
+      m_changed.notify_all();
+      if (auto error =
+              co_await m_coordinator.wait(m_attempt, context.requester_pid)) {
+        co_return std::unexpected(error);
+      }
+    }
+    co_return co_await m_inner.open(path, context);
+  }
+
+  exec::task<std::expected<std::string, std::error_code>> read_task(
+      std::filesystem::path path,
       makebelieve::Offset offset,
-      std::size_t size) const override {
+      std::size_t size) const {
+    if (path.filename().string().starts_with("readpark")) {
+      {
+        const std::lock_guard lock(m_mutex);
+        ++m_parked;
+      }
+      m_changed.notify_all();
+      if (auto error = co_await m_coordinator.wait(m_attempt)) {
+        co_return std::unexpected(error);
+      }
+    }
+    co_return co_await m_inner.read(path, offset, size);
+  }
+
+  [[nodiscard]] makebelieve::ReadSender read(const std::filesystem::path& path,
+                                             makebelieve::Offset offset,
+                                             std::size_t size) const override {
+    return makebelieve::file_task(read_task(path, offset, size));
+  }
+
+  [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
+      const std::function<void(const makebelieve::DirectoryTreeDiff&)>&
+          callback) const override {
+    return m_inner.subscribe_to_changes(callback);
+  }
+};
+
+#ifndef _WIN32
+// Deliberately completes on the request_stop() stack, without a coordinator
+// or coroutine scheduler to move completion away from libfuse's request lock.
+template <class T>
+struct InlineStopSender {
+  using sender_concept = stdexec::sender_t;
+  using completion_signatures =
+      stdexec::completion_signatures<stdexec::set_value_t(
+                                         std::expected<T, std::error_code>),
+                                     stdexec::set_stopped_t()>;
+  std::promise<void>* started;
+  bool stopped;
+
+  template <class Receiver>
+  struct Operation {
+    using operation_state_concept = stdexec::operation_state_t;
+    std::promise<void>* started;
+    bool stopped;
+    Receiver receiver;
+    struct OnStop {
+      Operation* self;
+      void operator()() const noexcept {
+        if (self->stopped) {
+          stdexec::set_stopped(std::move(self->receiver));
+        } else {
+          stdexec::set_value(
+              std::move(self->receiver),
+              std::expected<T, std::error_code>(std::unexpected(
+                  std::make_error_code(std::errc::operation_canceled))));
+        }
+      }
+    };
+    std::optional<stdexec::inplace_stop_callback<OnStop>> callback;
+    void start() & noexcept {
+      callback.emplace(stdexec::get_stop_token(stdexec::get_env(receiver)),
+                       OnStop{this});
+      started->set_value();
+    }
+  };
+
+  template <class Receiver>
+  Operation<Receiver> connect(Receiver receiver) const {
+    return {started, stopped, std::move(receiver), {}};
+  }
+};
+
+class InlineStopTree : public makebelieve::DirectoryTree {
+  const makebelieve::DirectoryTree& m_inner;
+  bool m_read;
+  bool m_stopped;
+
+ public:
+  mutable std::promise<void> started;
+
+  InlineStopTree(const makebelieve::DirectoryTree& inner,
+                 bool read,
+                 bool stopped)
+      : m_inner(inner), m_read(read), m_stopped(stopped) {}
+
+  std::expected<makebelieve::EntryInfo, std::error_code> status(
+      const std::filesystem::path& path) const override {
+    return m_inner.status(path);
+  }
+  std::expected<std::vector<makebelieve::TreeEntry>, std::error_code> ls(
+      const std::filesystem::path& path) const override {
+    return m_inner.ls(path);
+  }
+  makebelieve::OpenSender open(
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& context) const override {
+    if (!m_read && path == "pending") {
+      return InlineStopSender<makebelieve::FileInfo>{&started, m_stopped};
+    }
+    return m_inner.open(path, context);
+  }
+  makebelieve::ReadSender read(const std::filesystem::path& path,
+                               makebelieve::Offset offset,
+                               std::size_t size) const override {
+    if (m_read && path == "pending") {
+      return InlineStopSender<std::string>{&started, m_stopped};
+    }
+    return m_inner.read(path, offset, size);
+  }
+  makebelieve::Subscription subscribe_to_changes(
+      const std::function<void(const makebelieve::DirectoryTreeDiff&)>&
+          callback) const override {
+    return m_inner.subscribe_to_changes(callback);
+  }
+};
+#endif
+
+// Forwards to an in-memory tree, but holds open() of one path until released.
+class GatedOpenTree : public makebelieve::DirectoryTree {
+  const makebelieve::DirectoryTree& m_inner;
+  std::filesystem::path m_gated;
+  mutable std::mutex m_mutex;
+  mutable std::condition_variable m_changed;
+  mutable bool m_waiting = false;
+  mutable exec::static_thread_pool m_completions{1};
+  mutable makebelieve::BuildCoordinator m_coordinator{
+      makebelieve::unlimited_permits(), makebelieve::Attribution::none(),
+      m_completions.get_scheduler()};
+  makebelieve::BuildCoordinator::AttemptPtr m_attempt =
+      m_coordinator.create_attempt();
+
+ public:
+  GatedOpenTree(const makebelieve::DirectoryTree& inner,
+                std::filesystem::path gated)
+      : m_inner(inner), m_gated(std::move(gated)) {}
+
+  // Waits (bounded) until an open() of the gated path is held.
+  [[nodiscard]] bool wait_until_held() const {
+    std::unique_lock lock(m_mutex);
+    return m_changed.wait_for(lock, k_timeout, [this] { return m_waiting; });
+  }
+
+  void release() { m_coordinator.complete(m_attempt, {}); }
+
+  [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
+      const std::filesystem::path& path) const override {
+    return m_inner.status(path);
+  }
+
+  [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
+                              std::error_code>
+  ls(const std::filesystem::path& path) const override {
+    return m_inner.ls(path);
+  }
+
+  [[nodiscard]] makebelieve::OpenSender open(
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& context) const override {
+    return makebelieve::file_task(open_task(path, context));
+  }
+
+  [[nodiscard]] exec::task<
+      std::expected<makebelieve::FileInfo, std::error_code>>
+  open_task(std::filesystem::path path,
+            makebelieve::OpenContext context) const {
+    if (path == m_gated) {
+      {
+        const std::lock_guard lock(m_mutex);
+        m_waiting = true;
+      }
+      m_changed.notify_all();
+      if (auto error =
+              co_await m_coordinator.wait(m_attempt, context.requester_pid)) {
+        co_return std::unexpected(error);
+      }
+    }
+    co_return co_await m_inner.open(path, context);
+  }
+
+  [[nodiscard]] makebelieve::ReadSender read(const std::filesystem::path& path,
+                                             makebelieve::Offset offset,
+                                             std::size_t size) const override {
     return m_inner.read(path, offset, size);
   }
 
@@ -1089,6 +1297,231 @@ TEST_F(VirtualFileSystem, AnOpenThatWaitsDoesNotHoldUpOtherRequests) {
   EXPECT_EQ(slow.get(), "slow");
 }
 
+// Far more suspended requests than either backend has dispatcher/worker
+// threads. The unrelated request must finish before any waiter is released.
+TEST_F(VirtualFileSystem, Suspends128OpensWithoutBlockingDispatchers) {
+  constexpr std::size_t count = 128;
+  for (std::size_t i = 0; i < count; ++i) {
+    tree().write_file("park" + std::to_string(i),
+                      "parked " + std::to_string(i));
+  }
+  tree().write_file("free.txt", "free");
+  ParkingTree parking(tree());
+  const makebelieve::VirtualFileSystem vfs(parking, mountpoint(), notifier());
+  std::vector<std::future<std::optional<std::string>>> parked;
+  for (std::size_t i = 0; i < count; ++i) {
+    parked.push_back(std::async(std::launch::async, [this, i] {
+      return read_file(mountpoint() / ("park" + std::to_string(i)));
+    }));
+  }
+  const bool all_parked = parking.wait_until_parked(count);
+  auto other = std::async(std::launch::async, [this] {
+    std::error_code ignored;
+    static_cast<void>(
+        std::filesystem::file_size(mountpoint() / "free.txt", ignored));
+    return read_file(mountpoint() / "free.txt");
+  });
+  const bool progressed =
+      other.wait_for(k_timeout) == std::future_status::ready;
+  parking.release();
+  EXPECT_TRUE(all_parked);
+  EXPECT_TRUE(progressed);
+  EXPECT_EQ(other.get(), "free");
+  for (std::size_t i = 0; i < count; ++i) {
+    EXPECT_EQ(parked[i].get(), "parked " + std::to_string(i));
+  }
+}
+
+TEST_F(VirtualFileSystem, SuspendsReadsWithoutBlockingOtherFiles) {
+  for (int i = 0; i < 4; ++i) {
+    tree().write_file("readpark" + std::to_string(i), "ready");
+  }
+  tree().write_file("free", "free");
+  ParkingTree parking(tree());
+  const makebelieve::VirtualFileSystem vfs(parking, mountpoint(), notifier());
+  std::vector<std::future<std::optional<std::string>>> readers;
+  for (int i = 0; i < 4; ++i) {
+    readers.push_back(std::async(std::launch::async, [this, i] {
+      return read_file(mountpoint() / ("readpark" + std::to_string(i)));
+    }));
+  }
+  const bool suspended = parking.wait_until_parked(4);
+  auto other = std::async(std::launch::async,
+                          [this] { return read_file(mountpoint() / "free"); });
+  const bool progressed =
+      other.wait_for(k_timeout) == std::future_status::ready;
+  parking.release();
+  EXPECT_TRUE(suspended);
+  EXPECT_TRUE(progressed);
+  EXPECT_EQ(other.get(), "free");
+  for (auto& reader : readers) {
+    EXPECT_EQ(reader.get(), "ready");
+  }
+}
+
+TEST_F(VirtualFileSystem, UnmountCancelsSuspendedOpens) {
+  tree().write_file("park", "parked");
+  ParkingTree parking(tree());
+  auto vfs = std::make_unique<makebelieve::VirtualFileSystem>(
+      parking, mountpoint(), notifier());
+  auto reader = std::async(std::launch::async,
+                           [this] { return read_file(mountpoint() / "park"); });
+  const bool parked = parking.wait_until_parked(1);
+  vfs.reset();
+  EXPECT_TRUE(parked);
+  EXPECT_EQ(reader.wait_for(k_timeout), std::future_status::ready);
+  EXPECT_FALSE(reader.get().has_value());
+}
+
+#ifndef _WIN32
+// Exercise both a value carrying operation_canceled and set_stopped: the latter
+// skips the coroutine body and replies through Request's destructor instead.
+TEST_F(VirtualFileSystem, InlineStopCompletionsDoNotDeadlockTheDispatcher) {
+  tree().write_file("pending", "pending content");
+  tree().write_file("free", "dispatcher still serves requests");
+  for (const bool reading : {false, true}) {
+    for (const bool stopped : {false, true}) {
+      SCOPED_TRACE(reading ? "read" : "open");
+      SCOPED_TRACE(stopped ? "set_stopped" : "set_value");
+      InlineStopTree inline_stop(tree(), reading, stopped);
+      auto started = inline_stop.started.get_future();
+      auto vfs = std::make_unique<makebelieve::VirtualFileSystem>(
+          inline_stop, mountpoint(), notifier());
+      struct sigaction handler {};
+      struct sigaction previous {};
+      handler.sa_handler = [](int) {};
+      ::sigemptyset(&handler.sa_mask);
+      ASSERT_EQ(::sigaction(SIGUSR1, &handler, &previous), 0);
+
+      int error = 0;
+      std::thread reader([&] {
+        const int fd = ::open((mountpoint() / "pending").c_str(), O_RDONLY);
+        if (fd < 0) {
+          error = errno;
+        } else {
+          char byte;
+          if (reading && ::read(fd, &byte, 1) < 0) {
+            error = errno;
+          }
+          ::close(fd);
+        }
+      });
+      EXPECT_EQ(started.wait_for(k_timeout), std::future_status::ready);
+      EXPECT_EQ(read_file(mountpoint() / "free"),
+                "dispatcher still serves requests");
+      if (reading) {
+        // Buffered reads wait in the kernel page cache and do not reliably
+        // turn a handled signal into a FUSE interrupt. Cancel via shutdown.
+        vfs.reset();
+      } else {
+        EXPECT_EQ(::pthread_kill(reader.native_handle(), SIGUSR1), 0);
+      }
+      // A lock regression would strand the reader or prevent shutdown.
+      reader.join();
+      EXPECT_EQ(::sigaction(SIGUSR1, &previous, nullptr), 0);
+      if (reading) {
+        // Unmount can abort the connection before the buffered read observes
+        // the cancellation reply; either way the read must fail promptly.
+        EXPECT_NE(error, 0);
+      } else {
+        EXPECT_EQ(error, EINTR);
+      }
+      if (vfs) {
+        EXPECT_EQ(read_file(mountpoint() / "free"),
+                  "dispatcher still serves requests");
+      }
+    }
+  }
+}
+
+// A handled signal must interrupt just its reader with EINTR, so callers can
+// retry. Both readers share one coordinator attempt, which must stay alive.
+TEST_F(VirtualFileSystem,
+       InterruptedOpenReturnsEintrWithoutCancelingSharedWork) {
+  tree().write_file("park", "shared result");
+  ParkingTree parking(tree());
+  const makebelieve::VirtualFileSystem vfs(parking, mountpoint(), notifier());
+
+  struct sigaction handler {};
+  struct sigaction previous {};
+  handler.sa_handler = [](int) {};
+  ::sigemptyset(&handler.sa_mask);
+  // No SA_RESTART: observe the native open result rather than a kernel retry.
+  ASSERT_EQ(::sigaction(SIGUSR1, &handler, &previous), 0);
+
+  std::promise<int> opened;
+  auto result = opened.get_future();
+  std::thread interrupted([&] {
+    const int fd = ::open((mountpoint() / "park").c_str(), O_RDONLY);
+    const int error = fd < 0 ? errno : 0;
+    if (fd >= 0) {
+      ::close(fd);
+    }
+    opened.set_value(error);
+  });
+  auto other = std::async(std::launch::async,
+                          [&] { return read_file(mountpoint() / "park"); });
+  const bool parked = parking.wait_until_parked(2);
+  const int signalled = ::pthread_kill(interrupted.native_handle(), SIGUSR1);
+  const bool completed =
+      result.wait_for(k_timeout) == std::future_status::ready;
+  const bool other_waits = other.wait_for(0s) == std::future_status::timeout;
+  // Always release the gate, even when an assertion will fail, so the threads
+  // and mount can be torn down without waiting on the test timeout.
+  parking.release();
+  interrupted.join();
+  const auto content = other.get();
+  EXPECT_EQ(::sigaction(SIGUSR1, &previous, nullptr), 0);
+  EXPECT_TRUE(parked);
+  EXPECT_EQ(signalled, 0);
+  EXPECT_TRUE(completed);
+  EXPECT_TRUE(other_waits);
+  EXPECT_EQ(result.get(), EINTR);
+  EXPECT_EQ(content, "shared result");
+}
+
+TEST_F(VirtualFileSystem, ShutdownCancelsOpenWithEcanceled) {
+  tree().write_file("park", "pending");
+  ParkingTree parking(tree());
+  auto vfs = std::make_unique<makebelieve::VirtualFileSystem>(
+      parking, mountpoint(), notifier());
+  auto reader = std::async(std::launch::async, [&] {
+    const int fd = ::open((mountpoint() / "park").c_str(), O_RDONLY);
+    const int error = fd < 0 ? errno : 0;
+    if (fd >= 0) {
+      ::close(fd);
+    }
+    return error;
+  });
+  const bool parked = parking.wait_until_parked(1);
+  vfs.reset();
+  EXPECT_TRUE(parked);
+  EXPECT_EQ(reader.get(), ECANCELED);
+}
+#endif
+
+TEST_F(VirtualFileSystem, UnmountCancelsSuspendedReads) {
+  tree().write_file("readpark.txt", "pending");
+  ParkingTree parked(tree());
+  std::optional<makebelieve::VirtualFileSystem> vfs;
+  vfs.emplace(parked, mountpoint(), notifier());
+  auto reader = std::async(std::launch::async, [&] {
+    return read_error(mountpoint() / "readpark.txt");
+  });
+  if (!parked.wait_until_parked(1)) {
+    parked.release();
+    FAIL() << "the read never suspended";
+  }
+  auto unmounting = std::async(std::launch::async, [&] { vfs.reset(); });
+  const bool canceled =
+      unmounting.wait_for(k_timeout) == std::future_status::ready;
+  parked.release();
+  unmounting.get();
+  EXPECT_TRUE(canceled);
+  ASSERT_EQ(reader.wait_for(k_timeout), std::future_status::ready);
+  EXPECT_TRUE(reader.get());
+}
+
 // An error from a category that is no platform's - a command's exit status,
 // say - reaches the reader as an I/O error, not as whatever platform error
 // shares its number (4 would read as EINTR on Linux).
@@ -1324,6 +1757,22 @@ TEST_F(VirtualFileSystem, NotifiesWhenAFileIsRemoved) {
   ASSERT_TRUE(watcher.armed());
   tree().remove("a.txt");
   EXPECT_TRUE(watcher.wait_for("a.txt", Change::removed));
+}
+
+TEST_F(VirtualFileSystem, OpenHandleSurvivesEntryRecreation) {
+  tree().write_file("recreated.txt", "old");
+  mount();
+  std::ifstream reader(mountpoint() / "recreated.txt", std::ios::binary);
+  ASSERT_TRUE(reader);
+  ASSERT_EQ(read_rest(reader), "old");
+  tree().remove("recreated.txt");
+  EXPECT_FALSE(std::filesystem::exists(mountpoint() / "recreated.txt"));
+  tree().write_file("recreated.txt", "new contents",
+                    std::chrono::file_clock::now() + 1s);
+  ASSERT_EQ(read_file(mountpoint() / "recreated.txt"), "new contents");
+  reader.clear();
+  reader.seekg(0);
+  EXPECT_EQ(read_rest(reader), "new contents");
 }
 
 // --- Concurrency and teardown ----------------------------------------------

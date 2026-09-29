@@ -178,6 +178,7 @@ exec::task<BuildResult> detail::run_shell_command(
     IoContext& io,
     std::filesystem::path working_directory,
     Command command,
+    LaunchRegistrar registrar,
     stdexec::inplace_stop_token stop) {
   MB_TRACE_THREAD_NAME("build worker");
 
@@ -219,7 +220,8 @@ exec::task<BuildResult> detail::run_shell_command(
 
   ProcessUtil::Result result = co_await ProcessUtil::run(
       io, working_directory,
-      capture ? command.text : substitute_out(command.text, out_path), stop);
+      capture ? command.text : substitute_out(command.text, out_path),
+      registrar, stop);
   if (!result.has_value()) {
     co_return std::unexpected(result.error());
   }

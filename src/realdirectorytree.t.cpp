@@ -179,13 +179,13 @@ TEST_P(EscapingPath, IsRejectedByEveryOperation) {
   EXPECT_EQ(listing.error(), std::errc::no_such_file_or_directory);
 
   const std::expected<std::string, std::error_code> read =
-      tree().read(c.input, 0, 4);
+      makebelieve::DirectoryTreeUtil::read(tree(), c.input, 0, 4);
   ASSERT_FALSE(read.has_value());
   EXPECT_EQ(read.error(), std::errc::no_such_file_or_directory);
 
   // Check 0-size read (that short circuits) still returns an error
   const std::expected<std::string, std::error_code> empty_read =
-      tree().read(c.input, 0, 0);
+      makebelieve::DirectoryTreeUtil::read(tree(), c.input, 0, 0);
   ASSERT_FALSE(empty_read.has_value());
   EXPECT_EQ(empty_read.error(), std::errc::no_such_file_or_directory);
 }
@@ -376,7 +376,7 @@ class ReadSlice : public RealDirectoryTree,
 TEST_P(ReadSlice, ReturnsExpectedBytes) {
   const ReadCase& c = GetParam();
   const std::expected<std::string, std::error_code> result =
-      tree().read(c.input, c.offset, c.size);
+      makebelieve::DirectoryTreeUtil::read(tree(), c.input, c.offset, c.size);
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(*result, c.expected);
 }
@@ -427,7 +427,7 @@ class ReadFailure : public RealDirectoryTree,
 TEST_P(ReadFailure, FailsAsExpected) {
   const ReadFailureCase& c = GetParam();
   const std::expected<std::string, std::error_code> result =
-      tree().read(c.input, c.offset, c.size);
+      makebelieve::DirectoryTreeUtil::read(tree(), c.input, c.offset, c.size);
 
   ASSERT_FALSE(result.has_value());
   if (c.expected.has_value()) {
@@ -622,7 +622,7 @@ TEST_F(RealDirectoryTreeWithAMissingRoot, EveryOperationFails) {
   EXPECT_EQ(listing.error(), std::errc::no_such_file_or_directory);
 
   const std::expected<std::string, std::error_code> read =
-      tree.read("anything.txt", 0, 8);
+      makebelieve::DirectoryTreeUtil::read(tree, "anything.txt", 0, 8);
   ASSERT_FALSE(read.has_value());
   EXPECT_EQ(read.error(), std::errc::no_such_file_or_directory);
 }
