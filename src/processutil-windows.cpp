@@ -32,6 +32,7 @@
 
 #include <windows.h>
 
+// Detours requires the Windows types declared above.
 #include <detours.h>
 
 namespace makebelieve {
@@ -603,11 +604,14 @@ class ChildProcess {
     const std::string& hook;     // the DLL to inject, as Detours wants it
     const std::filesystem::path& working_directory;
     HANDLE standard_output;
+    LaunchRegistrar registrar;         // told about the command before it runs
+    LaunchRegistration& registration;  // where what it recorded is kept
   };
 
   // Starts the command @a spec describes, with the hook it names injected,
   // or says why it could not. A command that cannot be enrolled in a job never
   // runs: without one, what it started could be neither ended nor waited for.
+  // Nor does one its registrar refuses.
   static std::expected<std::unique_ptr<ChildProcess>, std::error_code> launch(
       const Launch& spec) {
     // Created before the suspended launch so the command is enrolled before it
@@ -643,20 +647,28 @@ class ChildProcess {
     ScopedHandle process(info.hProcess);
     ScopedHandle thread(info.hThread);
 
-    // Either failure leaves the command suspended, so it is ended - promptly -
+    // Any failure leaves the command suspended, so it is ended - promptly -
     // before any of its code has run.
-    const auto abandon = [&process]() {
-      const std::error_code error = last_error_code();
+    const auto abandon = [&process](std::error_code error) {
       TerminateProcess(process.get(), 1);
       WaitForSingleObject(process.get(), INFINITE);
       return std::unexpected(error);
     };
     if (!AssignProcessToJobObject(job->get(), process.get())) {
-      return abandon();
+      return abandon(last_error_code());
+    }
+    // In the job, so the registration covers everything the command will
+    // start, and still suspended, so the command has done nothing yet.
+    std::expected<LaunchRegistration, std::error_code> registered =
+        spec.registrar(
+            LaunchedProcess{.pid = info.dwProcessId, .job = job->get()});
+    if (!registered.has_value()) {
+      return abandon(registered.error());
     }
     if (ResumeThread(thread.get()) == static_cast<DWORD>(-1)) {
-      return abandon();
+      return abandon(last_error_code());
     }
+    spec.registration = std::move(*registered);
     return std::unique_ptr<ChildProcess>(new ChildProcess(
         std::move(*job), std::move(process), std::move(thread)));
   }
@@ -755,6 +767,7 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     IoContext& io,
     std::filesystem::path working_directory,
     std::string command,
+    LaunchRegistrar registrar,
     stdexec::inplace_stop_token stop) {
   if (stop.stop_requested()) {
     co_return std::unexpected(
@@ -785,12 +798,18 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
   // CreateProcessW takes a mutable command line.
   std::wstring command_line = L"cmd.exe /c " + *wcommand;
 
+  // Held until the command, and everything it started, has gone - declared
+  // before the child so it is undone only after that.
+  LaunchRegistration registration;
+
   std::expected<std::unique_ptr<ChildProcess>, std::error_code> child =
       ChildProcess::launch({.command_line = command_line,
                             .environment = (*tracing)->environment(),
                             .hook = (*tracing)->hook(),
                             .working_directory = working_directory,
-                            .standard_output = write_end.get()});
+                            .standard_output = write_end.get(),
+                            .registrar = registrar,
+                            .registration = registration});
   // Close our copy of the command's end, so only it can write to the pipe and
   // the pipe closes once it has gone.
   write_end.reset(nullptr);

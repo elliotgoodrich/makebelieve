@@ -2,9 +2,13 @@
 #include "virtualfilesystem.hpp"
 
 #include "directorytree.hpp"
+#include "iocontext.hpp"
 #include "processinfo.hpp"
 #include "tracer.hpp"
 
+#include <fuse_lowlevel.h>
+#include <fuse_opt.h>
+#include <exec/task.hpp>
 #include <stdexec/execution.hpp>
 
 #include <algorithm>
@@ -17,8 +21,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -29,9 +36,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include <fuse.h>
-#include <fuse_opt.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -108,17 +112,6 @@ TraceProcess calling_process(std::uint32_t thread) {
                       : ProcessInfo::name_of(process)};
 }
 
-// Turns a FUSE path (absolute, from the mount root) into the tree-relative
-// path a DirectoryTree expects: "/" becomes the empty path (the root), and a
-// leading slash is otherwise dropped so the result is not absolute.
-std::filesystem::path to_tree_path(const char* fuse_path) {
-  std::string_view view(fuse_path);
-  if (!view.empty() && view.front() == '/') {
-    view.remove_prefix(1);
-  }
-  return {view};
-}
-
 // Converts an EntryInfo mtime to the timespec a struct stat carries.
 timespec to_timespec(std::chrono::file_clock::time_point time) {
   const auto system_time =
@@ -191,7 +184,29 @@ class VirtualFileSystem::Impl {
   // Where notifier passes run.
   exec::static_thread_pool::scheduler m_scheduler;
   fuse_args m_args{};
-  struct fuse* m_fuse = nullptr;
+  fuse_session* m_fuse = nullptr;
+  stdexec::inplace_stop_source m_request_stop;
+  stdexec::counting_scope m_requests;
+  IoContext m_file_io;
+  struct FileHandle {
+    std::filesystem::path path;
+    std::vector<std::string> names;
+  };
+  // Unmount may discard kernel handles without sending release callbacks.
+  std::mutex m_handle_mutex;
+  std::uint64_t m_last_handle = 0;
+  std::unordered_map<std::uint64_t, std::unique_ptr<FileHandle>> m_handles;
+  std::mutex m_inode_mutex;
+  std::unordered_map<std::filesystem::path, fuse_ino_t> m_ids{
+      {{}, FUSE_ROOT_ID}};
+  struct Node {
+    std::filesystem::path path;
+    std::uint64_t lookups = 0;
+  };
+  std::unordered_map<fuse_ino_t, Node> m_paths{
+      {FUSE_ROOT_ID, Node{.path = {}, .lookups = 1}}};
+  fuse_ino_t m_next_inode = FUSE_ROOT_ID;
+
   std::thread m_loop;
 
   // Entries the kernel has seen through us, by lookup or in a listing, each
@@ -224,6 +239,7 @@ class VirtualFileSystem::Impl {
   // under way. m_pending coalesces: a path repeated across diffs is announced
   // once per pass, and m_everything_dirty supersedes the lot.
   std::mutex m_notify_mutex;
+
   Changes m_pending;
   bool m_everything_dirty = false;
   bool m_stopping = false;
@@ -256,37 +272,37 @@ class VirtualFileSystem::Impl {
                               "fuse_opt_add_arg failed");
     }
 
-    const fuse_operations operations = {
-        .getattr = trampoline<&Impl::op_getattr>,
-        .mkdir = trampoline<&Impl::op_mkdir>,
-        .unlink = trampoline<&Impl::op_unlink>,
-        .rmdir = trampoline<&Impl::op_rmdir>,
-        .open = trampoline<&Impl::op_open>,
-        .read = trampoline<&Impl::op_read>,
-        .write = trampoline<&Impl::op_write>,
-        .readdir = trampoline<&Impl::op_readdir>,
+    const fuse_lowlevel_ops operations = {
         .init = &Impl::op_init,
-        .create = trampoline<&Impl::op_create>,
+        .lookup = bridge<&Impl::lookup>,
+        .forget = &Impl::op_forget,
+        .getattr = bridge<&Impl::getattr>,
+        .mknod = bridge<&Impl::mknod>,
+        .mkdir = bridge<&Impl::mkdir>,
+        .unlink = bridge<&Impl::unlink>,
+        .rmdir = bridge<&Impl::rmdir>,
+        .open = bridge<&Impl::open>,
+        .read = bridge<&Impl::read>,
+        .write = bridge<&Impl::write>,
+        .release = bridge<&Impl::release>,
+        .opendir = bridge<&Impl::opendir>,
+        .readdir = bridge<&Impl::readdir>,
+        .releasedir = bridge<&Impl::releasedir>,
+        .create = bridge<&Impl::create>,
     };
-
-    m_fuse = fuse_new(&m_args, &operations, sizeof(operations), this);
-    if (m_fuse == nullptr) {
-      const int error = errno != 0 ? errno : EIO;
-      throw std::system_error(error, std::system_category(), "fuse_new failed");
+    m_fuse = fuse_session_new(&m_args, &operations, sizeof(operations), this);
+    if (!m_fuse) {
+      throw std::system_error(errno ? errno : EIO, std::system_category(),
+                              "fuse_session_new");
     }
-
-    if (fuse_mount(m_fuse, m_mountpoint.c_str()) != 0) {
-      const int error = errno != 0 ? errno : EIO;
-      throw std::system_error(error, std::system_category(),
-                              "fuse_mount failed");
+    if (fuse_session_mount(m_fuse, m_mountpoint.c_str()) != 0) {
+      throw std::system_error(errno ? errno : EIO, std::system_category(),
+                              "fuse_session_mount");
     }
-
-    // Multithreaded, so an open blocked on a build (see op_open) does not hold
-    // up other requests. Every callback here is safe to run concurrently.
-    m_loop = std::thread([this]() {
-      fuse_loop_config config{.clone_fd = 0, .max_idle_threads = 10};
-      fuse_loop_mt(m_fuse, &config);
-    });
+    // A single dispatcher suffices: waiting requests retain their reply handle,
+    // not this thread. Completions can reply concurrently from coroutine
+    // workers.
+    m_loop = std::thread([this] { fuse_session_loop(m_fuse); });
 
     // The subscription is taken last so no change can arrive before there is a
     // mount to poke.
@@ -305,12 +321,14 @@ class VirtualFileSystem::Impl {
     stdexec::sync_wait(m_notifications.join());
 
     if (m_fuse != nullptr) {
-      fuse_exit(m_fuse);
-      fuse_unmount(m_fuse);
+      m_request_stop.request_stop();
+      stdexec::sync_wait(m_requests.join());
+      fuse_session_exit(m_fuse);
+      fuse_session_unmount(m_fuse);
       if (m_loop.joinable()) {
         m_loop.join();
       }
-      fuse_destroy(m_fuse);
+      fuse_session_destroy(m_fuse);
     }
     fuse_opt_free_args(&m_args);
 
@@ -343,68 +361,102 @@ class VirtualFileSystem::Impl {
     create_mountpoint(m_mountpoint);
   }
 
-  // Bridges a fuse_operations C callback to a member function.
-  template <auto MemFn>
+  template <auto Member>
   struct Bridge;
-
-  template <typename... Args, int (Impl::*MemFn)(Args...)>
-  struct Bridge<MemFn> {
-    static int call(Args... args) {
+  template <class... Args, void (Impl::*Member)(fuse_req_t, Args...)>
+  struct Bridge<Member> {
+    static void call(fuse_req_t req, Args... args) noexcept {
       try {
-        auto* self = static_cast<Impl*>(fuse_get_context()->private_data);
-        return (self->*MemFn)(args...);
+        (static_cast<Impl*>(fuse_req_userdata(req))->*Member)(req, args...);
       } catch (const std::bad_alloc&) {
-        return -ENOMEM;
-      } catch (const std::system_error& error) {
-        // Everything this filesystem talks to deals in errno values, so a
-        // code that escaped as an exception is handed back the same way
-        // op_read hands back the ones the tree returns.
-        return -to_errno(error.code());
+        fuse_reply_err(req, ENOMEM);
+      } catch (const std::system_error& e) {
+        fuse_reply_err(req, to_errno(e.code()));
       } catch (...) {
-        return -EIO;
+        fuse_reply_err(req, EIO);
       }
     }
   };
+  template <auto Member>
+  static constexpr auto bridge = Bridge<Member>::call;
 
-  template <auto MemFn>
-  static constexpr auto trampoline = Bridge<MemFn>::call;
-
-  // Whether the request being serviced originates from a notifier pass, the
-  // only writer this filesystem accepts.
-  [[nodiscard]] bool is_self_request() const {
-    // `m_notifier_tid` is 0 between passes.
-    const pid_t writer = m_notifier_tid.load(std::memory_order_relaxed);
-    return writer != 0 && fuse_get_context()->pid == writer;
+  bool is_self_request(fuse_req_t req) const {
+    const auto writer = m_notifier_tid.load(std::memory_order_relaxed);
+    return writer && fuse_req_ctx(req)->pid == writer;
   }
-
-  // Readers go through the kernel's page cache (see op_open), so what keeps
-  // them from being served stale pages is the kernel re-asking for attributes
-  // on every access - the zero timeouts - and dropping cached pages whenever
-  // those attributes show the file moved on. AUTO_INVAL_DATA is what makes it
-  // drop them for a change of mtime as well as of size, which is the only
-  // sign of a same-size rewrite; libfuse normally enables it, but a stale
-  // page is silent corruption, so it is asked for rather than assumed.
-  static void* op_init(fuse_conn_info* conn, fuse_config* config) {
-    config->entry_timeout = 0;
-    config->attr_timeout = 0;
-    config->negative_timeout = 0;
-    // An announced removal really unlinks the entry, even while something
-    // holds it open. Without this, libfuse would try to hide an open file by
-    // renaming it instead, which this filesystem cannot do.
-    config->hard_remove = 1;
-    if ((conn->capable & FUSE_CAP_AUTO_INVAL_DATA) != 0) {
+  static void op_init(void*, fuse_conn_info* conn) {
+    if (conn->capable & FUSE_CAP_AUTO_INVAL_DATA) {
       conn->want |= FUSE_CAP_AUTO_INVAL_DATA;
       conn->want &= ~FUSE_CAP_EXPLICIT_INVAL_DATA;
     }
-    return fuse_get_context()->private_data;
   }
-
-  // Reports an entry's metadata. Everything is read-only: directories 0555,
-  // files 0444.
-  int op_getattr(const char* path, struct stat* out, fuse_file_info* /*info*/) {
-    const std::filesystem::path relative = to_tree_path(path);
+  // Lookup references belong to the kernel. Open handles own their path
+  // separately, so forgetting a lookup never invalidates an existing handle.
+  fuse_ino_t inode(const std::filesystem::path& name) {
+    const std::lock_guard lock(m_inode_mutex);
+    auto [it, inserted] = m_ids.try_emplace(name, m_next_inode + 1);
+    if (inserted) {
+      try {
+        m_paths.emplace(++m_next_inode, Node{.path = name});
+      } catch (...) {
+        m_ids.erase(it);
+        throw;
+      }
+    }
+    ++m_paths.at(it->second).lookups;
+    return it->second;
+  }
+  std::filesystem::path path(fuse_ino_t ino) {
+    const std::lock_guard lock(m_inode_mutex);
+    return m_paths.at(ino).path;
+  }
+  // Inode numbers and lookup counts share a platform integer type.
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  void forget_inode(fuse_ino_t ino, std::uint64_t count) noexcept {
+    const std::lock_guard lock(m_inode_mutex);
+    const auto found = m_paths.find(ino);
+    if (found == m_paths.end() || ino == FUSE_ROOT_ID) {
+      return;
+    }
+    found->second.lookups -= std::min(count, found->second.lookups);
+    if (found->second.lookups == 0) {
+      m_ids.erase(found->second.path);
+      m_paths.erase(found);
+    }
+  }
+  // Forget has no error reply. Bypass the exception-to-errno bridge, and keep
+  // reference cleanup non-throwing, including after a failed entry reply.
+  static void op_forget(fuse_req_t req,
+                        fuse_ino_t ino,
+                        std::uint64_t count) noexcept {
+    static_cast<Impl*>(fuse_req_userdata(req))->forget_inode(ino, count);
+    fuse_reply_none(req);
+  }
+  std::uint64_t retain(std::unique_ptr<FileHandle> handle) {
+    const std::lock_guard lock(m_handle_mutex);
+    const auto result = ++m_last_handle;
+    m_handles.emplace(result, std::move(handle));
+    return result;
+  }
+  FileHandle& file_handle(std::uint64_t handle) {
+    const std::lock_guard lock(m_handle_mutex);
+    return *m_handles.at(handle);
+  }
+  // May run after fuse_reply_open has consumed the request. Never unwind into
+  // the bridge and cause a second reply if cleanup cannot take its lock.
+  void drop(std::uint64_t handle) noexcept {
+    const std::lock_guard lock(m_handle_mutex);
+    m_handles.erase(handle);
+  }
+  void release(fuse_req_t req, fuse_ino_t, fuse_file_info* info) {
+    drop(info->fh);
+    fuse_reply_err(req, 0);
+  }
+  int attributes(fuse_req_t req,
+                 const std::filesystem::path& relative,
+                 struct stat* out) {
     std::memset(out, 0, sizeof(*out));
-    if (is_self_request()) {
+    if (is_self_request(req)) {
       switch (pretence_for(relative)) {
         case Pretence::none:
           break;
@@ -451,145 +503,279 @@ class VirtualFileSystem::Impl {
     return 0;
   }
 
-  // Lists a directory's children. Attribute caching is off, so the per-entry
-  // stat is left to op_getattr rather than primed here.
-  int op_readdir(const char* path,
-                 void* buffer,
-                 fuse_fill_dir_t filler,
-                 off_t /*offset*/,
-                 fuse_file_info* /*info*/,
-                 fuse_readdir_flags /*flags*/) {
-    const std::filesystem::path directory = to_tree_path(path);
-    const std::expected<std::vector<TreeEntry>, std::error_code> entries =
-        m_tree.ls(directory);
-    if (!entries.has_value()) {
-      return -ENOENT;
+  void entry(fuse_req_t req,
+             const std::filesystem::path& name,
+             fuse_file_info* fi = nullptr) {
+    fuse_entry_param value{};
+    const int error = attributes(req, name, &value.attr);
+    if (error) {
+      fuse_reply_err(req, -error);
+      return;
     }
-
-    // We need to supply the standard self/parent entries.
-    filler(buffer, ".", nullptr, 0, fuse_fill_dir_flags{});
-    filler(buffer, "..", nullptr, 0, fuse_fill_dir_flags{});
-    for (const TreeEntry& entry : *entries) {
-      // TreeEntry::name is the leaf name only. A listed entry is one the
-      // kernel's caller now knows about, so its removal is worth announcing
-      // even if nothing ever looks it up.
-      remember(directory / entry.name,
-               std::holds_alternative<DirectoryInfo>(entry.info));
-      filler(buffer, entry.name.c_str(), nullptr, 0, fuse_fill_dir_flags{});
+    value.ino = inode(name);
+    value.generation = 1;
+    value.attr.st_ino = value.ino;
+    const int replied =
+        fi ? fuse_reply_create(req, &value, fi) : fuse_reply_entry(req, &value);
+    if (replied != 0) {
+      forget_inode(value.ino, 1);
     }
-    return 0;
+  }
+  void lookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
+    entry(req, path(parent) / name);
+  }
+  void getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info* handle) {
+    struct stat value {};
+    const auto name =
+        handle && handle->fh ? file_handle(handle->fh).path : path(ino);
+    const int error = attributes(req, name, &value);
+    value.st_ino = ino;
+    if (error) {
+      fuse_reply_err(req, -error);
+    } else {
+      fuse_reply_attr(req, &value, 0);
+    }
   }
 
-  // Opens a file. Readers get the kernel's page cache rather than direct_io,
-  // because direct_io rules out shared memory mappings: the kernel only allows
-  // them on a direct_io file when the filesystem negotiates
-  // FUSE_DIRECT_IO_ALLOW_MMAP, which libfuse cannot request before 3.16 and
-  // Ubuntu 24.04 ships 3.14. Compilers, linkers and indexers map their inputs,
-  // so that is not a corner worth giving up.
-  //
-  // A read open blocks in the tree's open() until the file is final; a stat
-  // never comes here. With attribute caching off, the kernel re-reads the size
-  // before a read or fstat, so it sees the settled one.
-  int op_open(const char* path, fuse_file_info* info) {
-    const std::filesystem::path relative = to_tree_path(path);
-    // FUSE names the calling thread, which is the process itself for a
-    // single-threaded reader.
-    const auto caller = static_cast<std::uint32_t>(fuse_get_context()->pid);
-    MB_TRACE_POOL_SCOPE(m_reader_lanes, calling_process(caller), "vfs",
-                        std::tie("open", relative), "caller", caller);
-    const std::expected<EntryInfo, std::error_code> status =
-        m_tree.status(relative);
-    if (!status.has_value()) {
-      return -ENOENT;
+  // The kernel request survives the dispatch callback. Its owner unregisters
+  // interrupts before replying, and guarantees a reply even on cancellation or
+  // an exception in the coroutine. No pointers to callback arguments escape.
+  struct Request {
+    fuse_req_t req;
+    stdexec::inplace_stop_source stop;
+    // Keep the first cancellation cause: shutdown and a kernel interrupt can
+    // race, but only the latter should make the caller retry with EINTR.
+    std::atomic<int> cancellation{0};
+    void cancel(int error) noexcept {
+      int none = 0;
+      cancellation.compare_exchange_strong(none, error);
+      stop.request_stop();
     }
-    if (std::holds_alternative<DirectoryInfo>(*status)) {
-      return -EISDIR;
+    struct Stop {
+      Request* self;
+      void operator()() const noexcept { self->cancel(ECANCELED); }
+    };
+    stdexec::inplace_stop_callback<Stop> shutdown;
+    Request(fuse_req_t request, stdexec::inplace_stop_token token)
+        : req(request), shutdown(token, Stop{this}) {
+      fuse_req_interrupt_func(
+          req,
+          [](fuse_req_t, void* ptr) {
+            static_cast<Request*>(ptr)->cancel(EINTR);
+          },
+          this);
     }
-    if ((info->flags & O_ACCMODE) != O_RDONLY) {
-      // 0444 is advertised for every file, but that is cosmetic without
-      // default_permissions. This check is what actually keeps the projection
-      // read-only, and what carves out the notifier's own write.
-      if (!is_self_request()) {
-        return -EACCES;
+    ~Request() { reply_error(ECANCELED); }
+    void reply_error(int error) {
+      if (!req) {
+        return;
       }
-      // The notifier's write must not touch the page cache. A buffered write
-      // would copy its placeholder byte into the cached page before op_write
-      // ever sees it, and a reader mapping the file at that moment would see
-      // that byte in place of the real content.
-      info->direct_io = 1;
-      return 0;
+      // Unregister the interrupt callback before inspecting its final cause.
+      // Also handles a stopped sender, whose coroutine never reaches a reply.
+      const auto request = take();
+      if (error == ECANCELED && cancellation.load() == EINTR) {
+        error = EINTR;
+      }
+      fuse_reply_err(request, error);
     }
-
-    if (const std::expected<FileInfo, std::error_code> opened =
-            m_tree.open(relative);
-        !opened.has_value()) {
-      return -to_errno(opened.error());
+    fuse_req_t take() {
+      fuse_req_interrupt_func(req, nullptr, nullptr);
+      return std::exchange(req, nullptr);
     }
-    return 0;
+  };
+  exec::task<void> open_file(std::shared_ptr<Request> request,
+                             std::filesystem::path name,
+                             fuse_file_info info,
+                             std::uint32_t caller) {
+    TraceAsyncScope trace;
+    if (g_tracer) {
+      trace.open(m_reader_lanes, calling_process(caller), name);
+    }
+    try {
+      auto handle = std::make_unique<FileHandle>(FileHandle{.path = name});
+      auto opened = co_await stdexec::write_env(
+          m_tree.open(name, OpenContext{.requester_pid = caller}),
+          stdexec::prop{stdexec::get_stop_token, request->stop.get_token()});
+      if (!opened) {
+        request->reply_error(to_errno(opened.error()));
+      } else {
+        info.fh = retain(std::move(handle));
+        if (fuse_reply_open(request->take(), &info) != 0) {
+          drop(info.fh);
+        }
+      }
+    } catch (...) {
+      request->reply_error(EIO);
+    }
   }
-
-  // Hydrates up to `size` bytes at `offset` from the tree. A result shorter
-  // than `size` is end of file.
-  int op_read(const char* path,
-              char* buffer,
-              size_t size,
-              off_t offset,
-              fuse_file_info* /*info*/) {
-    const std::expected<std::string, std::error_code> bytes =
-        m_tree.read(to_tree_path(path), static_cast<Offset>(offset), size);
-    if (!bytes.has_value()) {
-      return -to_errno(bytes.error());
+  void open(fuse_req_t req, fuse_ino_t ino, fuse_file_info* fi) {
+    if ((fi->flags & O_ACCMODE) != O_RDONLY) {
+      if (!is_self_request(req)) {
+        fuse_reply_err(req, EACCES);
+        return;
+      }
+      fi->direct_io = 1;
+      fuse_reply_open(req, fi);
+      return;
     }
-
-    const size_t count = std::min(size, bytes->size());
-    // A FUSE read buffer holds a counted byte range, not a string - the
-    // length goes back as the return value, so there is nothing to terminate.
-    // NOLINTNEXTLINE(bugprone-not-null-terminated-result)
-    std::memcpy(buffer, bytes->data(), count);
-    return static_cast<int>(count);
+    auto name = path(ino);
+    auto caller = static_cast<std::uint32_t>(fuse_req_ctx(req)->pid);
+    auto request = std::make_shared<Request>(req, m_request_stop.get_token());
+    // Ownership has passed to Request: errors below must not trigger a second
+    // reply.
+    try {
+      stdexec::spawn(
+          stdexec::starts_on(m_file_io.get_scheduler(),
+                             open_file(request, std::move(name), *fi, caller)) |
+              stdexec::upon_error([](const std::exception_ptr&) noexcept {}),
+          m_requests.get_token());
+    } catch (...) {
+      request.reset();  // The final request owner supplies a failure reply.
+    }
   }
-
-  // Swallows the notifier's own write and rejects everyone else's.
-  int op_write(const char* /*path*/,
-               [[maybe_unused]] const char* buffer,
+  exec::task<void> read_file(std::shared_ptr<Request> request,
+                             std::filesystem::path name,
+                             size_t size,
+                             off_t offset) {
+    try {
+      auto bytes = co_await stdexec::write_env(
+          m_tree.read(name, offset, size),
+          stdexec::prop{stdexec::get_stop_token, request->stop.get_token()});
+      if (!bytes) {
+        request->reply_error(to_errno(bytes.error()));
+      } else {
+        fuse_reply_buf(request->take(), bytes->data(),
+                       std::min(size, bytes->size()));
+      }
+    } catch (...) {
+      request->reply_error(EIO);
+    }
+  }
+  // NOLINTBEGIN(bugprone-easily-swappable-parameters): libfuse callback
+  // signature.
+  void read(fuse_req_t req,
+            fuse_ino_t ino,
+            size_t size,
+            off_t offset,
+            fuse_file_info* info) {
+    // NOLINTEND(bugprone-easily-swappable-parameters)
+    auto name = info->fh ? file_handle(info->fh).path : path(ino);
+    auto request = std::make_shared<Request>(req, m_request_stop.get_token());
+    try {
+      stdexec::spawn(
+          stdexec::starts_on(
+              m_file_io.get_scheduler(),
+              read_file(request, std::move(name), size, offset)) |
+              stdexec::upon_error([](const std::exception_ptr&) noexcept {}),
+          m_requests.get_token());
+    } catch (...) {
+      request.reset();  // The final request owner supplies a failure reply.
+    }
+  }
+  void write(fuse_req_t req,
+             fuse_ino_t,
+             const char*,
+             size_t size,
+             off_t,
+             fuse_file_info*) {
+    if (!is_self_request(req)) {
+      fuse_reply_err(req, EACCES);
+    } else {
+      fuse_reply_write(req, size);
+    }
+  }
+  using Directory = FileHandle;
+  void opendir(fuse_req_t req, fuse_ino_t ino, fuse_file_info* fi) {
+    const auto name = path(ino);
+    auto entries = m_tree.ls(name);
+    if (!entries) {
+      fuse_reply_err(req, to_errno(entries.error()));
+      return;
+    }
+    auto directory = std::make_unique<Directory>();
+    directory->path = name;
+    directory->names = {".", ".."};
+    for (const auto& item : *entries) {
+      directory->names.push_back(item.name.string());
+      remember(name / item.name,
+               std::holds_alternative<DirectoryInfo>(item.info));
+    }
+    fi->fh = retain(std::move(directory));
+    if (fuse_reply_open(req, fi) != 0) {
+      drop(fi->fh);
+    }
+  }
+  // NOLINTBEGIN(bugprone-easily-swappable-parameters): libfuse callback
+  // signature.
+  void readdir(fuse_req_t req,
+               fuse_ino_t,
                size_t size,
-               off_t /*offset*/,
-               fuse_file_info* /*info*/) {
-    if (!is_self_request()) {
-      return -EACCES;
+               off_t offset,
+               fuse_file_info* fi) {
+    // NOLINTEND(bugprone-easily-swappable-parameters)
+    const auto& names = file_handle(fi->fh).names;
+    std::string buffer(size, '\0');
+    size_t used = 0;
+    for (auto i = static_cast<size_t>(offset); i < names.size(); ++i) {
+      const struct stat info {};
+      const size_t count =
+          fuse_add_direntry(req, buffer.data() + used, size - used,
+                            names[i].c_str(), &info, static_cast<off_t>(i + 1));
+      if (count > size - used) {
+        break;
+      }
+      used += count;
     }
-    // Our self writes are only to raise fsnotify events as this is not
-    // directly supported in FUSE.
-    assert(std::string_view(buffer, size) == k_fake_write_contents);
-    return static_cast<int>(size);
+    fuse_reply_buf(req, buffer.data(), used);
   }
-
-  // The four ways into the tree's namespace, which, like op_write, exist only
-  // for the notifier. Its creates and removals are how the kernel is made to
-  // raise IN_CREATE and IN_DELETE (see announce_creation() and
-  // announce_removal()); each ends the pretence that let the kernel go ahead,
-  // so the lookup libfuse makes straight afterwards sees the tree as it is.
-  // Anyone else is refused, which is what keeps the projection read-only.
-  int op_create(const char* path, mode_t /*mode*/, fuse_file_info* info) {
-    if (!end_pretence(path, Pretence::absent)) {
-      return -EACCES;
+  void releasedir(fuse_req_t req, fuse_ino_t, fuse_file_info* fi) {
+    drop(fi->fh);
+    fuse_reply_err(req, 0);
+  }
+  void create(fuse_req_t req,
+              fuse_ino_t parent,
+              const char* name,
+              mode_t,
+              fuse_file_info* fi) {
+    const auto relative = path(parent) / name;
+    if (!end_pretence(req, relative, Pretence::absent)) {
+      fuse_reply_err(req, EACCES);
+      return;
     }
-    // Nothing is ever written through this handle, but direct_io keeps it
-    // from touching the page cache all the same (see op_open).
-    info->direct_io = 1;
-    return 0;
+    fi->direct_io = 1;
+    entry(req, relative, fi);
   }
-
-  int op_mkdir(const char* path, mode_t /*mode*/) {
-    return end_pretence(path, Pretence::absent) ? 0 : -EACCES;
+  void mknod(fuse_req_t req,
+             fuse_ino_t parent,
+             const char* name,
+             mode_t,
+             dev_t) {
+    const auto relative = path(parent) / name;
+    if (!end_pretence(req, relative, Pretence::absent)) {
+      fuse_reply_err(req, EACCES);
+      return;
+    }
+    entry(req, relative);
   }
-
-  int op_unlink(const char* path) {
-    return end_pretence(path, Pretence::present_file) ? 0 : -EACCES;
+  void mkdir(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t) {
+    const auto relative = path(parent) / name;
+    if (!end_pretence(req, relative, Pretence::absent)) {
+      fuse_reply_err(req, EACCES);
+      return;
+    }
+    entry(req, relative);
   }
-
-  int op_rmdir(const char* path) {
-    return end_pretence(path, Pretence::present_directory) ? 0 : -EACCES;
+  void unlink(fuse_req_t req, fuse_ino_t parent, const char* name) {
+    fuse_reply_err(
+        req, end_pretence(req, path(parent) / name, Pretence::present_file)
+                 ? 0
+                 : EACCES);
+  }
+  void rmdir(fuse_req_t req, fuse_ino_t parent, const char* name) {
+    fuse_reply_err(
+        req, end_pretence(req, path(parent) / name, Pretence::present_directory)
+                 ? 0
+                 : EACCES);
   }
 
   // What the notifier's own requests should be told about @a path.
@@ -607,12 +793,14 @@ class VirtualFileSystem::Impl {
 
   // Ends the pretence if it is the notifier asking about the path it is
   // pretending @a expected for, and reports whether it was.
-  bool end_pretence(const char* fuse_path, Pretence expected) {
-    if (!is_self_request()) {
+  bool end_pretence(fuse_req_t req,
+                    const std::filesystem::path& relative,
+                    Pretence expected) {
+    if (!is_self_request(req)) {
       return false;
     }
     const std::lock_guard<std::mutex> lock(m_pretence_mutex);
-    if (m_pretence != expected || m_pretence_path != to_tree_path(fuse_path)) {
+    if (m_pretence != expected || m_pretence_path != relative) {
       return false;
     }
     m_pretence = Pretence::none;

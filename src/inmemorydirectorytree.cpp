@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "inmemorydirectorytree.hpp"
 
+#include "directorytreeutil.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -327,11 +329,17 @@ InMemoryDirectoryTree::ls(const std::filesystem::path& path) const {
   return m_impl->ls(path);
 }
 
-std::expected<std::string, std::error_code> InMemoryDirectoryTree::read(
-    const std::filesystem::path& path,
-    Offset offset,
-    std::size_t size) const {
-  return m_impl->read(path, offset, size);
+OpenSender InMemoryDirectoryTree::open(const std::filesystem::path& path,
+                                       const OpenContext&) const {
+  return DirectoryTreeUtil::open_by_status(*this, path);
+}
+
+ReadSender InMemoryDirectoryTree::read(const std::filesystem::path& path,
+                                       Offset offset,
+                                       std::size_t size) const {
+  return stdexec::just() | stdexec::then([this, path, offset, size] {
+           return m_impl->read(path, offset, size);
+         });
 }
 
 Subscription InMemoryDirectoryTree::subscribe_to_changes(

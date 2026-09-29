@@ -2,18 +2,12 @@
 #include "virtualfilesystem.hpp"
 
 #include "directorytree.hpp"
+#include "iocontext.hpp"
 #include "processinfo.hpp"
 #include "tracer.hpp"
 
+#include <exec/task.hpp>
 #include <stdexec/execution.hpp>
-
-#include <windows.h>
-
-#include <bcrypt.h>  // PNTSTATUS
-
-#include <winfsp/winfsp.h>
-
-#include <sddl.h>
 
 #include <algorithm>
 #include <array>
@@ -23,6 +17,7 @@
 #include <cstring>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <functional>
 #include <map>
 #include <memory>
@@ -37,6 +32,14 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include <windows.h>
+
+#include <bcrypt.h>  // PNTSTATUS
+#include <sddl.h>
+
+// WinFsp requires the Windows and bcrypt types declared above.
+#include <winfsp/winfsp.h>
 
 namespace makebelieve {
 
@@ -206,6 +209,12 @@ constexpr std::array k_errc_statuses{
                .status = STATUS_TOO_MANY_OPENED_FILES},
     ErrcStatus{.condition = std::errc::operation_canceled,
                .status = STATUS_CANCELLED},
+    // An open that would wait on a cycle of builds.
+    ErrcStatus{.condition = std::errc::resource_deadlock_would_occur,
+               .status = STATUS_POSSIBLE_DEADLOCK},
+    // An open that would block with no dispatcher thread left to park.
+    ErrcStatus{.condition = std::errc::resource_unavailable_try_again,
+               .status = STATUS_INSUFFICIENT_RESOURCES},
     ErrcStatus{.condition = std::errc::timed_out, .status = STATUS_IO_TIMEOUT},
     ErrcStatus{.condition = std::errc::io_error,
                .status = STATUS_IO_DEVICE_ERROR},
@@ -411,6 +420,10 @@ class VirtualFileSystem::Impl {
       throw_status(status, "FspFileSystemCreate failed");
     }
     m_filesystem->UserContext = this;
+    // The high-level Open callback cannot pend. The operation layer can:
+    // run WinFsp's access checks and handle setup first, then defer its reply.
+    FspFileSystemSetOperation(m_filesystem, FspFsctlTransactCreateKind,
+                              &Impl::dispatch_open);
 
     if (const NTSTATUS status =
             FspFileSystemSetMountPoint(m_filesystem, m_root.data());
@@ -419,14 +432,12 @@ class VirtualFileSystem::Impl {
     }
     m_mounted = true;
 
-    // 0 asks for WinFsp's default thread count, which is what every sample
-    // uses and scales with the machine.
-    if (const NTSTATUS status = FspFileSystemStartDispatcher(m_filesystem, 0);
+    // Dispatchers only accept requests; file coroutines defer their replies.
+    if (const NTSTATUS status = FspFileSystemStartDispatcher(m_filesystem, 2);
         !NT_SUCCESS(status)) {
       throw_status(status, "FspFileSystemStartDispatcher failed");
     }
     m_dispatching = true;
-
     // The subscription is taken last so no notification can arrive before
     // there is a filesystem to announce it through.
     m_subscription.emplace(m_tree.subscribe_to_changes(
@@ -466,6 +477,7 @@ class VirtualFileSystem::Impl {
 
     if (m_filesystem != nullptr) {
       if (m_dispatching) {
+        m_request_stop.request_stop();
         FspFileSystemStopDispatcher(m_filesystem);
       }
       if (m_mounted) {
@@ -474,6 +486,7 @@ class VirtualFileSystem::Impl {
         // is gone, which is what this class promises.
         FspFileSystemRemoveMountPoint(m_filesystem);
       }
+      stdexec::sync_wait(m_requests.join());
       FspFileSystemDelete(m_filesystem);
     }
 
@@ -636,22 +649,11 @@ class VirtualFileSystem::Impl {
                 PVOID* file_context,
                 FSP_FSCTL_FILE_INFO* file_info) {
     const std::filesystem::path path = to_tree_path(name);
-    // WinFsp names the process, not the thread within it.
-    const std::uint32_t caller = FspFileSystemOperationProcessId();
-    MB_TRACE_POOL_SCOPE(m_reader_lanes, calling_process(caller), "vfs",
-                        std::tie("open", path), "caller", caller);
     std::expected<EntryInfo, std::error_code> status = m_tree.status(path);
-    if (!status.has_value()) {
+    if (!status) {
       return STATUS_OBJECT_NAME_NOT_FOUND;
     }
-    if (std::holds_alternative<FileInfo>(*status) &&
-        (granted_access & (FILE_READ_DATA | FILE_EXECUTE)) != 0) {
-      const std::expected<FileInfo, std::error_code> opened = m_tree.open(path);
-      if (!opened.has_value()) {
-        return to_ntstatus(opened.error());
-      }
-      status = *opened;
-    }
+    static_cast<void>(granted_access);
 
     const bool is_directory = std::holds_alternative<DirectoryInfo>(*status);
     if (is_directory && (create_options & FILE_NON_DIRECTORY_FILE) != 0) {
@@ -673,6 +675,98 @@ class VirtualFileSystem::Impl {
     *file_info = make_file_info(*status);
     *file_context = handle.release();
     return STATUS_SUCCESS;
+  }
+
+  // Owns the response storage after the dispatcher returns. If starting or
+  // running the coroutine fails, the outstanding request still gets one reply.
+  struct PendingResponse {
+    Impl* owner;
+    RecordBuffer<FSP_FSCTL_TRANSACT_RSP, FSP_FSCTL_TRANSACT_RSP_BUFFER_SIZEMAX>
+        storage;
+    OpenFile* unopened = nullptr;
+    bool replied = false;
+    explicit PendingResponse(Impl& self, const FSP_FSCTL_TRANSACT_RSP& response)
+        : owner(&self) {
+      std::memcpy(storage.get(), &response, response.Size);
+    }
+    void send(NTSTATUS status) noexcept {
+      auto* response = storage.get();
+      response->IoStatus.Status = status;
+      if (unopened) {
+        if (!NT_SUCCESS(status)) {
+          owner->close(unopened);
+        }
+        unopened = nullptr;
+      }
+      replied = true;
+      FspFileSystemSendResponse(owner->m_filesystem, response);
+    }
+    ~PendingResponse() {
+      if (!replied) {
+        send(STATUS_CANCELLED);
+      }
+    }
+  };
+
+  static NTSTATUS dispatch_open(FSP_FILE_SYSTEM* fs,
+                                FSP_FSCTL_TRANSACT_REQ* request,
+                                FSP_FSCTL_TRANSACT_RSP* response) noexcept {
+    auto* self = static_cast<Impl*>(fs->UserContext);
+    const NTSTATUS status = FspFileSystemOpCreate(fs, request, response);
+    if (status != STATUS_SUCCESS) {
+      return status;
+    }
+    auto* handle =
+        reinterpret_cast<OpenFile*>(response->Rsp.Create.Opened.UserContext2);
+    if ((response->Rsp.Create.Opened.FileInfo.FileAttributes &
+         FILE_ATTRIBUTE_DIRECTORY) ||
+        !(response->Rsp.Create.Opened.GrantedAccess &
+          (FILE_READ_DATA | FILE_EXECUTE))) {
+      return status;
+    }
+    // Capture the actual caller before leaving WinFsp's thread-local context.
+    const auto caller = FspFileSystemOperationProcessId();
+    std::shared_ptr<PendingResponse> pending;
+    try {
+      pending = std::make_shared<PendingResponse>(*self, *response);
+      pending->unopened = handle;
+      stdexec::spawn(
+          stdexec::starts_on(self->m_file_io.get_scheduler(),
+                             self->finish_open(pending, handle->path, caller)) |
+              stdexec::upon_error([](std::exception_ptr) noexcept {}),
+          self->m_requests.get_token());
+      return STATUS_PENDING;
+    } catch (...) {
+      if (pending) {
+        return STATUS_PENDING;  // its destructor sends cancellation
+      }
+      self->close(handle);
+      return STATUS_INSUFFICIENT_RESOURCES;
+    }
+  }
+  exec::task<void> finish_open(std::shared_ptr<PendingResponse> pending,
+                               std::filesystem::path path,
+                               std::uint32_t caller) {
+    TraceAsyncScope trace;
+    if (g_tracer) {
+      trace.open(m_reader_lanes, calling_process(caller), path);
+    }
+    try {
+      auto result = co_await stdexec::write_env(
+          m_tree.open(path, OpenContext{.requester_pid = caller}),
+          stdexec::prop{stdexec::get_stop_token, m_request_stop.get_token()});
+      if (!result) {
+        pending->send(to_ntstatus(result.error()));
+        co_return;
+      }
+      pending->storage.get()->Rsp.Create.Opened.FileInfo =
+          make_file_info(*result);
+      pending->send(STATUS_SUCCESS);
+    } catch (const std::system_error& e) {
+      pending->send(to_ntstatus(e.code()));
+    } catch (...) {
+      pending->send(STATUS_IO_DEVICE_ERROR);
+    }
   }
 
   // The handle is gone from the process that held it. The file itself can
@@ -726,23 +820,46 @@ class VirtualFileSystem::Impl {
                 UINT64 offset,
                 ULONG length,
                 PULONG bytes_transferred) {
-    const auto* handle = static_cast<const OpenFile*>(file_context);
-    const std::expected<std::string, std::error_code> bytes =
-        m_tree.read(handle->path, static_cast<Offset>(offset), length);
-    if (!bytes.has_value()) {
-      return to_ntstatus(bytes.error());
+    static_cast<void>(bytes_transferred);
+    auto* response = FspFileSystemGetOperationContext()->Response;
+    auto pending = std::make_shared<PendingResponse>(*this, *response);
+    try {
+      const auto* handle = static_cast<const OpenFile*>(file_context);
+      stdexec::spawn(
+          stdexec::starts_on(
+              m_file_io.get_scheduler(),
+              finish_read(pending, handle->path, buffer, offset, length)) |
+              stdexec::upon_error([](std::exception_ptr) noexcept {}),
+          m_requests.get_token());
+    } catch (...) {
+    }  // PendingResponse supplies a failure reply.
+    return STATUS_PENDING;
+  }
+  exec::task<void> finish_read(std::shared_ptr<PendingResponse> pending,
+                               std::filesystem::path path,
+                               PVOID buffer,
+                               UINT64 offset,
+                               ULONG length) {
+    try {
+      auto bytes = co_await stdexec::write_env(
+          m_tree.read(path, static_cast<Offset>(offset), length),
+          stdexec::prop{stdexec::get_stop_token, m_request_stop.get_token()});
+      if (!bytes) {
+        pending->send(to_ntstatus(bytes.error()));
+        co_return;
+      }
+      if (bytes->empty()) {
+        pending->send(STATUS_END_OF_FILE);
+        co_return;
+      }
+      const auto count =
+          static_cast<ULONG>(std::min<std::size_t>(length, bytes->size()));
+      std::memcpy(buffer, bytes->data(), count);
+      pending->storage.get()->IoStatus.Information = count;
+      pending->send(STATUS_SUCCESS);
+    } catch (...) {
+      pending->send(STATUS_IO_DEVICE_ERROR);
     }
-    if (bytes->empty()) {
-      // read() promises only "up to size bytes", and nothing at all is how it
-      // spells a read that started at or past the end of the file.
-      return STATUS_END_OF_FILE;
-    }
-
-    const auto count =
-        static_cast<ULONG>(std::min<std::size_t>(length, bytes->size()));
-    std::memcpy(buffer, bytes->data(), count);
-    *bytes_transferred = count;
-    return STATUS_SUCCESS;
   }
 
   // Re-queries rather than reporting what Open saw, so a file that was built
@@ -1105,6 +1222,10 @@ class VirtualFileSystem::Impl {
   // several times over. Consulted before every notification and drained by
   // cleanup().
   std::mutex m_open_mutex;
+
+  stdexec::inplace_stop_source m_request_stop;
+  stdexec::counting_scope m_requests;
+  IoContext m_file_io;
   std::map<std::filesystem::path, int> m_open_counts;
 
   // The queue on_tree_changed hands the notifier. m_pending coalesces: a path

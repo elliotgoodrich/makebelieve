@@ -4,6 +4,7 @@
 #include "iocontext.hpp"
 #include "processutilinternal.hpp"
 
+#include <fuse_lowlevel.h>
 #include <exec/task.hpp>
 #include <exec/when_any.hpp>
 #include <stdexec/execution.hpp>
@@ -32,8 +33,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#include <fuse_lowlevel.h>
 
 #include <fcntl.h>
 #include <sched.h>
@@ -869,8 +868,9 @@ exec::task<void> serve_or_abort(IoContext& io,
 // 2. run_child(), in the child: enters a fresh namespace, mounts the device
 //    over the root, hands it back and waits.
 // 3. attach(), in the parent: serves the device it was handed, or reports why
-//    the child could not set up; then release() tells the child the session is
-//    ready, and only then does the command run.
+//    the child could not set up; the command is then registered, and only
+//    once that succeeds does release() tell the child the session is ready,
+//    so only then does the command run.
 class TracingSetup {
   UniqueFd m_parent;
   UniqueFd m_child;
@@ -936,6 +936,7 @@ class TracingSetup {
 exec::task<ProcessUtil::Result> run_traced(IoContext& io,
                                            std::filesystem::path root,
                                            std::string command,
+                                           LaunchRegistrar registrar,
                                            stdexec::inplace_stop_token stop) {
   std::array<int, 2> out_pipe{-1, -1};
   if (::pipe(out_pipe.data()) != 0) {
@@ -954,6 +955,10 @@ exec::task<ProcessUtil::Result> run_traced(IoContext& io,
       detail::take_forced_failure(ProcessUtilTestUtil::Failure::tracing_setup)
           .value_or(std::error_code{})
           .value();
+
+  // Held until the command has been reaped and what it left in its group
+  // killed - declared before the child so it is undone only after that.
+  LaunchRegistration registration;
 
   const pid_t pid = ::fork();
   if (pid < 0) {
@@ -977,6 +982,16 @@ exec::task<ProcessUtil::Result> run_traced(IoContext& io,
           ProcessUtilTestUtil::Failure::tracing_service)) {
     (*session)->fail_at_first_request(*forced);
   }
+  // The child is parked at the barrier, before exec, so the command has done
+  // nothing yet; and it is our unreaped child, so its pid is still its own.
+  std::expected<LaunchRegistration, std::error_code> registered =
+      registrar(LaunchedProcess{.pid = static_cast<std::uint32_t>(pid),
+                                .pidfd = child.exited()});
+  if (!registered.has_value()) {
+    co_await child.terminate(io);
+    co_return std::unexpected(registered.error());
+  }
+  registration = std::move(*registered);
   setup->release();
 
   // Supervise the command and serve its requests side by side. Supervision
@@ -1013,6 +1028,7 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     IoContext& io,
     std::filesystem::path working_directory,
     std::string command,
+    LaunchRegistrar registrar,
     stdexec::inplace_stop_token stop) {
   if (stop.stop_requested()) {
     co_return std::unexpected(
@@ -1028,7 +1044,8 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
   if (ec) {
     root = working_directory;
   }
-  co_return co_await run_traced(io, std::move(root), std::move(command), stop);
+  co_return co_await run_traced(io, std::move(root), std::move(command),
+                                registrar, stop);
 }
 
 }  // namespace makebelieve

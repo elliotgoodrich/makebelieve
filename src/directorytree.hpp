@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <exec/any_sender_of.hpp>
+#include <stdexec/execution.hpp>
+
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <exception>
 #include <expected>
 #include <filesystem>
 #include <functional>
@@ -107,6 +112,32 @@ class Subscription {
   Subscription(const Subscription&) = delete;
 };
 
+/// The process requesting a file. Cancellation travels in the sender
+/// environment.
+struct OpenContext {
+  /// Native process id of the requester; zero means no attributed process.
+  std::uint32_t requester_pid = 0;
+};
+
+/// A file operation yielding a value or filesystem error, an exception, or
+/// stopped. Cancellation propagates through the receiver's stop token.
+/// Implementations may use coroutines or ordinary sender composition.
+/// No completion-thread affinity is promised, including for cancellation:
+/// a sender may complete inside its stop callback. Consumers whose completion
+/// code cannot run there must transfer completion to a suitable scheduler.
+template <class T>
+using FileSender = exec::any_sender<exec::any_receiver<
+    stdexec::completion_signatures<stdexec::set_value_t(
+                                       std::expected<T, std::error_code>),
+                                   stdexec::set_error_t(std::exception_ptr),
+                                   stdexec::set_stopped_t()>,
+    exec::queries<stdexec::inplace_stop_token(
+        stdexec::get_stop_token_t) noexcept>>>;
+/// An asynchronous open yielding the final file metadata or an error.
+using OpenSender = FileSender<FileInfo>;
+/// An asynchronous read yielding file bytes or an error.
+using ReadSender = FileSender<std::string>;
+
 /// @class DirectoryTree
 /// An abstract base class to describe an observable directory tree.
 class DirectoryTree {
@@ -123,29 +154,24 @@ class DirectoryTree {
   [[nodiscard]] virtual std::expected<std::vector<TreeEntry>, std::error_code>
   ls(const std::filesystem::path& path) const = 0;
 
-  /// Blocks until the file at @a path is final and returns its info, or an
-  /// error_code (`is_a_directory` for a directory). Unlike @link status, which
-  /// never blocks. The default reports @link status for a file.
-  [[nodiscard]] virtual std::expected<FileInfo, std::error_code> open(
-      const std::filesystem::path& path) const {
-    const std::expected<EntryInfo, std::error_code> info = status(path);
-    if (!info.has_value()) {
-      return std::unexpected(info.error());
-    }
-    if (const auto* file = std::get_if<FileInfo>(&*info)) {
-      return *file;
-    }
-    return std::unexpected(std::make_error_code(std::errc::is_a_directory));
-  }
+  /// Opens the file at @a path, yielding its final metadata or an error
+  /// (`is_a_directory` for a directory). @a context identifies the requester.
+  /// Suspends while a build is needed. Cancellation
+  /// detaches this reader without stopping a build shared by other readers.
+  /// Completion follows the @link FileSender threading contract.
+  [[nodiscard]] virtual OpenSender open(
+      const std::filesystem::path& path,
+      const OpenContext& context = {}) const = 0;
 
   /// Returns up to @a size bytes of @a path starting at @a offset, or an
-  /// error_code on failure. A result shorter than @a size means end of file. A
-  /// @a size of 0 succeeds with an empty result without opening @a path. Never
-  /// blocks; call @link open first for final contents.
-  [[nodiscard]] virtual std::expected<std::string, std::error_code> read(
-      const std::filesystem::path& path,
-      Offset offset,
-      std::size_t size) const = 0;
+  /// error. A shorter result means end of file; zero size succeeds with an
+  /// empty result without opening the file. Await @link open first for final
+  /// contents. Waiting implementations suspend without occupying a dispatcher
+  /// thread. Cancellation comes from the receiver's stop token.
+  /// Completion follows the @link FileSender threading contract.
+  [[nodiscard]] virtual ReadSender read(const std::filesystem::path& path,
+                                        Offset offset,
+                                        std::size_t size) const = 0;
 
   /// Subscribes to changes in this object by calling @a callback and returns an
   /// RAII guard that will unsubscribe on destruction.

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: MIT
 #include "builddirectorytree.hpp"
 
+#include "buildcoordinator.hpp"
+#include "buildpermits.hpp"
+#include "directorytreeutil.hpp"
+#include "filetask.hpp"
 #include "inmemorydirectorytree.hpp"
 #include "manifest.hpp"
 #include "processinfo.hpp"
 #include "tracer.hpp"
 
+#include <exec/static_thread_pool.hpp>
 #include <stdexec/execution.hpp>
 
 #include <algorithm>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -64,7 +68,8 @@ std::expected<std::string, std::error_code> read_all(
   std::string content;
   while (true) {
     const std::expected<std::string, std::error_code> chunk =
-        tree.read(path, static_cast<Offset>(content.size()), k_chunk);
+        DirectoryTreeUtil::read(tree, path, static_cast<Offset>(content.size()),
+                                k_chunk);
     if (!chunk.has_value()) {
       return std::unexpected(chunk.error());
     }
@@ -120,19 +125,6 @@ std::string_view to_string(Manifest::Action action) {
       return "tracing";
   }
   return "unknown";
-}
-
-// The error a build that completed with @a error is recorded as.
-std::error_code to_error_code(const std::exception_ptr& error) noexcept {
-  try {
-    std::rethrow_exception(error);
-  } catch (const std::system_error& failure) {
-    return failure.code();
-  } catch (const std::bad_alloc&) {
-    return std::make_error_code(std::errc::not_enough_memory);
-  } catch (...) {
-    return std::make_error_code(std::errc::io_error);
-  }
 }
 
 // The content of a `tracing` output: the trace so far, or an empty one when
@@ -211,15 +203,18 @@ class BuildDirectoryTree::Impl {
   std::set<std::filesystem::path> m_stale;
 
   // Outputs whose build has started and is awaiting completion, so a second
-  // open or a coincident input change does not launch it again.
+  // open or a coincident input change does not launch it again. An output
+  // both in flight and stale changed after its build started.
   std::set<std::filesystem::path> m_in_flight;
 
-  // Signalled when a build finishes, waking a waiting open().
-  std::condition_variable m_settled;
-
-  // Builds finished per output, and the last one's error if it failed.
-  std::map<std::filesystem::path, std::uint64_t> m_finished;
-  std::map<std::filesystem::path, std::error_code> m_failed;
+  // Each output's build attempts, as the coordinator knows them: the one
+  // under way or last run, and the next, created by an open that arrived
+  // after the output changed mid-build and started once that build ends.
+  struct Attempts {
+    BuildCoordinator::AttemptPtr current;
+    BuildCoordinator::AttemptPtr next;
+  };
+  std::map<std::filesystem::path, Attempts> m_attempts;
 
   // Outputs opened at least once, which an input change rebuilds eagerly.
   std::set<std::filesystem::path> m_materialized;
@@ -250,6 +245,14 @@ class BuildDirectoryTree::Impl {
 
   CommandRunner m_runner;
 
+  // Used when the tree is given no coordinator: no limit on builds, and no
+  // request attributed to any.
+  std::optional<exec::static_thread_pool> m_own_workers;
+  std::optional<BuildCoordinator> m_own_coordinator;
+
+  // Runs every build and holds every open that waits on one.
+  BuildCoordinator* m_coordinator;
+
   // Told why a changed manifest was rejected; may be empty.
   ManifestErrorHandler m_on_manifest_error;
 
@@ -274,10 +277,17 @@ class BuildDirectoryTree::Impl {
  public:
   Impl(const DirectoryTree& source,
        CommandRunner runner,
+       BuildCoordinator* coordinator,
        ManifestErrorHandler on_manifest_error)
       : m_source(source),
         m_runner(std::move(runner)),
+        m_coordinator(coordinator),
         m_on_manifest_error(std::move(on_manifest_error)) {
+    if (m_coordinator == nullptr) {
+      m_coordinator =
+          &m_own_coordinator.emplace(unlimited_permits(), Attribution::none(),
+                                     m_own_workers.emplace(1).get_scheduler());
+    }
     const auto commands = read_rules(m_source);
     if (!commands.has_value()) {
       throw std::runtime_error(commands.error());
@@ -323,51 +333,73 @@ class BuildDirectoryTree::Impl {
     return m_structure.ls(path);
   }
 
-  [[nodiscard]] std::expected<std::string, std::error_code> read(
-      const std::filesystem::path& path,
-      Offset offset,
-      std::size_t size) const {
+  [[nodiscard]] ReadSender read(const std::filesystem::path& path,
+                                Offset offset,
+                                std::size_t size) const {
     return m_structure.read(path, offset, size);
   }
 
-  // Builds or waits until a declared output is neither stale nor building.
-  // Returns the error of a build that failed meanwhile rather than retrying.
-  [[nodiscard]] std::error_code build_now(const std::filesystem::path& path) {
+  // Waits, through the coordinator, for the build of a declared output that
+  // brings it up to date - joining the one under way unless the output has
+  // changed since it started, otherwise the next, which is started here if the
+  // output is idle - and returns that build's error, if it failed.
+  [[nodiscard]] exec::task<std::error_code> build_now(
+      std::filesystem::path path,
+      OpenContext context) {
     const std::filesystem::path output = path.lexically_normal();
-    std::unique_lock lock(m_mutex);
-    const auto command = m_commands.find(output);
-    if (command == m_commands.end()) {
-      return {};
-    }
-    m_materialized.insert(output);
+    BuildCoordinator::AttemptPtr target;
+    std::optional<Launch> launch;
+    {
+      const std::lock_guard lock(m_mutex);
+      const auto command = m_commands.find(output);
+      if (command == m_commands.end()) {
+        co_return std::error_code{};
+      }
+      m_materialized.insert(output);
 
-    // A trace is out of date the moment anything else happens, so each open
-    // takes a fresh one.
-    if (command->second.action == Manifest::Action::Tracing &&
-        !m_in_flight.contains(output)) {
-      m_stale.insert(output);
-    }
+      // A trace is out of date the moment anything else happens, so each open
+      // takes a fresh one.
+      if (command->second.action == Manifest::Action::Tracing &&
+          !m_in_flight.contains(output)) {
+        m_stale.insert(output);
+      }
 
-    const std::uint64_t finished_before = m_finished[output];
-    while (true) {
+      Attempts& attempts = m_attempts[output];
       if (m_in_flight.contains(output)) {
-        m_settled.wait(lock);
-        continue;
-      }
-      if (!m_stale.contains(output)) {
-        return {};
-      }
-      // Stale and idle: report a failure since we started, else build.
-      if (m_finished[output] != finished_before) {
-        if (const auto it = m_failed.find(output); it != m_failed.end()) {
-          return it->second;
+        if (!m_stale.contains(output)) {
+          target = attempts.current;
+        } else {
+          if (attempts.next == nullptr) {
+            attempts.next = m_coordinator->create_attempt(attempts.current);
+          }
+          target = attempts.next;
         }
+      } else if (m_stale.contains(output)) {
+        launch = claim_build(output);
+        target = launch->attempt;
+      } else {
+        co_return std::error_code{};
       }
-      // Unlocked: a build that completes inline calls finish_build from inside.
-      lock.unlock();
-      start_build(output);
-      lock.lock();
     }
+    // Unlocked: a build that completes inline calls finish_build from inside.
+    if (launch.has_value()) {
+      launch_build(std::move(*launch));
+    }
+    co_return co_await m_coordinator->wait(target, context.requester_pid);
+  }
+
+  exec::task<std::expected<FileInfo, std::error_code>> open(
+      std::filesystem::path path,
+      OpenContext context) {
+    if (const auto stop = co_await stdexec::get_stop_token();
+        stop.stop_requested()) {
+      co_return std::unexpected(
+          std::make_error_code(std::errc::operation_canceled));
+    }
+    if (const auto error = co_await build_now(path, context)) {
+      co_return std::unexpected(error);
+    }
+    co_return co_await DirectoryTreeUtil::open_by_status(m_structure, path);
   }
 
   // Passes on every change but the rewrite of a `tracing` output. Reading the
@@ -414,35 +446,64 @@ class BuildDirectoryTree::Impl {
   }
 
  private:
-  // Recursive with finish_build: a build that completes inline and finds its
-  // output went stale meanwhile starts the next one. Each round needs another
-  // change to the output's inputs, so it cannot run away.
-  // NOLINTNEXTLINE(misc-no-recursion)
-  void start_build(const std::filesystem::path& output) {
+  // A build claimed under m_mutex, for launch_build to start once it is
+  // released.
+  struct Launch {
+    std::filesystem::path output;
+    BuildCoordinator::AttemptPtr attempt;
     Command command;
     std::uint64_t build_id = 0;
+  };
+
+  // Marks @a output as building - as the attempt an open is already waiting
+  // on, if one is - and returns what launch_build needs to start it.
+  // @pre m_mutex is held; @a output is declared, stale and not in flight.
+  Launch claim_build(const std::filesystem::path& output) {
+    Attempts& attempts = m_attempts[output];
+    BuildCoordinator::AttemptPtr attempt =
+        attempts.next != nullptr ? std::exchange(attempts.next, nullptr)
+                                 : m_coordinator->create_attempt();
+    attempts.current = attempt;
+    m_stale.erase(output);
+    m_in_flight.insert(output);
+    Launch launch{.output = output,
+                  .attempt = std::move(attempt),
+                  .command = m_commands.at(output)};
+    // A `tracing` output is left out of the trace, whose snapshot would
+    // otherwise always hold its own unfinished build.
+    if (launch.command.action != Manifest::Action::Tracing) {
+      launch.build_id = ++m_last_build_id;
+    }
+    return launch;
+  }
+
+  // Starts @a output's build if it is declared, stale and idle.
+  // NOLINTNEXTLINE(misc-no-recursion): see launch_build.
+  void start_build(const std::filesystem::path& output) {
+    std::optional<Launch> launch;
     {
       const std::lock_guard lock(m_mutex);
-      if (!m_stale.contains(output) || m_in_flight.contains(output)) {
+      if (!m_stale.contains(output) || m_in_flight.contains(output) ||
+          !m_commands.contains(output)) {
         return;
       }
-      const auto it = m_commands.find(output);
-      if (it == m_commands.end()) {
-        return;
-      }
-      m_stale.erase(output);
-      m_in_flight.insert(output);
-      command = it->second;
-      // A `tracing` output is left out of the trace, whose snapshot would
-      // otherwise always hold its own unfinished build.
-      if (command.action != Manifest::Action::Tracing) {
-        build_id = ++m_last_build_id;
-      }
+      launch = claim_build(output);
     }
+    launch_build(std::move(*launch));
+  }
+
+  // Recursive with finish_build: a build that completes inline and finds its
+  // output went stale meanwhile starts the next one. Each round needs another
+  // change to the output's inputs, or an open waiting on the next, so it
+  // cannot run away.
+  // NOLINTNEXTLINE(misc-no-recursion)
+  void launch_build(Launch launch) {
+    const std::filesystem::path output = launch.output;
+    const std::uint64_t build_id = launch.build_id;
 
     // Served by the tree itself rather than the runner.
-    if (command.action == Manifest::Action::Tracing) {
-      finish_build(output, build_id,
+    if (launch.command.action == Manifest::Action::Tracing) {
+      finish_build(output, launch.attempt, build_id,
                    BuildOutput{.bytes = trace_snapshot(), .inputs = {}});
       return;
     }
@@ -454,17 +515,18 @@ class BuildDirectoryTree::Impl {
       const TraceLane lane = take_lane(output);
       tracer->flow_out("build", "build", build_id);
       TraceArgs args;
-      args.add("action", to_string(command.action));
-      args.add("command", command.text);
+      args.add("action", to_string(launch.command.action));
+      args.add("command", launch.command.text);
       tracer->begin(lane, "build", output, args);
       tracer->flow_in(lane, "build", "build", build_id);
     }
 
-    std::optional<BuildSender> build;
+    std::optional<AttemptSender> build;
     try {
-      build.emplace(m_runner(std::move(command)));
+      build.emplace(m_coordinator->run(launch.attempt,
+                                       m_runner(std::move(launch.command))));
     } catch (...) {
-      finish_build(output, build_id,
+      finish_build(output, launch.attempt, build_id,
                    std::unexpected(to_error_code(std::current_exception())));
       return;
     }
@@ -485,8 +547,9 @@ class BuildDirectoryTree::Impl {
             // to, a failure there ends the process, as it would on any thread.
             stdexec::then(
                 // NOLINTNEXTLINE(bugprone-exception-escape)
-                [this, output, build_id](BuildResult result) noexcept {
-                  finish_build(output, build_id, std::move(result));
+                [this, output, attempt = std::move(launch.attempt),
+                 build_id](BuildResult result) noexcept {
+                  finish_build(output, attempt, build_id, std::move(result));
                 }),
         m_builds.get_token());
   }
@@ -525,10 +588,12 @@ class BuildDirectoryTree::Impl {
     }
   }
 
-  // Records the outcome of a build. @a build_id is 0 for one left out of the
-  // trace.
-  // NOLINTNEXTLINE(misc-no-recursion): see start_build.
+  // Records the outcome of @a attempt, a build of @a output, then hands it to
+  // everything waiting on that attempt. @a build_id is 0 for one left out of
+  // the trace.
+  // NOLINTNEXTLINE(misc-no-recursion): see launch_build.
   void finish_build(const std::filesystem::path& output,
+                    const BuildCoordinator::AttemptPtr& attempt,
                     std::uint64_t build_id,
                     BuildResult result) {
     if (result.has_value()) {
@@ -549,27 +614,44 @@ class BuildDirectoryTree::Impl {
       }
     }
 
-    bool rebuild_again = false;
+    std::optional<Launch> next;
+    BuildCoordinator::AttemptPtr orphaned;
     {
       const std::lock_guard lock(m_mutex);
-      // Only now the content is in place may a waiting open() be released.
       m_in_flight.erase(output);
-      ++m_finished[output];
+      const auto attempts = m_attempts.find(output);
+      const bool waited_on =
+          attempts != m_attempts.end() && attempts->second.next != nullptr;
+      bool rebuild = false;
       if (!m_commands.contains(output)) {
-        // Removed mid-build: nothing to record or rebuild.
+        // Removed mid-build: nothing to record or rebuild, and whatever waits
+        // on a next build never gets one.
+        if (attempts != m_attempts.end()) {
+          orphaned = std::move(attempts->second.next);
+          m_attempts.erase(attempts);
+        }
       } else if (result.has_value()) {
-        m_failed.erase(output);
         // An input that changed mid-build left it stale again; rebuild if
-        // watched.
-        rebuild_again =
-            m_stale.contains(output) && m_materialized.contains(output);
+        // watched, or if an open waits on the next build.
+        rebuild = waited_on ||
+                  (m_stale.contains(output) && m_materialized.contains(output));
       } else {
-        // A failed build stays stale, so a later open or input change retries.
-        m_failed.insert_or_assign(output, result.error());
+        // A failed build stays stale, so a later open or input change retries;
+        // an open already waiting on the next build gets it now.
         m_stale.insert(output);
+        rebuild = waited_on;
+      }
+      if (rebuild) {
+        next = claim_build(output);
       }
     }
-    m_settled.notify_all();
+    // Only now the content is in place may a waiting open() be released.
+    m_coordinator->complete(
+        attempt, result.has_value() ? std::error_code() : result.error());
+    if (orphaned != nullptr) {
+      m_coordinator->complete(
+          orphaned, std::make_error_code(std::errc::no_such_file_or_directory));
+    }
 
     const std::optional<TraceLane> lane =
         build_id != 0 ? lane_of(output) : std::nullopt;
@@ -582,8 +664,8 @@ class BuildDirectoryTree::Impl {
       free_lane(output);
     }
 
-    if (rebuild_again) {
-      start_build(output);
+    if (next.has_value()) {
+      launch_build(std::move(*next));
     }
   }
 
@@ -652,7 +734,11 @@ class BuildDirectoryTree::Impl {
         for (const std::filesystem::path& output : removed) {
           m_stale.erase(output);
           m_materialized.erase(output);
-          m_failed.erase(output);
+          // A build under way keeps its attempts until it finishes, which
+          // settles whatever waits on them.
+          if (!m_in_flight.contains(output)) {
+            m_attempts.erase(output);
+          }
           update_dependents(output, {});
           m_dependencies.erase(output);
         }
@@ -735,6 +821,16 @@ BuildDirectoryTree::BuildDirectoryTree(const DirectoryTree& source,
                                        ManifestErrorHandler on_manifest_error)
     : m_impl(std::make_unique<Impl>(source,
                                     std::move(runner),
+                                    nullptr,
+                                    std::move(on_manifest_error))) {}
+
+BuildDirectoryTree::BuildDirectoryTree(const DirectoryTree& source,
+                                       CommandRunner runner,
+                                       BuildCoordinator& coordinator,
+                                       ManifestErrorHandler on_manifest_error)
+    : m_impl(std::make_unique<Impl>(source,
+                                    std::move(runner),
+                                    &coordinator,
                                     std::move(on_manifest_error))) {}
 
 BuildDirectoryTree::~BuildDirectoryTree() = default;
@@ -749,18 +845,14 @@ std::expected<std::vector<TreeEntry>, std::error_code> BuildDirectoryTree::ls(
   return m_impl->ls(path);
 }
 
-std::expected<FileInfo, std::error_code> BuildDirectoryTree::open(
-    const std::filesystem::path& path) const {
-  if (const std::error_code error = m_impl->build_now(path)) {
-    return std::unexpected(error);
-  }
-  return DirectoryTree::open(path);  // status() now reflects the build
+OpenSender BuildDirectoryTree::open(const std::filesystem::path& path,
+                                    const OpenContext& context) const {
+  return file_task(m_impl->open(path, context));
 }
 
-std::expected<std::string, std::error_code> BuildDirectoryTree::read(
-    const std::filesystem::path& path,
-    Offset offset,
-    std::size_t size) const {
+ReadSender BuildDirectoryTree::read(const std::filesystem::path& path,
+                                    Offset offset,
+                                    std::size_t size) const {
   return m_impl->read(path, offset, size);
 }
 

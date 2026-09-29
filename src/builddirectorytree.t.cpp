@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: MIT
 #include "builddirectorytree.hpp"
 
-#include "shellrunner.hpp"
-
+#include "directorytreeutil.hpp"
 #include "inmemorydirectorytree.hpp"
 #include "iocontext.hpp"
 #include "realdirectorytree.hpp"
+#include "shellrunner.hpp"
 #include "tracer.hpp"
 
+#include <gtest/gtest.h>
 #include <exec/single_thread_context.hpp>
 #include <exec/static_thread_pool.hpp>
 #include <stdexec/execution.hpp>
-
-#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <atomic>
@@ -307,12 +306,14 @@ class BuildDirectoryTreeTest : public ::testing::Test {
   // Opens (which builds) then reads a whole output.
   static std::string read_output(const BuildDirectoryTree& tree,
                                  const std::filesystem::path& path) {
-    const std::expected<FileInfo, std::error_code> opened = tree.open(path);
+    const std::expected<FileInfo, std::error_code> opened =
+        makebelieve::DirectoryTreeUtil::open(tree, path);
     EXPECT_TRUE(opened.has_value());
     if (!opened.has_value()) {
       return {};
     }
-    const auto content = tree.read(path, 0, opened->size);
+    const auto content =
+        makebelieve::DirectoryTreeUtil::read(tree, path, 0, opened->size);
     EXPECT_TRUE(content.has_value());
     return content.value_or(std::string{});
   }
@@ -358,11 +359,12 @@ TEST_F(BuildDirectoryTreeTest, OnlyOpenBuilds) {
   ASSERT_EQ(root->size(), 1U);
   EXPECT_EQ((*root)[0].name, "output.txt");
   EXPECT_EQ(output_size(tree, "output.txt"), 1U);
-  EXPECT_TRUE(tree.read("output.txt", 0, 16).has_value());
+  EXPECT_TRUE(makebelieve::DirectoryTreeUtil::read(tree, "output.txt", 0, 16)
+                  .has_value());
   EXPECT_EQ(runs, 0);
 
   const std::expected<FileInfo, std::error_code> opened =
-      tree.open("output.txt");
+      makebelieve::DirectoryTreeUtil::open(tree, "output.txt");
   ASSERT_TRUE(opened.has_value());
   EXPECT_EQ(opened->size, 5U);
   EXPECT_EQ(runs, 1);
@@ -374,8 +376,9 @@ TEST_F(BuildDirectoryTreeTest, OpenOfAnythingButAnOutputIsNotABuild) {
   int runs = 0;
   const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
 
-  EXPECT_EQ(tree.open("out").error(), std::errc::is_a_directory);
-  EXPECT_EQ(tree.open("missing.txt").error(),
+  EXPECT_EQ(makebelieve::DirectoryTreeUtil::open(tree, "out").error(),
+            std::errc::is_a_directory);
+  EXPECT_EQ(makebelieve::DirectoryTreeUtil::open(tree, "missing.txt").error(),
             std::errc::no_such_file_or_directory);
   EXPECT_EQ(runs, 0);
 }
@@ -460,7 +463,7 @@ TEST_F(BuildDirectoryTreeTest, RetriesAfterAFailedBuild) {
 
   // The failed first build fails the open...
   const std::expected<FileInfo, std::error_code> failed =
-      tree.open("output.txt");
+      makebelieve::DirectoryTreeUtil::open(tree, "output.txt");
   ASSERT_FALSE(failed.has_value());
   EXPECT_EQ(failed.error(), std::errc::io_error);
   EXPECT_EQ(runs, 1);
@@ -529,8 +532,10 @@ TEST_F(BuildDirectoryTreeTest, ARunnerOrBuildThatThrowsFailsTheBuild) {
            });
   });
 
-  EXPECT_EQ(tree.open("thrown.txt").error(), std::errc::permission_denied);
-  EXPECT_EQ(tree.open("raised.txt").error(), std::errc::bad_message);
+  EXPECT_EQ(makebelieve::DirectoryTreeUtil::open(tree, "thrown.txt").error(),
+            std::errc::permission_denied);
+  EXPECT_EQ(makebelieve::DirectoryTreeUtil::open(tree, "raised.txt").error(),
+            std::errc::bad_message);
 }
 
 // open() waits for the build to report back; status() does not.
@@ -855,8 +860,9 @@ TEST_F(BuildDirectoryTreeTest, RemovingARuleRemovesItsOutputAndEmptyParents) {
 
   EXPECT_FALSE(tree.status("gone/deep/file.txt").has_value());
   EXPECT_FALSE(tree.status("gone").has_value());
-  EXPECT_EQ(tree.open("gone/deep/file.txt").error(),
-            std::errc::no_such_file_or_directory);
+  EXPECT_EQ(
+      makebelieve::DirectoryTreeUtil::open(tree, "gone/deep/file.txt").error(),
+      std::errc::no_such_file_or_directory);
   const auto root = tree.ls("");
   ASSERT_TRUE(root.has_value());
   ASSERT_EQ(root->size(), 1U);
@@ -922,7 +928,9 @@ TEST_F(BuildDirectoryTreeTest, ABuildFinishingAfterItsRuleIsRemovedIsDropped) {
   const BuildDirectoryTree tree(source, builds.runner());
 
   std::expected<FileInfo, std::error_code> opened;
-  std::thread reader([&] { opened = tree.open("output.txt"); });
+  std::thread reader([&] {
+    opened = makebelieve::DirectoryTreeUtil::open(tree, "output.txt");
+  });
   ASSERT_TRUE(builds.wait_for_runs(1));
 
   write_manifest("");
@@ -989,13 +997,18 @@ class FlakyTree : public DirectoryTree {
       const std::filesystem::path& path) const override {
     return inner.ls(path);
   }
-  [[nodiscard]] std::expected<std::string, std::error_code> read(
+  [[nodiscard]] makebelieve::OpenSender open(
       const std::filesystem::path& path,
-      Offset offset,
-      std::size_t size) const override {
+      const makebelieve::OpenContext& context) const override {
+    return inner.open(path, context);
+  }
+
+  [[nodiscard]] makebelieve::ReadSender read(const std::filesystem::path& path,
+                                             Offset offset,
+                                             std::size_t size) const override {
     if (fail_reads) {
-      return std::unexpected(
-          std::make_error_code(std::errc::permission_denied));
+      return stdexec::just(std::expected<std::string, std::error_code>(
+          std::unexpected(std::make_error_code(std::errc::permission_denied))));
     }
     return inner.read(path, offset, size);
   }
@@ -1131,8 +1144,14 @@ TEST_F(BuildDirectoryTreeTracingTest, BuildsShareRowsInTheTrace) {
   const BuildDirectoryTree tree(source, runner.runner());
 
   // Two builds at once, so they cannot share a row.
-  std::thread first([&tree] { EXPECT_TRUE(tree.open("a.txt").has_value()); });
-  std::thread second([&tree] { EXPECT_TRUE(tree.open("b.txt").has_value()); });
+  std::thread first([&tree] {
+    EXPECT_TRUE(
+        makebelieve::DirectoryTreeUtil::open(tree, "a.txt").has_value());
+  });
+  std::thread second([&tree] {
+    EXPECT_TRUE(
+        makebelieve::DirectoryTreeUtil::open(tree, "b.txt").has_value());
+  });
   ASSERT_TRUE(runner.wait_for_runs(2));
   runner.complete(built("one"));
   runner.complete(built("two"));
@@ -1141,7 +1160,10 @@ TEST_F(BuildDirectoryTreeTracingTest, BuildsShareRowsInTheTrace) {
 
   // Both rows are free again, so a third build takes one rather than adding to
   // them.
-  std::thread third([&tree] { EXPECT_TRUE(tree.open("c.txt").has_value()); });
+  std::thread third([&tree] {
+    EXPECT_TRUE(
+        makebelieve::DirectoryTreeUtil::open(tree, "c.txt").has_value());
+  });
   ASSERT_TRUE(runner.wait_for_runs(3));
   runner.complete(built("three"));
   third.join();

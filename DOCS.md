@@ -21,6 +21,11 @@ Generated files live in the mounted output namespace and use `@/`:
 
 Paths without `@/` refer to the normal filesystem.
 
+Currently `@/` is recognized only on the left-hand side of a declaration.
+To read another generated output in a command, use its filesystem path
+through the mount, such as `../mnt/chain2.txt`; `@/chain2.txt` is not expanded
+inside commands.
+
 An output is assigned an action and what that action applies to. With
 `run` the command writes the output itself, to the path `%out` stands
 for. That path is a scratch file with the same name as the output, so
@@ -119,3 +124,26 @@ makebelieve unmount <mountpoint>
 
 `unmount` signals the instance serving that mountpoint to shut down and
 blocks until it has fully torn down.
+
+By default, at most one build per core holds a place to run at a time;
+`-j <builds>` sets another limit:
+
+```sh
+makebelieve mount -j 2 <mountpoint>
+```
+
+The option may also follow the mountpoint: `makebelieve mount <mountpoint> -j 2`.
+
+A build's command may itself read other outputs through the mount - a PDF
+built from generated Markdown, say. While it waits for one to build, its
+build gives up its place, so a chain of such outputs longer than the limit
+still completes. Its other threads and processes keep running meanwhile, so
+`-j` limits how many builds hold a place, not how many processes are
+runnable or how much CPU they use; a command that never reads another output
+keeps its place until it finishes.
+
+Opening an output that would wait on a cycle of builds - including a command
+reading its own output - fails with `EDEADLK`, and every build on the cycle
+fails. Pending opens suspend as coroutines and consume no dispatcher
+thread, so there is no 64-open limit. Linux uses low-level FUSE replies;
+Windows defers WinFsp transactions. Unmount cancels pending requests.

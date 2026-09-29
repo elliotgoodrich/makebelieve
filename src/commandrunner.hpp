@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include "launchregistrar.hpp"
 #include "manifest.hpp"
 
 #include <exec/any_sender_of.hpp>
@@ -10,6 +11,7 @@
 #include <expected>
 #include <filesystem>
 #include <functional>
+#include <new>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -63,12 +65,34 @@ struct Command {
 /// stop sources stdexec interposes live inside the build and would be freed
 /// while that request is still walking them. Completing from another thread
 /// is fine.
+///
+/// The receiver's environment also names the @link LaunchRegistrar every
+/// process the build launches must be registered with before it runs
+/// (`get_launch_registrar`). A build that launches nothing may ignore it; one
+/// that does must pass it on, so the processes a build runs can be told apart
+/// from anyone else's.
 using BuildSender = exec::any_sender<exec::any_receiver<
     stdexec::completion_signatures<stdexec::set_value_t(BuildResult),
                                    stdexec::set_error_t(std::exception_ptr),
                                    stdexec::set_stopped_t()>,
     exec::queries<stdexec::inplace_stop_token(
-        stdexec::get_stop_token_t) noexcept>>>;
+                      stdexec::get_stop_token_t) noexcept,
+                  LaunchRegistrar(get_launch_registrar_t) noexcept>>>;
+
+/// The error a build that completed with the exception @a error is recorded
+/// as.
+[[nodiscard]] inline std::error_code to_error_code(
+    const std::exception_ptr& error) noexcept {
+  try {
+    std::rethrow_exception(error);
+  } catch (const std::system_error& failure) {
+    return failure.code();
+  } catch (const std::bad_alloc&) {
+    return std::make_error_code(std::errc::not_enough_memory);
+  } catch (...) {
+    return std::make_error_code(std::errc::io_error);
+  }
+}
 
 /// Carries out one rule, returning the build as a sender that the caller -
 /// a `BuildDirectoryTree` - starts. A `Manifest::Action::Tracing` rule never
