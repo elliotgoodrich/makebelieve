@@ -41,12 +41,11 @@ class ExitStatusCategory : public std::error_category {
 // The placeholder in a command that is replaced with the output's path.
 constexpr std::string_view k_out_placeholder = "%out";
 
-// What a path in a command that names another output starts with, replaced
-// with the path of that output through the mount.
+// The prefix in a command naming another output, replaced with its path
+// through the mount.
 constexpr std::string_view k_generated_prefix = "@/";
 
-// Where an unquoted `@/` path in a command ends, besides whitespace: the
-// characters a shell would take as the start of something else.
+// Besides whitespace, what ends an unquoted `@/` path.
 constexpr std::string_view k_word_enders = "\"'<>|;&()";
 
 bool is_space(char c) {
@@ -120,15 +119,13 @@ std::string substitute_out(std::string_view command,
   }
 }
 
-// Replaces every `@/<path>` in @a command with the path of that output through
-// @a mountpoint, with the platform's own separators, so a tool that insists
-// on them (as cmd's built-ins do) is not handed a switch. Outside quotes
-// `<path>` runs to the next whitespace or shell metacharacter, and the result
-// is quoted as %out's is, so a mountpoint containing spaces survives the
-// shell; inside quotes it runs to the closing quote, which already covers it.
+// Replaces every `@/<path>` in @a command with that output's path under
+// @a mountpoint, using native separators (cmd's built-ins read `/` as a
+// switch). An unquoted path is quoted, as %out is; one already inside quotes
+// runs to the closing quote.
 std::string expand_generated(std::string_view command,
                              const std::filesystem::path& mountpoint) {
-  // Without a trailing separator, so each path gets exactly one after it.
+  // Without a trailing separator.
   const std::string root =
       (mountpoint.has_filename() ? mountpoint : mountpoint.parent_path())
           .string();
@@ -284,8 +281,6 @@ exec::task<BuildResult> detail::run_shell_command(
     out_path = scratch->path() / command.output.filename();
   }
 
-  // Outputs are named as the command's own processes will reach them: through
-  // the mount, which builds each on the way.
   std::string text = expand_generated(command.text, mountpoint);
   if (!capture) {
     text = substitute_out(text, out_path);

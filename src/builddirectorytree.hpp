@@ -46,17 +46,12 @@ class BuildCoordinator;
 /// It then observes @a source for the rest of its life, recording the inputs
 /// each build reads, so a change to one of those inputs rebuilds the outputs
 /// that depend on it: eagerly if opened before, otherwise on the next open.
-/// @a source must outlive this tree. An input recorded as `@/<path>` - by a
-/// copy of another output, or by a runner that can see reads through the
-/// mount - is another output; whatever makes that output out of date makes
-/// every output that read it out of date too, and so on down, all before any
-/// of them starts rebuilding.
+/// @a source must outlive this tree. The outputs a build's commands open
+/// through this tree are its inputs too, as `@/<path>`: when one goes out of
+/// date, so does everything that read it, transitively.
 ///
-/// A `copy @/<path>` rule, a copy of another output, is served by the tree
-/// itself rather than the runner: its build brings that output up to date as
-/// an open would - giving its permit back while it waits, and failing with
-/// `std::errc::resource_deadlock_would_occur` on a cycle - then takes its
-/// bytes.
+/// A `copy @/<path>` rule is served by the tree itself: it waits on that
+/// output as an open from the copy's own build would, then takes its bytes.
 ///
 /// A change to `build.makebelieve` itself reloads the rules: a new rule's
 /// output appears unbuilt, a removed rule's output disappears (with any

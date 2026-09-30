@@ -489,10 +489,8 @@ TEST_F(BuildDirectoryTreeTest, RebuildsACopyWhenTheOutputItCopiesChanges) {
   EXPECT_EQ(runs, 2);
 }
 
-// An output whose command read another through the mount - which the runner
-// reports as an `@/` input - is out of date whenever that one is, however far
-// down the change started, and none of them is served stale meanwhile: a copy
-// never opened is still rebuilt on its next open.
+// An output that read another (an `@/` input) is out of date whenever that one
+// is, however far down the change started.
 TEST_F(BuildDirectoryTreeTest,
        AChangeReachesEveryOutputReadingThroughTheMount) {
   source.write_file("input.txt", "v1");
@@ -515,8 +513,7 @@ TEST_F(BuildDirectoryTreeTest,
                     .inputs = std::move(inputs)});
   });
 
-  // The runner only claims to read first.txt, so it is built here as the real
-  // read through the mount would have built it.
+  // The runner only claims to read first.txt, so build it here.
   EXPECT_EQ(read_output(tree, "first.txt"), "first %out 1");
   EXPECT_EQ(read_output(tree, "second.txt"), "second %out 1");
   EXPECT_EQ(read_output(tree, "third.txt"), "second %out 1");

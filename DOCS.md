@@ -32,9 +32,9 @@ mount, which builds it on the way:
 
 Outside quotes the path runs to the next space or shell metacharacter and
 is quoted, so a mountpoint with spaces in it survives the shell; inside
-quotes (`"@/my notes.md"`) it runs to the closing quote. Reads through the
-mount are not traced, so a command that reads another output is not yet
-rebuilt when that output changes.
+quotes (`"@/my notes.md"`) it runs to the closing quote. Every output a
+command opens through the mount - named with `@/` or not - becomes one of
+its inputs, so it is rebuilt whenever that output goes out of date.
 
 An output is assigned an action and what that action applies to. With
 `run` the command writes the output itself, to the path `%out` stands

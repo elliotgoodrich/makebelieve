@@ -24,8 +24,8 @@ class Manifest {
     /// the output.
     Capture,
     /// `copy <path>`: the output is the bytes of the file at `<path>`. No
-    /// command runs, and `<path>` is the rule's one input. A `<path>` under
-    /// `@/` names another output instead of a source file.
+    /// command runs, and `<path>` - a source file, or an output under `@/` -
+    /// is the rule's one input.
     Copy,
     /// `tracing`: the output is a trace of what makebelieve has been doing, in
     /// the Trace Event Format. Takes no argument.
@@ -39,11 +39,9 @@ class Manifest {
     std::filesystem::path output;
     Action action;
 
-    /// The command to run for `Run` and `Capture`, taken verbatim - any `@/`
-    /// in it is left for the runner to expand; for `Copy`, the normalised path
-    /// of the file to copy, relative to the manifest's directory, or of the
-    /// output to copy, relative to `@/` and with `@/` kept in front; empty for
-    /// `Tracing`.
+    /// The command to run for `Run` and `Capture`, taken verbatim; for `Copy`,
+    /// the normalised path of the file to copy, relative to the manifest's
+    /// directory, or `@/` and the output to copy; empty for `Tracing`.
     std::string command;
   };
 
@@ -62,9 +60,8 @@ class Manifest {
   /// directory that no earlier rule declared, either as that file or as one of
   /// its parent directories. A `copy` rule must name a file inside the
   /// manifest's directory, so its source is always one the build can watch,
-  /// or, under `@/`, an output declared anywhere in the manifest other than
-  /// its own. Each line that is not is reported in @link errors and left out of
-  /// @link rules.
+  /// or another declared output. Each line that is not is reported in @link
+  /// errors and left out of @link rules.
   [[nodiscard]] static Manifest parse(std::string_view text);
 
   /// The rules the manifest declares, in the order they appeared.
