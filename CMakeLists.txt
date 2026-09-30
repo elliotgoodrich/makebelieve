@@ -52,6 +52,9 @@ if(BUILD_TESTING)
   # (/MDd, /MD). Its default is the static CRT, and mixing the two is a hard
   # link error on MSVC - the single most common way a first gtest build fails.
   set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+  # Nothing uses GoogleMock, and building it compiles gtest-all.cc twice more.
+  set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+  set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest)
   include(GoogleTest)
 endif()
@@ -65,6 +68,13 @@ add_compile_options(
   $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wextra>
   $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wno-missing-field-initializers>
 )
+
+# MSBuild's /m (from `cmake --build --parallel`) only builds whole projects in
+# parallel; /MP is what compiles a project's own sources concurrently. Ninja
+# hands cl one source at a time, so it needs neither.
+if(CMAKE_GENERATOR MATCHES "^Visual Studio")
+  add_compile_options($<$<CXX_COMPILER_ID:MSVC>:/MP>)
+endif()
 
 # ASan/UBSan flags below are GCC/Clang syntax; skip on MSVC for now rather
 # than wiring up MSVC's separate (and UBSan-less) /fsanitize=address. CONFIG

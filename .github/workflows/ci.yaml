@@ -16,8 +16,8 @@ jobs:
           - {os: ubuntu-24.04,   compiler: Clang, cpp: clang++-19, apt: clang-19, build_type: Release}
           - {os: ubuntu-24.04,   compiler: GCC,   cpp: g++-14,     apt: g++-14,   build_type: Debug}
           - {os: ubuntu-24.04,   compiler: GCC,   cpp: g++-14,     apt: g++-14,   build_type: Release}
-          - {os: windows-latest, compiler: MSVC,                                  build_type: Debug}
-          - {os: windows-latest, compiler: MSVC,                                  build_type: Release}
+          - {os: windows-latest, compiler: MSVC,  cpp: cl,                        build_type: Debug}
+          - {os: windows-latest, compiler: MSVC,  cpp: cl,                        build_type: Release}
     name: ${{ matrix.compiler }} (${{ matrix.build_type }})
     runs-on: ${{ matrix.os }}
     steps:
@@ -40,10 +40,29 @@ jobs:
       if: runner.os == 'Windows'
       shell: powershell
       run: choco install winfsp -y --no-progress
+    # Ninja, unlike the Visual Studio generator, needs the environment a
+    # Developer Command Prompt sets up (cl, INCLUDE, LIB, and Visual Studio's
+    # bundled ninja on PATH), so export what vcvars64.bat changes to the steps
+    # below.
+    - name: Set up MSVC environment
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+        $before = @{}
+        Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+        cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+          $name, $value = $_ -split '=', 2
+          if ($before[$name] -ne $value) { "$name=$value" }
+        } | Add-Content $env:GITHUB_ENV
+    # Ninja on every platform: the default generators (Make, MSBuild) run one
+    # compile at a time. The compiler is named explicitly because the Windows
+    # runner also has MinGW's g++ on PATH.
     - name: Configure CMake
       run: >
-        cmake -B build
-        ${{ runner.os == 'Linux' && format('-DCMAKE_CXX_COMPILER={0} -DCMAKE_BUILD_TYPE={1}', matrix.cpp, matrix.build_type) || '' }}
+        cmake -B build -G Ninja
+        -DCMAKE_CXX_COMPILER=${{ matrix.cpp }}
+        -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
     - name: Build
       run: cmake --build build --config ${{ matrix.build_type }}
     - name: Test
@@ -63,7 +82,7 @@ jobs:
       # CLANG_TIDY_EXE is the cache variable find_program() fills in, so setting
       # it here pins clang-tidy to the same release as the compiler.
       run: >
-        cmake -B build
+        cmake -B build -G Ninja
         -DCMAKE_CXX_COMPILER=clang++-19
         -DENABLE_CLANG_TIDY=ON
         -DCLANG_TIDY_EXE=/usr/bin/clang-tidy-19
