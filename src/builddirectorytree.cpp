@@ -112,6 +112,16 @@ void remove_with_empty_parents(InMemoryDirectoryTree& tree,
   }
 }
 
+// What a path naming another output starts with, in a `copy` rule and among a
+// build's inputs.
+constexpr std::string_view k_generated_prefix = "@/";
+
+// @a output as it appears among the inputs of the builds that read it: under
+// `@/`, apart from the source files, which are relative to the source root.
+std::filesystem::path as_input(const std::filesystem::path& output) {
+  return std::filesystem::path("@") / output;
+}
+
 // The name of @a action as a manifest spells it.
 std::string_view to_string(Manifest::Action action) {
   switch (action) {
@@ -346,44 +356,10 @@ class BuildDirectoryTree::Impl {
   [[nodiscard]] exec::task<std::error_code> build_now(
       std::filesystem::path path,
       OpenContext context) {
-    const std::filesystem::path output = path.lexically_normal();
-    BuildCoordinator::AttemptPtr target;
-    std::optional<Launch> launch;
-    {
-      const std::lock_guard lock(m_mutex);
-      const auto command = m_commands.find(output);
-      if (command == m_commands.end()) {
-        co_return std::error_code{};
-      }
-      m_materialized.insert(output);
-
-      // A trace is out of date the moment anything else happens, so each open
-      // takes a fresh one.
-      if (command->second.action == Manifest::Action::Tracing &&
-          !m_in_flight.contains(output)) {
-        m_stale.insert(output);
-      }
-
-      Attempts& attempts = m_attempts[output];
-      if (m_in_flight.contains(output)) {
-        if (!m_stale.contains(output)) {
-          target = attempts.current;
-        } else {
-          if (attempts.next == nullptr) {
-            attempts.next = m_coordinator->create_attempt(attempts.current);
-          }
-          target = attempts.next;
-        }
-      } else if (m_stale.contains(output)) {
-        launch = claim_build(output);
-        target = launch->attempt;
-      } else {
-        co_return std::error_code{};
-      }
-    }
-    // Unlocked: a build that completes inline calls finish_build from inside.
-    if (launch.has_value()) {
-      launch_build(std::move(*launch));
+    const BuildCoordinator::AttemptPtr target =
+        bring_up_to_date(path.lexically_normal());
+    if (target == nullptr) {
+      co_return std::error_code{};
     }
     co_return co_await m_coordinator->wait(target, context.requester_pid);
   }
@@ -455,6 +431,76 @@ class BuildDirectoryTree::Impl {
     std::uint64_t build_id = 0;
   };
 
+  // The build of @a output that brings it up to date - the one under way
+  // unless the output has changed since it started, otherwise the next, which
+  // is started here if the output is idle - or nullptr when @a output is up to
+  // date already or is not declared.
+  // NOLINTNEXTLINE(misc-no-recursion): see launch_build.
+  BuildCoordinator::AttemptPtr bring_up_to_date(
+      const std::filesystem::path& output) {
+    BuildCoordinator::AttemptPtr target;
+    std::optional<Launch> launch;
+    {
+      const std::lock_guard lock(m_mutex);
+      const auto command = m_commands.find(output);
+      if (command == m_commands.end()) {
+        return nullptr;
+      }
+      m_materialized.insert(output);
+
+      // A trace is out of date the moment anything else happens, so each open
+      // takes a fresh one.
+      if (command->second.action == Manifest::Action::Tracing &&
+          !m_in_flight.contains(output)) {
+        m_stale.insert(output);
+      }
+
+      Attempts& attempts = m_attempts[output];
+      if (m_in_flight.contains(output)) {
+        if (!m_stale.contains(output)) {
+          target = attempts.current;
+        } else {
+          if (attempts.next == nullptr) {
+            attempts.next = m_coordinator->create_attempt(attempts.current);
+          }
+          target = attempts.next;
+        }
+      } else if (m_stale.contains(output)) {
+        launch = claim_build(output);
+        target = launch->attempt;
+      } else {
+        return nullptr;
+      }
+    }
+    // Unlocked: a build that completes inline calls finish_build from inside.
+    if (launch.has_value()) {
+      launch_build(std::move(*launch));
+    }
+    return target;
+  }
+
+  // The build of a rule copying @a source, another output, as the attempt
+  // @a self: brought up to date the way an open would, waited on as a request
+  // of @a self's own, so it gives its permit back meanwhile, then read. Its
+  // one input is @a source, as the outputs reading it are keyed.
+  // NOLINTNEXTLINE(misc-no-recursion): see launch_build.
+  exec::task<BuildResult> copy_output(std::filesystem::path source,
+                                      BuildCoordinator::AttemptPtr self) {
+    if (const BuildCoordinator::AttemptPtr target = bring_up_to_date(source)) {
+      if (const std::error_code error =
+              co_await m_coordinator->wait_as(target, self)) {
+        co_return std::unexpected(error);
+      }
+    }
+    std::expected<std::string, std::error_code> bytes =
+        read_all(m_structure, source);
+    if (!bytes.has_value()) {
+      co_return std::unexpected(bytes.error());
+    }
+    co_return BuildOutput{.bytes = std::move(*bytes),
+                          .inputs = {as_input(source)}};
+  }
+
   // Marks @a output as building - as the attempt an open is already waiting
   // on, if one is - and returns what launch_build needs to start it.
   // @pre m_mutex is held; @a output is declared, stale and not in flight.
@@ -523,8 +569,24 @@ class BuildDirectoryTree::Impl {
 
     std::optional<AttemptSender> build;
     try {
-      build.emplace(m_coordinator->run(launch.attempt,
-                                       m_runner(std::move(launch.command))));
+      // A copy of another output is served by the tree too, which already
+      // knows how to bring that output up to date; anything else goes to the
+      // runner.
+      const bool copies_output =
+          launch.command.action == Manifest::Action::Copy &&
+          launch.command.text.starts_with(k_generated_prefix);
+      // Its steps are brief, and it resumes wherever the coordinator answers
+      // its wait, so it needs no scheduler of its own.
+      BuildSender work =
+          copies_output
+              ? BuildSender(stdexec::write_env(
+                    copy_output(
+                        launch.command.text.substr(k_generated_prefix.size()),
+                        launch.attempt),
+                    stdexec::prop{stdexec::get_start_scheduler,
+                                  stdexec::inline_scheduler{}}))
+              : m_runner(std::move(launch.command));
+      build.emplace(m_coordinator->run(launch.attempt, std::move(work)));
     } catch (...) {
       finish_build(output, launch.attempt, build_id,
                    std::unexpected(to_error_code(std::current_exception())));
@@ -708,7 +770,8 @@ class BuildDirectoryTree::Impl {
   // Brings the declared outputs in line with @a commands: a new rule's output
   // appears unbuilt, a removed rule's output disappears, and an output whose
   // command changed goes stale (rebuilt eagerly if opened). Outputs whose rule
-  // is unchanged keep their built content.
+  // is unchanged keep their built content, unless they read one that was
+  // added, removed or changed.
   void apply_rules(const std::map<std::filesystem::path, Command>& commands) {
     std::vector<std::filesystem::path> removed;
     std::vector<std::filesystem::path> added;
@@ -756,10 +819,24 @@ class BuildDirectoryTree::Impl {
       }
     }
 
-    // Outside the layout lock, since an eager rebuild writes its result.
-    for (const std::filesystem::path& output : changed) {
-      invalidate(output);
+    // An output that read one that has gone, or that has come back, read what
+    // is no longer there.
+    {
+      const std::lock_guard lock(m_mutex);
+      for (const std::vector<std::filesystem::path>* outputs :
+           {&removed, &added}) {
+        for (const std::filesystem::path& output : *outputs) {
+          if (const auto readers = m_dependents.find(as_input(output));
+              readers != m_dependents.end()) {
+            changed.insert(changed.end(), readers->second.begin(),
+                           readers->second.end());
+          }
+        }
+      }
     }
+
+    // Outside the layout lock, since an eager rebuild writes its result.
+    invalidate(std::move(changed));
   }
 
   // Reloads the manifest if it may have changed, then collects the outputs
@@ -794,23 +871,40 @@ class BuildDirectoryTree::Impl {
         }
       }
     }
-    for (const std::filesystem::path& output : affected) {
-      invalidate(output);
-    }
+    invalidate(std::move(affected));
   }
 
-  void invalidate(const std::filesystem::path& output) {
-    bool eager = false;
+  // Marks each of @a outputs stale, and with it every output that read one -
+  // through the mount or by copying it - and so on down, since each of those
+  // would be built from content about to change. Only once all are marked are
+  // the eager rebuilds started, of those opened before and idle, so an open
+  // meanwhile of anything downstream waits rather than being served the old
+  // content.
+  void invalidate(std::vector<std::filesystem::path> outputs) {
+    std::vector<std::filesystem::path> eager;
     {
       const std::lock_guard lock(m_mutex);
-      if (!m_commands.contains(output)) {
-        return;
+      // Visited once each, so outputs that read each other cannot loop.
+      std::set<std::filesystem::path> seen;
+      while (!outputs.empty()) {
+        const std::filesystem::path output = std::move(outputs.back());
+        outputs.pop_back();
+        if (!m_commands.contains(output) || !seen.insert(output).second) {
+          continue;
+        }
+        m_stale.insert(output);
+        // Eager only if opened and idle; an in-flight build re-runs if stale.
+        if (m_materialized.contains(output) && !m_in_flight.contains(output)) {
+          eager.push_back(output);
+        }
+        if (const auto readers = m_dependents.find(as_input(output));
+            readers != m_dependents.end()) {
+          outputs.insert(outputs.end(), readers->second.begin(),
+                         readers->second.end());
+        }
       }
-      m_stale.insert(output);
-      // Eager only if opened and idle; an in-flight build re-runs if stale.
-      eager = m_materialized.contains(output) && !m_in_flight.contains(output);
     }
-    if (eager) {
+    for (const std::filesystem::path& output : eager) {
       start_build(output);
     }
   }

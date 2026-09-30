@@ -82,6 +82,31 @@ INSTANTIATE_TEST_SUITE_P(
                            "@/e.txt = copy kept.txt\n",
                   .expected = {{"e.txt", Action::Copy, "kept.txt"}},
                   .error_lines = {1, 2, 3, 4}},
+        // A copy source under `@/` is another output, which may be declared
+        // before or after the copy; it is kept normalised with its `@/`, and
+        // `@/` in a command is left for the runner.
+        ParseCase{.name = "copies_another_output",
+                  .input = "@/a.txt = copy @/./out/../b.txt\n"
+                           "@/b.txt = capture cat @/c.txt\n"
+                           "@/c.txt = run build %out\n"
+                           "@/d.txt = copy @/a.txt\n",
+                  .expected = {{"a.txt", Action::Copy, "@/b.txt"},
+                               {"b.txt", Action::Capture, "cat @/c.txt"},
+                               {"c.txt", Action::Run, "build %out"},
+                               {"d.txt", Action::Copy, "@/a.txt"}}},
+        // It must name a file inside `@/` that the manifest declares, and not
+        // the copy's own output; each error lands in line order with the rest.
+        ParseCase{.name = "rejects_a_copy_of_an_undeclared_output",
+                  .input = "@/a.txt = copy @/missing.txt\n"
+                           "@/b.txt = copy @/../escape.txt\n"
+                           "@/c.txt = copy @/c.txt\n"
+                           "@/d.txt = copy @/dir\n"
+                           "not a rule\n"
+                           "@/dir/e.txt = run e\n"
+                           "@/f.txt = copy @/dir/e.txt\n",
+                  .expected = {{"dir/e.txt", Action::Run, "e"},
+                               {"f.txt", Action::Copy, "@/dir/e.txt"}},
+                  .error_lines = {1, 2, 3, 4, 5}},
         // `tracing` takes nothing after it: the output is makebelieve's own
         // trace.
         ParseCase{.name = "single_tracing_rule",

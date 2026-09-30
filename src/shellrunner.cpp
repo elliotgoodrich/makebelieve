@@ -41,6 +41,18 @@ class ExitStatusCategory : public std::error_category {
 // The placeholder in a command that is replaced with the output's path.
 constexpr std::string_view k_out_placeholder = "%out";
 
+// What a path in a command that names another output starts with, replaced
+// with the path of that output through the mount.
+constexpr std::string_view k_generated_prefix = "@/";
+
+// Where an unquoted `@/` path in a command ends, besides whitespace: the
+// characters a shell would take as the start of something else.
+constexpr std::string_view k_word_enders = "\"'<>|;&()";
+
+bool is_space(char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
 // Removes a directory and everything beneath it on destruction, so a command's
 // scratch space does not outlive the build it was created for.
 class TempDirectory {
@@ -106,6 +118,58 @@ std::string substitute_out(std::string_view command,
     result += replacement;
     pos = found + k_out_placeholder.size();
   }
+}
+
+// Replaces every `@/<path>` in @a command with the path of that output through
+// @a mountpoint, with the platform's own separators, so a tool that insists
+// on them (as cmd's built-ins do) is not handed a switch. Outside quotes
+// `<path>` runs to the next whitespace or shell metacharacter, and the result
+// is quoted as %out's is, so a mountpoint containing spaces survives the
+// shell; inside quotes it runs to the closing quote, which already covers it.
+std::string expand_generated(std::string_view command,
+                             const std::filesystem::path& mountpoint) {
+  // Without a trailing separator, so each path gets exactly one after it.
+  const std::string root =
+      (mountpoint.has_filename() ? mountpoint : mountpoint.parent_path())
+          .string();
+  std::string result;
+  char quote = 0;
+  std::size_t pos = 0;
+  while (pos < command.size()) {
+    const char c = command[pos];
+    if (!command.substr(pos).starts_with(k_generated_prefix)) {
+      if (c == quote) {
+        quote = 0;
+      } else if (quote == 0 && (c == '"' || c == '\'')) {
+        quote = c;
+      }
+      result += c;
+      ++pos;
+      continue;
+    }
+
+    const std::size_t start = pos + k_generated_prefix.size();
+    std::size_t end = start;
+    while (end < command.size() &&
+           (quote != 0 ? command[end] != quote
+                       : !is_space(command[end]) &&
+                             !k_word_enders.contains(command[end]))) {
+      ++end;
+    }
+    std::string path = root;
+    if (end != start) {
+      path += std::filesystem::path::preferred_separator;
+      for (const char part : command.substr(start, end - start)) {
+        path +=
+            part == '/'
+                ? static_cast<char>(std::filesystem::path::preferred_separator)
+                : part;
+      }
+    }
+    result += quote != 0 ? path : "\"" + path + "\"";
+    pos = end;
+  }
+  return result;
 }
 
 // Reads the whole of @a path, or the error that stopped it. ifstream does not
@@ -176,7 +240,9 @@ const std::error_category& exit_status_category() {
 
 exec::task<BuildResult> detail::run_shell_command(
     IoContext& io,
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): named by the header
     std::filesystem::path working_directory,
+    std::filesystem::path mountpoint,
     Command command,
     LaunchRegistrar registrar,
     stdexec::inplace_stop_token stop) {
@@ -218,10 +284,14 @@ exec::task<BuildResult> detail::run_shell_command(
     out_path = scratch->path() / command.output.filename();
   }
 
-  ProcessUtil::Result result = co_await ProcessUtil::run(
-      io, working_directory,
-      capture ? command.text : substitute_out(command.text, out_path),
-      registrar, stop);
+  // Outputs are named as the command's own processes will reach them: through
+  // the mount, which builds each on the way.
+  std::string text = expand_generated(command.text, mountpoint);
+  if (!capture) {
+    text = substitute_out(text, out_path);
+  }
+  ProcessUtil::Result result =
+      co_await ProcessUtil::run(io, working_directory, text, registrar, stop);
   if (!result.has_value()) {
     co_return std::unexpected(result.error());
   }

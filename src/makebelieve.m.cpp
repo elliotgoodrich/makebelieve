@@ -94,8 +94,8 @@ int mount(const char* mountpoint_arg, unsigned jobs) {
 
   // Runs each build through the shell. Its working directory is the source
   // root, so the inputs it traces line up with the source's own change
-  // notifications.
-  const ShellRunner run(source, io, workers.get_scheduler());
+  // notifications. Commands reach other outputs, `@/...`, through the mount.
+  const ShellRunner run(source, mountpoint, io, workers.get_scheduler());
 
   // How many builds hold a permit at once: -j, or one per core. A build whose
   // command waits on another output gives its permit back meanwhile, so this

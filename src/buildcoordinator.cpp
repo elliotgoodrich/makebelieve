@@ -77,7 +77,7 @@ class BuildCoordinator::Impl {
   AttemptSender run(AttemptPtr attempt, BuildSender work);
   void complete(const AttemptPtr& attempt, std::error_code result);
   exec::task<std::error_code> wait(AttemptPtr target,
-                                   std::uint32_t requester_pid);
+                                   std::optional<AttemptId> requester_id);
   void cancel_wait(Wait& wait) noexcept;
   [[nodiscard]] Stats stats() const;
   [[nodiscard]] std::size_t edge_count(const AttemptPtr& from,
@@ -303,7 +303,19 @@ void BuildCoordinator::complete(const AttemptPtr& attempt,
 exec::task<std::error_code> BuildCoordinator::wait(
     AttemptPtr target,
     std::uint32_t requester_pid) {
-  co_return co_await m_impl->wait(std::move(target), requester_pid);
+  // Before the wait takes any lock: it may read /proc or open the requesting
+  // process.
+  const std::optional<AttemptId> requester_id =
+      requester_pid != 0 ? m_impl->m_attribution.resolve(requester_pid)
+                         : std::nullopt;
+  co_return co_await m_impl->wait(std::move(target), requester_id);
+}
+
+exec::task<std::error_code> BuildCoordinator::wait_as(
+    AttemptPtr target,
+    const AttemptPtr& requester) {
+  const AttemptId requester_id = id_of(requester);
+  co_return co_await m_impl->wait(std::move(target), requester_id);
 }
 
 BuildCoordinator::Stats BuildCoordinator::stats() const {
@@ -527,11 +539,8 @@ std::vector<BuildCoordinator::Attempt*> BuildCoordinator::Impl::path_to(
 
 exec::task<std::error_code> BuildCoordinator::Impl::wait(
     AttemptPtr target,
-    std::uint32_t requester_pid) {
+    std::optional<AttemptId> requester_id) {
   const auto stop = co_await stdexec::get_stop_token();
-  // Outside the lock: it may read /proc or open the requesting process.
-  const std::optional<AttemptId> requester_id =
-      requester_pid != 0 ? m_attribution.resolve(requester_pid) : std::nullopt;
 
   Wait wait;
   Effects effects;

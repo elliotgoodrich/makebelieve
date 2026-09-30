@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: MIT
 #include "manifest.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <filesystem>
 #include <format>
 #include <map>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace makebelieve {
 
@@ -85,6 +88,16 @@ Manifest Manifest::parse(std::string_view text) {
   std::map<std::filesystem::path, std::size_t> files;
   std::map<std::filesystem::path, std::size_t> directories;
 
+  // Each accepted rule that copies another output, checked against every
+  // declared output once all are known.
+  struct CopyOfOutput {
+    std::size_t rule;
+    std::size_t line;
+    std::string left;
+    std::filesystem::path source;
+  };
+  std::vector<CopyOfOutput> copies;
+
   std::size_t start = 0;
   for (std::size_t number = 1; start <= text.size(); ++number) {
     const std::size_t newline = text.find('\n', start);
@@ -140,26 +153,39 @@ Manifest Manifest::parse(std::string_view text) {
       continue;
     }
 
+    const std::optional<std::filesystem::path> output =
+        to_inside_path(left.substr(2));
+
     // A `run` or `capture` command is taken verbatim. `copy` names a file
     // instead, held to the same shape as an output - inside the directory, no
     // escaping - so every copy's source is one the build can watch, and stored
-    // normalised.
+    // normalised. One under `@/` is another output, which must be declared
+    // somewhere in the manifest; that is checked once every line is read.
     std::string command(argument);
+    std::optional<std::filesystem::path> copied_output;
     if (*action == Manifest::Action::Copy) {
+      const bool generated = argument.starts_with("@/");
       const std::optional<std::filesystem::path> source =
-          to_inside_path(argument);
+          to_inside_path(generated ? argument.substr(2) : argument);
       if (!source.has_value()) {
-        reject(
-            std::format("`{}` copies `{}`, which does not name a file "
-                        "inside the manifest's directory",
-                        left, argument));
+        reject(std::format(
+            "`{}` copies `{}`, which does not name a file "
+            "inside {}",
+            left, argument, generated ? "`@/`" : "the manifest's directory"));
         continue;
       }
-      command = source->generic_string();
+      if (generated) {
+        if (source == output) {
+          reject(std::format("`{}` copies itself", left));
+          continue;
+        }
+        copied_output = source;
+        command = "@/" + source->generic_string();
+      } else {
+        command = source->generic_string();
+      }
     }
 
-    const std::optional<std::filesystem::path> output =
-        to_inside_path(left.substr(2));
     if (!output.has_value()) {
       reject(std::format("`{}` does not name a file inside `@/`", left));
       continue;
@@ -195,8 +221,33 @@ Manifest Manifest::parse(std::string_view text) {
          parent = parent.parent_path()) {
       directories.emplace(parent, number);
     }
+    if (copied_output.has_value()) {
+      copies.push_back({.rule = manifest.m_rules.size(),
+                        .line = number,
+                        .left = std::string(left),
+                        .source = std::move(*copied_output)});
+    }
     manifest.m_rules.push_back(
         {.output = *output, .action = *action, .command = std::move(command)});
+  }
+
+  // Only now is every output known, since a copy may name one declared after
+  // it. Each copy of an undeclared one is dropped, last first so the indices
+  // of those before it still hold, and reported in line with the rest.
+  bool dropped = false;
+  for (const CopyOfOutput& copy : std::views::reverse(copies)) {
+    if (!files.contains(copy.source)) {
+      manifest.m_rules.erase(manifest.m_rules.begin() +
+                             static_cast<std::ptrdiff_t>(copy.rule));
+      manifest.m_errors.push_back(
+          {.line = copy.line,
+           .message = std::format("`{}` copies `@/{}`, which is not declared",
+                                  copy.left, copy.source.generic_string())});
+      dropped = true;
+    }
+  }
+  if (dropped) {
+    std::ranges::stable_sort(manifest.m_errors, {}, &Manifest::Error::line);
   }
 
   return manifest;
