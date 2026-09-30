@@ -3,7 +3,8 @@
 # integration/dependencies, whose commands are real `cmake -E cat`s of other
 # outputs, and checks that a chain longer than the cap, a fan-in opened all at
 # once, a command that opens a generated output as its very first action, and
-# a `copy @/` of another output all build and read back correctly. At a cap of one, a command's open that
+# a `copy @/` of another output all build and read back correctly - and read
+# back new content once the source file at the bottom of them changes. At a cap of one, a command's open that
 # was not attributed to its build - one registered too late, say - would hold
 # the only permit while waiting on a build that needs it, and hang; every read
 # here is bounded, so that fails rather than hangs.
@@ -139,6 +140,24 @@ else()
   if(NOT first STREQUAL "${LEAF}")
     list(APPEND FAILURES "first.txt read '${first}', not '${LEAF}'")
   endif()
+
+  # A change to the leaf reaches everything that read it through the mount
+  # (only chain6 traced leaf.txt itself). Polled, as the watcher takes time.
+  set(NEW_LEAF "changed leaf\n")
+  file(WRITE "${SRC}/leaf.txt" "${NEW_LEAF}")
+  foreach(output chain1.txt copied.txt first.txt)
+    foreach(attempt RANGE 1 100)
+      read_output(${output} value)
+      if(value STREQUAL "${NEW_LEAF}")
+        break()
+      endif()
+      execute_process(COMMAND "${CMAKE_COMMAND}" -E sleep 0.1)
+    endforeach()
+    if(NOT value STREQUAL "${NEW_LEAF}")
+      list(APPEND FAILURES
+           "${output} read '${value}' after leaf.txt changed, not '${NEW_LEAF}'")
+    endif()
+  endforeach()
 endif()
 
 execute_process(COMMAND "${MAKEBELIEVE_EXE}" unmount "${MNT}"

@@ -547,6 +547,42 @@ TEST(BuildCoordinator, AtTheCapEachAttemptOpeningAnUnbuiltOutputCompletes) {
   EXPECT_EQ(fixture.content("a2"), "b2=ok ");
 }
 
+// An output a command opened is one of its build's inputs, even when the open
+// did not have to wait.
+TEST(BuildCoordinator, AnOutputACommandOpenedIsAnInputOfItsBuild) {
+  Fixture fixture(1);
+  fixture.declare(
+      "@/a = run open b\n"
+      "@/b = run signal one\n");
+  ASSERT_EQ(outcome(fixture.open("b")), "ok");
+  ASSERT_EQ(outcome(fixture.open("a")), "ok");
+  ASSERT_EQ(fixture.commands.runs("a"), 1);
+
+  // Changing b's command rebuilds b, and with it a, which read it.
+  fixture.redeclare(
+      "@/a = run open b\n"
+      "@/b = run signal two\n");
+  EXPECT_EQ(outcome(fixture.open("a")), "ok");
+  EXPECT_EQ(fixture.commands.runs("b"), 2);
+  EXPECT_EQ(fixture.commands.runs("a"), 2);
+}
+
+// An open from outside any build is no build's input.
+TEST(BuildCoordinator, AnOpenFromOutsideAnyBuildIsNoBuildsInput) {
+  Fixture fixture(1);
+  fixture.declare(
+      "@/a = run signal a\n"
+      "@/b = run signal one\n");
+  ASSERT_EQ(outcome(fixture.open("a")), "ok");
+  ASSERT_EQ(outcome(fixture.open("b")), "ok");
+
+  fixture.redeclare(
+      "@/a = run signal a\n"
+      "@/b = run signal two\n");
+  EXPECT_EQ(outcome(fixture.open("a")), "ok");
+  EXPECT_EQ(fixture.commands.runs("a"), 1);
+}
+
 TEST(BuildCoordinator, AChainLongerThanTheCapCompletes) {
   Fixture fixture(1);
   fixture.declare(

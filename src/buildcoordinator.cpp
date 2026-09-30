@@ -303,19 +303,21 @@ void BuildCoordinator::complete(const AttemptPtr& attempt,
 exec::task<std::error_code> BuildCoordinator::wait(
     AttemptPtr target,
     std::uint32_t requester_pid) {
-  // Before the wait takes any lock: it may read /proc or open the requesting
-  // process.
-  const std::optional<AttemptId> requester_id =
-      requester_pid != 0 ? m_impl->m_attribution.resolve(requester_pid)
-                         : std::nullopt;
+  // Outside the lock: it may read /proc.
+  const std::optional<AttemptId> requester_id = resolve(requester_pid);
   co_return co_await m_impl->wait(std::move(target), requester_id);
+}
+
+std::optional<AttemptId> BuildCoordinator::resolve(
+    std::uint32_t requester_pid) const {
+  return requester_pid != 0 ? m_impl->m_attribution.resolve(requester_pid)
+                            : std::nullopt;
 }
 
 exec::task<std::error_code> BuildCoordinator::wait_as(
     AttemptPtr target,
-    const AttemptPtr& requester) {
-  const AttemptId requester_id = id_of(requester);
-  co_return co_await m_impl->wait(std::move(target), requester_id);
+    std::optional<AttemptId> requester) {
+  co_return co_await m_impl->wait(std::move(target), requester);
 }
 
 BuildCoordinator::Stats BuildCoordinator::stats() const {

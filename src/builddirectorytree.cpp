@@ -112,12 +112,10 @@ void remove_with_empty_parents(InMemoryDirectoryTree& tree,
   }
 }
 
-// What a path naming another output starts with, in a `copy` rule and among a
-// build's inputs.
 constexpr std::string_view k_generated_prefix = "@/";
 
-// @a output as it appears among the inputs of the builds that read it: under
-// `@/`, apart from the source files, which are relative to the source root.
+// @a output as an input of the builds that read it, kept apart from source
+// files by its `@/`.
 std::filesystem::path as_input(const std::filesystem::path& output) {
   return std::filesystem::path("@") / output;
 }
@@ -225,6 +223,10 @@ class BuildDirectoryTree::Impl {
     BuildCoordinator::AttemptPtr next;
   };
   std::map<std::filesystem::path, Attempts> m_attempts;
+
+  // The outputs each build under way has opened through us, added to its
+  // inputs when it finishes. Tracing sees only the source, so not these.
+  std::unordered_map<AttemptId, std::set<std::filesystem::path>> m_reads;
 
   // Outputs opened at least once, which an input change rebuilds eagerly.
   std::set<std::filesystem::path> m_materialized;
@@ -352,16 +354,26 @@ class BuildDirectoryTree::Impl {
   // Waits, through the coordinator, for the build of a declared output that
   // brings it up to date - joining the one under way unless the output has
   // changed since it started, otherwise the next, which is started here if the
-  // output is idle - and returns that build's error, if it failed.
+  // output is idle - and returns that build's error, if it failed. An open by
+  // one of our builds' commands is recorded as that build's read, waiting or
+  // not.
   [[nodiscard]] exec::task<std::error_code> build_now(
       std::filesystem::path path,
       OpenContext context) {
-    const BuildCoordinator::AttemptPtr target =
-        bring_up_to_date(path.lexically_normal());
+    const std::filesystem::path output = path.lexically_normal();
+    std::optional<AttemptId> requester;
+    if (context.requester_pid != 0 && is_declared(output)) {
+      // Unlocked: it may read /proc.
+      requester = m_coordinator->resolve(context.requester_pid);
+      if (requester.has_value()) {
+        record_read(*requester, output);
+      }
+    }
+    const BuildCoordinator::AttemptPtr target = bring_up_to_date(output);
     if (target == nullptr) {
       co_return std::error_code{};
     }
-    co_return co_await m_coordinator->wait(target, context.requester_pid);
+    co_return co_await m_coordinator->wait_as(target, requester);
   }
 
   exec::task<std::expected<FileInfo, std::error_code>> open(
@@ -431,10 +443,8 @@ class BuildDirectoryTree::Impl {
     std::uint64_t build_id = 0;
   };
 
-  // The build of @a output that brings it up to date - the one under way
-  // unless the output has changed since it started, otherwise the next, which
-  // is started here if the output is idle - or nullptr when @a output is up to
-  // date already or is not declared.
+  // The build that brings @a output up to date, as build_now describes, or
+  // nullptr if it is up to date already or not declared.
   // NOLINTNEXTLINE(misc-no-recursion): see launch_build.
   BuildCoordinator::AttemptPtr bring_up_to_date(
       const std::filesystem::path& output) {
@@ -479,16 +489,13 @@ class BuildDirectoryTree::Impl {
     return target;
   }
 
-  // The build of a rule copying @a source, another output, as the attempt
-  // @a self: brought up to date the way an open would, waited on as a request
-  // of @a self's own, so it gives its permit back meanwhile, then read. Its
-  // one input is @a source, as the outputs reading it are keyed.
+  // The build, as @a self, of a copy of the output @a source.
   // NOLINTNEXTLINE(misc-no-recursion): see launch_build.
   exec::task<BuildResult> copy_output(std::filesystem::path source,
                                       BuildCoordinator::AttemptPtr self) {
     if (const BuildCoordinator::AttemptPtr target = bring_up_to_date(source)) {
-      if (const std::error_code error =
-              co_await m_coordinator->wait_as(target, self)) {
+      if (const std::error_code error = co_await m_coordinator->wait_as(
+              target, BuildCoordinator::id_of(self))) {
         co_return std::unexpected(error);
       }
     }
@@ -499,6 +506,19 @@ class BuildDirectoryTree::Impl {
     }
     co_return BuildOutput{.bytes = std::move(*bytes),
                           .inputs = {as_input(source)}};
+  }
+
+  [[nodiscard]] bool is_declared(const std::filesystem::path& output) {
+    const std::lock_guard lock(m_mutex);
+    return m_commands.contains(output);
+  }
+
+  // Records that @a attempt opened @a output, if it is one of ours under way.
+  void record_read(AttemptId attempt, const std::filesystem::path& output) {
+    const std::lock_guard lock(m_mutex);
+    if (const auto reads = m_reads.find(attempt); reads != m_reads.end()) {
+      reads->second.insert(as_input(output));
+    }
   }
 
   // Marks @a output as building - as the attempt an open is already waiting
@@ -512,6 +532,7 @@ class BuildDirectoryTree::Impl {
     attempts.current = attempt;
     m_stale.erase(output);
     m_in_flight.insert(output);
+    m_reads.try_emplace(BuildCoordinator::id_of(attempt));
     Launch launch{.output = output,
                   .attempt = std::move(attempt),
                   .command = m_commands.at(output)};
@@ -569,14 +590,10 @@ class BuildDirectoryTree::Impl {
 
     std::optional<AttemptSender> build;
     try {
-      // A copy of another output is served by the tree too, which already
-      // knows how to bring that output up to date; anything else goes to the
-      // runner.
+      // A copy of another output is served by the tree too.
       const bool copies_output =
           launch.command.action == Manifest::Action::Copy &&
           launch.command.text.starts_with(k_generated_prefix);
-      // Its steps are brief, and it resumes wherever the coordinator answers
-      // its wait, so it needs no scheduler of its own.
       BuildSender work =
           copies_output
               ? BuildSender(stdexec::write_env(
@@ -666,6 +683,11 @@ class BuildDirectoryTree::Impl {
         // Its rule may have left the manifest mid-build.
         declared = m_commands.contains(output);
         if (declared) {
+          if (const auto reads = m_reads.find(BuildCoordinator::id_of(attempt));
+              reads != m_reads.end()) {
+            result->inputs.insert(result->inputs.end(), reads->second.begin(),
+                                  reads->second.end());
+          }
           update_dependents(output, std::move(result->inputs));
         }
       }
@@ -681,6 +703,7 @@ class BuildDirectoryTree::Impl {
     {
       const std::lock_guard lock(m_mutex);
       m_in_flight.erase(output);
+      m_reads.erase(BuildCoordinator::id_of(attempt));
       const auto attempts = m_attempts.find(output);
       const bool waited_on =
           attempts != m_attempts.end() && attempts->second.next != nullptr;
@@ -819,8 +842,7 @@ class BuildDirectoryTree::Impl {
       }
     }
 
-    // An output that read one that has gone, or that has come back, read what
-    // is no longer there.
+    // Whatever read an output that came or went read something else now.
     {
       const std::lock_guard lock(m_mutex);
       for (const std::vector<std::filesystem::path>* outputs :
@@ -874,17 +896,14 @@ class BuildDirectoryTree::Impl {
     invalidate(std::move(affected));
   }
 
-  // Marks each of @a outputs stale, and with it every output that read one -
-  // through the mount or by copying it - and so on down, since each of those
-  // would be built from content about to change. Only once all are marked are
-  // the eager rebuilds started, of those opened before and idle, so an open
-  // meanwhile of anything downstream waits rather than being served the old
-  // content.
+  // Marks @a outputs stale along with everything that read them, transitively,
+  // then starts the eager rebuilds - only once all are marked, so nothing
+  // downstream is served old content meanwhile.
   void invalidate(std::vector<std::filesystem::path> outputs) {
     std::vector<std::filesystem::path> eager;
     {
       const std::lock_guard lock(m_mutex);
-      // Visited once each, so outputs that read each other cannot loop.
+      // Outputs that read each other must not loop.
       std::set<std::filesystem::path> seen;
       while (!outputs.empty()) {
         const std::filesystem::path output = std::move(outputs.back());

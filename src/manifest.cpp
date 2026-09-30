@@ -88,8 +88,7 @@ Manifest Manifest::parse(std::string_view text) {
   std::map<std::filesystem::path, std::size_t> files;
   std::map<std::filesystem::path, std::size_t> directories;
 
-  // Each accepted rule that copies another output, checked against every
-  // declared output once all are known.
+  // Accepted copies of outputs, checked once every output is known.
   struct CopyOfOutput {
     std::size_t rule;
     std::size_t line;
@@ -159,8 +158,7 @@ Manifest Manifest::parse(std::string_view text) {
     // A `run` or `capture` command is taken verbatim. `copy` names a file
     // instead, held to the same shape as an output - inside the directory, no
     // escaping - so every copy's source is one the build can watch, and stored
-    // normalised. One under `@/` is another output, which must be declared
-    // somewhere in the manifest; that is checked once every line is read.
+    // normalised. One under `@/` is another output.
     std::string command(argument);
     std::optional<std::filesystem::path> copied_output;
     if (*action == Manifest::Action::Copy) {
@@ -231,9 +229,8 @@ Manifest Manifest::parse(std::string_view text) {
         {.output = *output, .action = *action, .command = std::move(command)});
   }
 
-  // Only now is every output known, since a copy may name one declared after
-  // it. Each copy of an undeclared one is dropped, last first so the indices
-  // of those before it still hold, and reported in line with the rest.
+  // A copy may name an output declared after it. Dropped last first, so
+  // earlier indices still hold.
   bool dropped = false;
   for (const CopyOfOutput& copy : std::views::reverse(copies)) {
     if (!files.contains(copy.source)) {

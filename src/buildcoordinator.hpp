@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <system_error>
 
 namespace makebelieve {
@@ -143,14 +144,16 @@ class BuildCoordinator {
       AttemptPtr target,
       std::uint32_t requester_pid = 0);
 
-  /// As @link wait, for a request made by @a requester itself rather than by
-  /// a process it launched - work its build does in-process, such as copying
-  /// another output - which gives its permit back while it waits and fails
-  /// on a cycle just as an attributed request does.
-  /// @pre @a requester is running.
+  /// The attempt @a requester_pid belongs to, if any. May read /proc, so call
+  /// it holding no lock.
+  [[nodiscard]] std::optional<AttemptId> resolve(
+      std::uint32_t requester_pid) const;
+
+  /// As @link wait, for a request already resolved to @a requester (or to
+  /// none), such as an in-process copy waiting as its own attempt.
   [[nodiscard]] exec::task<std::error_code> wait_as(
       AttemptPtr target,
-      const AttemptPtr& requester);
+      std::optional<AttemptId> requester);
 
   /// What is being tracked right now.
   [[nodiscard]] Stats stats() const;
