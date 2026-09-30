@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -271,9 +272,9 @@ class BuildDirectoryTreeTest : public ::testing::Test {
        std::string(
            ::testing::UnitTest::GetInstance()->current_test_info()->name()));
 
-  // Runs real commands in `work`.
+  // Runs real commands in `work`, as if the outputs were mounted beside it.
   [[nodiscard]] auto shell() {
-    return ShellRunner(work, io, pool.get_scheduler());
+    return ShellRunner(work, work.string() + "-mnt", io, pool.get_scheduler());
   }
 
   void SetUp() override {
@@ -412,6 +413,142 @@ TEST_F(BuildDirectoryTreeTest, ReadHandsACopysSourceToTheRunner) {
   ASSERT_EQ(commands.size(), 1U);
   EXPECT_EQ(commands[0].action, Manifest::Action::Copy);
   EXPECT_EQ(commands[0].text, "src/input.txt");
+}
+
+// A copy of another output never reaches the runner: the tree builds that
+// output as an open would and takes its bytes.
+TEST_F(BuildDirectoryTreeTest, CopiesAnotherOutputWithoutTheRunner) {
+  write_manifest(
+      "@/copy.txt = copy @/out/original.txt\n"
+      "@/out/original.txt = run build %out\n");
+
+  std::vector<Command> commands;
+  const BuildDirectoryTree tree(source, [&commands](Command command) {
+    commands.push_back(std::move(command));
+    return finished(built("original"));
+  });
+
+  EXPECT_EQ(read_output(tree, "copy.txt"), "original");
+  ASSERT_EQ(commands.size(), 1U);
+  EXPECT_EQ(commands[0].output, std::filesystem::path("out") / "original.txt");
+
+  // The original was built on the way, so reading it builds nothing more.
+  EXPECT_EQ(read_output(tree, "out/original.txt"), "original");
+  EXPECT_EQ(commands.size(), 1U);
+}
+
+// The copy fails, with its error, when the output it copies does.
+TEST_F(BuildDirectoryTreeTest, ACopyOfAFailingOutputFails) {
+  write_manifest(
+      "@/copy.txt = copy @/original.txt\n"
+      "@/original.txt = run build %out\n");
+
+  const std::error_code failure = exit_status_error(3);
+  const BuildDirectoryTree tree(source, [&failure](Command) {
+    return finished(std::unexpected(failure));
+  });
+
+  const std::expected<FileInfo, std::error_code> opened =
+      makebelieve::DirectoryTreeUtil::open(tree, "copy.txt");
+  ASSERT_FALSE(opened.has_value());
+  EXPECT_EQ(opened.error(), failure);
+}
+
+// Outputs copying each other would wait on each other forever; the cycle is
+// caught instead.
+TEST_F(BuildDirectoryTreeTest, OutputsCopyingEachOtherFailAsACycle) {
+  write_manifest("@/a.txt = copy @/b.txt\n@/b.txt = copy @/a.txt\n");
+
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
+
+  const std::expected<FileInfo, std::error_code> opened =
+      makebelieve::DirectoryTreeUtil::open(tree, "a.txt");
+  ASSERT_FALSE(opened.has_value());
+  EXPECT_EQ(opened.error(), std::errc::resource_deadlock_would_occur);
+  EXPECT_EQ(runs, 0);
+}
+
+// A copy of an output is out of date whenever that output is, so a change to
+// the original's input rebuilds both, the original first.
+TEST_F(BuildDirectoryTreeTest, RebuildsACopyWhenTheOutputItCopiesChanges) {
+  source.write_file("input.txt", "v1");
+  write_manifest(
+      "@/copy.txt = copy @/original.txt\n"
+      "@/original.txt = run build input.txt %out\n");
+
+  int runs = 0;
+  const BuildDirectoryTree tree(source,
+                                counting_with_inputs(runs, {"input.txt"}));
+
+  EXPECT_EQ(read_output(tree, "copy.txt"), "build 1");
+
+  source.write_file("input.txt", "v2");
+  EXPECT_EQ(runs, 2);
+  EXPECT_EQ(read_output(tree, "copy.txt"), "build 2");
+  EXPECT_EQ(runs, 2);
+}
+
+// An output whose command read another through the mount - which the runner
+// reports as an `@/` input - is out of date whenever that one is, however far
+// down the change started, and none of them is served stale meanwhile: a copy
+// never opened is still rebuilt on its next open.
+TEST_F(BuildDirectoryTreeTest,
+       AChangeReachesEveryOutputReadingThroughTheMount) {
+  source.write_file("input.txt", "v1");
+  write_manifest(
+      "@/first.txt = run first %out\n"
+      "@/second.txt = run second %out\n"
+      "@/third.txt = copy @/second.txt\n");
+
+  std::map<std::string, int> runs;
+  const BuildDirectoryTree tree(source, [&runs](Command command) {
+    const int run = ++runs[command.text];
+    std::vector<std::filesystem::path> inputs;
+    if (command.text == "first %out") {
+      inputs = {"input.txt"};
+    } else {
+      inputs = {std::filesystem::path("@") / "first.txt"};
+    }
+    return finished(
+        BuildOutput{.bytes = command.text + " " + std::to_string(run),
+                    .inputs = std::move(inputs)});
+  });
+
+  // The runner only claims to read first.txt, so it is built here as the real
+  // read through the mount would have built it.
+  EXPECT_EQ(read_output(tree, "first.txt"), "first %out 1");
+  EXPECT_EQ(read_output(tree, "second.txt"), "second %out 1");
+  EXPECT_EQ(read_output(tree, "third.txt"), "second %out 1");
+
+  // Every one of them was opened, so each is rebuilt eagerly, in order.
+  source.write_file("input.txt", "v2");
+  EXPECT_EQ(runs["second %out"], 2);
+  EXPECT_EQ(read_output(tree, "third.txt"), "second %out 2");
+  EXPECT_EQ(runs["second %out"], 2);
+}
+
+// Removing an output that another read makes the reader out of date, since
+// what it read is gone.
+TEST_F(BuildDirectoryTreeTest, RemovingAnOutputRebuildsWhatReadIt) {
+  write_manifest(
+      "@/first.txt = run first %out\n"
+      "@/second.txt = run second %out\n");
+
+  int second_runs = 0;
+  const BuildDirectoryTree tree(source, [&second_runs](Command command) {
+    if (command.text == "first %out") {
+      return finished(built("first"));
+    }
+    ++second_runs;
+    return finished(
+        BuildOutput{.bytes = "second",
+                    .inputs = {std::filesystem::path("@") / "first.txt"}});
+  });
+
+  EXPECT_EQ(read_output(tree, "second.txt"), "second");
+  write_manifest("@/second.txt = run second %out\n");
+  EXPECT_EQ(second_runs, 2);
 }
 
 // A command also names the output it is building, so a runner can give the

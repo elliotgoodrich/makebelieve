@@ -32,6 +32,7 @@ namespace detail {
 exec::task<BuildResult> run_shell_command(
     IoContext& io,
     std::filesystem::path working_directory,
+    std::filesystem::path mountpoint,
     Command command,
     LaunchRegistrar registrar,
     stdexec::inplace_stop_token stop);
@@ -53,15 +54,20 @@ exec::task<BuildResult> run_shell_command(
 /// the extension needs no extra flag - and produces the bytes it wrote there,
 /// failing if it wrote no file there at all; a `Capture` command produces the
 /// bytes it wrote to standard output. A command that exits with a nonzero
-/// status fails. A
+/// status fails. Before either runs, each `@/<path>` in it becomes the path of
+/// that output under the mountpoint given at construction, quoted unless it
+/// already stands inside quotes, so the command reads the output through the
+/// mount, which builds it first. A
 /// `Copy` rule runs no command at all: it produces the bytes of the file it
 /// names, read from under the working directory, and reports that file as its
-/// one input.
+/// one input. (A copy of another output, `@/<path>`, is not the runner's to
+/// carry out: `BuildDirectoryTree` serves it itself.)
 /// Each command it runs is registered, before it runs, with the
 /// @link LaunchRegistrar its receiver's environment names.
 /// Traced inputs are reported relative to the working directory, so for
 /// dependency tracking to line up it should be the filesystem root that the
-/// tree's source mirrors.
+/// tree's source mirrors. Tracing covers only the working directory, so a
+/// read through the mountpoint is not among them.
 ///
 /// @tparam Scheduler Where each build's synchronous steps run, and where it
 /// resumes, and completes, after waiting on its command. Satisfying
@@ -74,18 +80,22 @@ exec::task<BuildResult> run_shell_command(
 template <stdexec::scheduler Scheduler>
 class ShellRunner {
   std::filesystem::path m_working_directory;
+  std::filesystem::path m_mountpoint;
   IoContext* m_io;
   Scheduler m_scheduler;
 
  public:
-  /// Creates a runner working in @a working_directory, running its
+  /// Creates a runner working in @a working_directory, whose commands reach
+  /// other outputs under @a mountpoint, an absolute path, running its
   /// synchronous steps on @a scheduler and waiting through @a io.
   /// @pre @a io, and whatever runs @a scheduler's work, outlive every build it
   /// starts.
   ShellRunner(std::filesystem::path working_directory,
+              std::filesystem::path mountpoint,
               IoContext& io,
               Scheduler scheduler)
       : m_working_directory(std::move(working_directory)),
+        m_mountpoint(std::move(mountpoint)),
         m_io(&io),
         m_scheduler(std::move(scheduler)) {}
 
@@ -97,6 +107,7 @@ class ShellRunner {
     return stdexec::schedule(m_scheduler) |
            stdexec::let_value([io = m_io,
                                working_directory = m_working_directory,
+                               mountpoint = m_mountpoint,
                                command = std::move(command)]() mutable {
              return stdexec::read_env(get_launch_registrar) |
                     stdexec::let_value([&](LaunchRegistrar registrar) {
@@ -107,7 +118,7 @@ class ShellRunner {
                                  [&,
                                   registrar](stdexec::inplace_stop_token stop) {
                                    return detail::run_shell_command(
-                                       *io, working_directory,
+                                       *io, working_directory, mountpoint,
                                        std::move(command), registrar, stop);
                                  });
                     });

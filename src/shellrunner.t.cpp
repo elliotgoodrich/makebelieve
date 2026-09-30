@@ -65,15 +65,27 @@ class ShellRunnerTest : public ::testing::Test {
        std::string(
            ::testing::UnitTest::GetInstance()->current_test_info()->name()));
 
+  // Stands in for the mount, holding the outputs a command reaches as `@/`.
+  // With a space in it, so a path through it has to be quoted to survive.
+  std::filesystem::path mountpoint = work.string() + " mnt";
+
   void SetUp() override {
     std::error_code ec;
     std::filesystem::remove_all(work, ec);
+    std::filesystem::remove_all(mountpoint, ec);
     std::filesystem::create_directories(work);
+    std::filesystem::create_directories(mountpoint / "sub");
   }
 
   void TearDown() override {
     std::error_code ec;
     std::filesystem::remove_all(work, ec);
+    std::filesystem::remove_all(mountpoint, ec);
+  }
+
+  void write_generated(const std::filesystem::path& name,
+                       std::string_view content) {
+    std::ofstream(mountpoint / name, std::ios::binary) << content;
   }
 
   void write_input(std::string_view name, std::string_view content) {
@@ -103,7 +115,7 @@ class ShellRunnerTest : public ::testing::Test {
       Command command,
       ex::inplace_stop_token stop = {},
       LaunchRegistrar registrar = LaunchRegistrar::none()) {
-    const ShellRunner run(work, io, context.get_scheduler());
+    const ShellRunner run(work, mountpoint, io, context.get_scheduler());
     return build(run, std::move(command), stop, registrar);
   }
 };
@@ -261,6 +273,48 @@ TEST_F(ShellRunnerTest, AddsNoExtensionToABareOutput) {
   EXPECT_EQ(trimmed_path(built.result->bytes).filename(), "report");
 }
 
+// `@/` in a command names another output, reached through the mountpoint -
+// quoted, since the mountpoint may hold spaces.
+TEST_F(ShellRunnerTest, ExpandsAnOutputInACaptureCommandToItsPathInTheMount) {
+  write_generated(std::filesystem::path("sub") / "generated.txt", "generated");
+  const Built built = build({.output = "output.txt",
+                             .action = Manifest::Action::Capture,
+                             .text = "cmake -E cat @/sub/generated.txt"});
+  ASSERT_TRUE(built.result.has_value()) << built.result.error().message();
+  EXPECT_EQ(built.result->bytes, "generated");
+}
+
+TEST_F(ShellRunnerTest, ExpandsAnOutputInARunCommandAlongsideOut) {
+  write_generated("generated.txt", "generated");
+  write_input("input.txt", "input");
+  const Built built =
+      build({.output = "output.txt",
+             .action = Manifest::Action::Run,
+             .text = "cmake -E cat input.txt @/generated.txt > %out"});
+  ASSERT_TRUE(built.result.has_value()) << built.result.error().message();
+  EXPECT_EQ(built.result->bytes, "inputgenerated");
+}
+
+// A `@/` path already inside quotes runs to the closing quote - spaces and
+// all - and is left to those quotes rather than quoted again.
+TEST_F(ShellRunnerTest, ExpandsAnOutputAlreadyInsideQuotes) {
+  write_generated("my file.txt", "spaced");
+  const Built built = build({.output = "output.txt",
+                             .action = Manifest::Action::Capture,
+                             .text = "cmake -E cat \"@/my file.txt\""});
+  ASSERT_TRUE(built.result.has_value()) << built.result.error().message();
+  EXPECT_EQ(built.result->bytes, "spaced");
+}
+
+// A command reading an output through the mount builds on whatever it finds
+// there; one that is missing fails the command like any missing file.
+TEST_F(ShellRunnerTest, FailsACommandReadingAMissingOutput) {
+  const Built built = build({.output = "output.txt",
+                             .action = Manifest::Action::Capture,
+                             .text = "cmake -E cat @/missing.txt"});
+  EXPECT_FALSE(built.result.has_value());
+}
+
 // A copy takes the bytes verbatim, so a binary source survives intact.
 TEST_F(ShellRunnerTest, CopiesBytesVerbatim) {
   const std::string binary("a\0b\r\nc", 6);
@@ -311,7 +365,7 @@ TEST_F(ShellRunnerTest, RunsAndCompletesEachBuildOnItsScheduler) {
 TEST_F(ShellRunnerTest, RunsOnAThreadPool) {
   write_input("input.txt", "pooled");
   exec::static_thread_pool pool(1);
-  const ShellRunner run(work, io, pool.get_scheduler());
+  const ShellRunner run(work, mountpoint, io, pool.get_scheduler());
   const Built built = build(run, {.output = "output.txt",
                                   .action = Manifest::Action::Capture,
                                   .text = "cmake -E cat input.txt"});

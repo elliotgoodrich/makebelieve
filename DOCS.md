@@ -21,10 +21,20 @@ Generated files live in the mounted output namespace and use `@/`:
 
 Paths without `@/` refer to the normal filesystem.
 
-Currently `@/` is recognized only on the left-hand side of a declaration.
-To read another generated output in a command, use its filesystem path
-through the mount, such as `../mnt/chain2.txt`; `@/chain2.txt` is not expanded
-inside commands.
+A command reads another output by naming it with `@/` too. Before the
+command runs, each `@/<path>` in it becomes that output's path through the
+mount, which builds it on the way:
+
+```mb
+@/paper.pdf = run pandoc @/paper.md -o %out
+@/paper.md = capture python render.py
+```
+
+Outside quotes the path runs to the next space or shell metacharacter and
+is quoted, so a mountpoint with spaces in it survives the shell; inside
+quotes (`"@/my notes.md"`) it runs to the closing quote. Reads through the
+mount are not traced, so a command that reads another output is not yet
+rebuilt when that output changes.
 
 An output is assigned an action and what that action applies to. With
 `run` the command writes the output itself, to the path `%out` stands
@@ -54,6 +64,14 @@ The path is relative to the manifest's directory and must stay inside
 it, so the file is always one **makebelieve** can watch - a copy is
 rebuilt when its source changes even where command tracing is
 unavailable.
+
+A path under `@/` copies another output, which must be declared in the
+manifest. It is built first, and whenever it goes out of date, so does
+the copy:
+
+```mb
+@/latest.json = copy @/releases/v2.json
+```
 
 `tracing` takes no argument: the output is a trace of what
 **makebelieve** itself has been doing - every file opened through the

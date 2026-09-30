@@ -143,6 +143,15 @@ class BuildCoordinator {
       AttemptPtr target,
       std::uint32_t requester_pid = 0);
 
+  /// As @link wait, for a request made by @a requester itself rather than by
+  /// a process it launched - work its build does in-process, such as copying
+  /// another output - which gives its permit back while it waits and fails
+  /// on a cycle just as an attributed request does.
+  /// @pre @a requester is running.
+  [[nodiscard]] exec::task<std::error_code> wait_as(
+      AttemptPtr target,
+      const AttemptPtr& requester);
+
   /// What is being tracked right now.
   [[nodiscard]] Stats stats() const;
 

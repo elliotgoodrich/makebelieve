@@ -2,8 +2,8 @@
 # the mount: spawns the daemon capped at one build at a time (`-j 1`) over
 # integration/dependencies, whose commands are real `cmake -E cat`s of other
 # outputs, and checks that a chain longer than the cap, a fan-in opened all at
-# once, and a command that opens a generated output as its very first action
-# all build and read back correctly. At a cap of one, a command's open that
+# once, a command that opens a generated output as its very first action, and
+# a `copy @/` of another output all build and read back correctly. At a cap of one, a command's open that
 # was not attributed to its build - one registered too late, say - would hold
 # the only permit while waiting on a build that needs it, and hang; every read
 # here is bounded, so that fails rather than hangs.
@@ -27,7 +27,7 @@ file(COPY "${FIXTURE_DIR}/" DESTINATION "${SRC}")
 foreach(link RANGE 1 79)
   math(EXPR next "${link} + 1")
   file(APPEND "${SRC}/build.makebelieve"
-    "\n@/deep${link}.txt = capture cmake -E cat ../mnt/deep${next}.txt\n")
+    "\n@/deep${link}.txt = capture cmake -E cat @/deep${next}.txt\n")
 endforeach()
 file(APPEND "${SRC}/build.makebelieve" "\n@/deep80.txt = capture cmake -E cat leaf.txt\n")
 
@@ -82,6 +82,13 @@ endforeach()
 if(NOT MOUNTED)
   list(APPEND FAILURES "daemon did not mount within the timeout")
 else()
+  # The copy of the chain's head, opened first: it holds the only permit until
+  # it waits on the chain, which then builds as below.
+  read_output(copied.txt copied)
+  if(NOT copied STREQUAL "${LEAF}")
+    list(APPEND FAILURES "copied.txt read '${copied}', not '${LEAF}'")
+  endif()
+
   # The chain: opening its head builds every link, one waiting on the next,
   # each giving its permit back while it waits.
   read_output(chain1.txt chain)
