@@ -11,23 +11,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The runner already has g++-14 but not clang-19. Debug builds with
+        # Clang need its sanitizer runtimes, which clang-19 only recommends.
         include:
-          - {os: ubuntu-24.04,   compiler: Clang, cpp: clang++-19, apt: clang-19, build_type: Debug}
-          - {os: ubuntu-24.04,   compiler: Clang, cpp: clang++-19, apt: clang-19, build_type: Release}
-          - {os: ubuntu-24.04,   compiler: GCC,   cpp: g++-14,     apt: g++-14,   build_type: Debug}
-          - {os: ubuntu-24.04,   compiler: GCC,   cpp: g++-14,     apt: g++-14,   build_type: Release}
-          - {os: windows-latest, compiler: MSVC,  cpp: cl,                        build_type: Debug}
-          - {os: windows-latest, compiler: MSVC,  cpp: cl,                        build_type: Release}
+          - {os: ubuntu-24.04,   compiler: Clang, cpp: clang++-19, apt: clang-19 libclang-rt-19-dev, build_type: Debug}
+          - {os: ubuntu-24.04,   compiler: Clang, cpp: clang++-19, apt: clang-19,                    build_type: Release}
+          - {os: ubuntu-24.04,   compiler: GCC,   cpp: g++-14,                                       build_type: Debug}
+          - {os: ubuntu-24.04,   compiler: GCC,   cpp: g++-14,                                       build_type: Release}
+          - {os: windows-latest, compiler: MSVC,  cpp: cl,                                           build_type: Debug}
+          - {os: windows-latest, compiler: MSVC,  cpp: cl,                                           build_type: Release}
     name: ${{ matrix.compiler }} (${{ matrix.build_type }})
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
+    # Recommended packages would more than double clang-19's download (such as
+    # llvm-19-dev) for nothing the build uses.
     - name: Install dependencies
       if: runner.os == 'Linux'
       run: >
-        sudo apt-get update && sudo apt-get install -y
+        sudo apt-get update && sudo apt-get install -y --no-install-recommends
         libfuse3-dev pkg-config ${{ matrix.apt }}
     - name: Allow unprivileged user namespaces
       if: runner.os == 'Linux'
@@ -76,7 +80,7 @@ jobs:
         persist-credentials: false
     - name: Install dependencies
       run: >
-        sudo apt-get update && sudo apt-get install -y
+        sudo apt-get update && sudo apt-get install -y --no-install-recommends
         libfuse3-dev pkg-config clang-19 clang-tidy-19
     - name: Configure CMake
       # CLANG_TIDY_EXE is the cache variable find_program() fills in, so setting
