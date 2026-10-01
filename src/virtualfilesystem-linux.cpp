@@ -456,12 +456,19 @@ class VirtualFileSystem::Impl {
                  const std::filesystem::path& relative,
                  struct stat* out) {
     std::memset(out, 0, sizeof(*out));
-    if (is_self_request(req)) {
-      switch (pretence_for(relative)) {
-        case Pretence::none:
-          break;
-        case Pretence::absent:
-          return -ENOENT;
+    const Pretence pretence =
+        is_self_request(req) ? pretence_for(relative) : Pretence::none;
+    if (pretence == Pretence::absent) {
+      return -ENOENT;
+    }
+
+    const std::expected<EntryInfo, std::error_code> status =
+        m_tree.status(relative);
+    if (!status.has_value()) {
+      // Made up only while the path really is gone. One recreated since its
+      // removal was queued shares the kernel's inode with it, so made-up
+      // attributes - a size of 0 - would be what everyone else read too.
+      switch (pretence) {
         case Pretence::present_file:
           out->st_mode = S_IFREG | 0444;
           out->st_nlink = 1;
@@ -470,13 +477,9 @@ class VirtualFileSystem::Impl {
           out->st_mode = S_IFDIR | 0555;
           out->st_nlink = 2;
           return 0;
+        default:
+          return -ENOENT;
       }
-    }
-
-    const std::expected<EntryInfo, std::error_code> status =
-        m_tree.status(relative);
-    if (!status.has_value()) {
-      return -ENOENT;
     }
 
     // Every watch starts with a lookup, and entry caching is off, so every such
