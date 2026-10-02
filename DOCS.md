@@ -117,13 +117,48 @@ Without the `!`, the right-hand side is a built-in action (`run`,
 
 ## Directory Expansion
 
-A wildcard can create one output per matching input:
+A `*` in an output creates one output per matching source file:
 
 ```mb
-@/out/*.o = !cc src/*.cpp
+@/out/*.o = run clang++ -c src/*.cpp -o %out
+@/site/*.md = copy notes/*.md
 ```
 
-For now, only the simple single-`*` case is defined.
+The source files are those matching the first word of the command with a
+`*` in it - for `copy`, the path. With `src/main.cpp` present the first
+rule declares `@/out/main.o`, built by that command with every `*`
+replaced by `main`. Outputs appear and disappear as matching files do.
+
+Each pattern takes a single `*`, in the file name, which matches one or
+more characters. The source pattern is an unquoted path inside the
+manifest's directory. What the `*` matched goes into the command as it
+is, so a file name with spaces or shell metacharacters in it needs the
+command to quote the `*`.
+
+Without a `*` in the output, a `*` in a command is left for the shell.
+
+A source pattern under `@/` matches other outputs instead, whichever rule
+declares them:
+
+```mb
+@/gen/*.md = capture python render.py src/*.txt
+@/site/*.html = run pandoc @/gen/*.md -o %out
+```
+
+Two rules may never be able to produce the same path, whatever source
+files come to exist. So a wildcard bans its suffix - whatever follows the
+`*` - from its directory: with `@/out/*.foo` declared, nothing else in
+`@/out` may end in `.foo`. The manifest is rejected when it holds, beside
+that wildcard:
+
+- an output ending in the suffix - `@/out/a.foo`;
+- another wildcard whose suffix ends in it, or that it ends in -
+  `@/out/lib*.foo`, `@/out/*.x.foo` or `@/out/*o`;
+- an output inside a directory ending in it - `@/out/x.foo/y`.
+
+Nor may a wildcard over outputs be able to produce something its own
+pattern matches, directly or through other wildcards, since its outputs
+would never end - `@/gen/*.md.md = copy @/gen/*.md`.
 
 ## Serving
 

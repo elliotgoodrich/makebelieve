@@ -1433,4 +1433,83 @@ TEST_F(BuildDirectoryTreeTest, ReloadsTheManifestWhenItChangesOnDisk) {
 }
 #endif
 
+// A wildcard rule declares one output per source file its pattern matches,
+// each built by the command with that file's stem in place of every `*`.
+TEST_F(BuildDirectoryTreeTest, AWildcardDeclaresAnOutputPerMatchingSource) {
+  source.make_directory("src");
+  source.make_directory("src/nested.md");
+  source.write_file("src/a.md", "a");
+  source.write_file("src/b.md", "b");
+  source.write_file("src/c.txt", "c");
+  write_manifest("@/out/*.html = run render src/*.md %out\n");
+
+  const BuildDirectoryTree tree(
+      source, [](Command command) { return finished(built(command.text)); });
+
+  const auto out = tree.ls("out");
+  ASSERT_TRUE(out.has_value());
+  std::vector<std::filesystem::path> names;
+  for (const TreeEntry& entry : *out) {
+    names.push_back(entry.name);
+  }
+  std::ranges::sort(names);
+  EXPECT_EQ(names, (std::vector<std::filesystem::path>{"a.html", "b.html"}));
+  EXPECT_EQ(read_output(tree, "out/b.html"), "render src/b.md %out");
+}
+
+// The outputs follow the source files as they come and go, and those that
+// stay keep what was built.
+TEST_F(BuildDirectoryTreeTest, AWildcardFollowsItsSourceFiles) {
+  write_manifest("@/out/*.html = run render src/*.md %out\n");
+
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
+  EXPECT_FALSE(tree.status("out").has_value());
+
+  // The directory itself arrives after the tree does.
+  source.make_directory("src");
+  source.write_file("src/a.md", "a");
+  EXPECT_EQ(read_output(tree, "out/a.html"), "build 1");
+
+  source.write_file("src/b.md", "b");
+  EXPECT_EQ(output_size(tree, "out/b.html"), 1U);
+  EXPECT_EQ(read_output(tree, "out/a.html"), "build 1");
+  EXPECT_EQ(runs, 1);
+
+  source.remove("src/a.md");
+  EXPECT_FALSE(tree.status("out/a.html").has_value());
+  EXPECT_TRUE(tree.status("out/b.html").has_value());
+
+  source.remove("src/b.md");
+  EXPECT_FALSE(tree.status("out").has_value());
+}
+
+// A wildcard over outputs matches whatever is declared, including what other
+// wildcards declare, and follows it as that changes.
+TEST_F(BuildDirectoryTreeTest, AWildcardMatchesOtherOutputs) {
+  source.make_directory("src");
+  source.write_file("src/a.txt", "a");
+  write_manifest(
+      "@/site/*.html = run pandoc @/gen/*.md -o %out\n"
+      "@/copy/*.html = copy @/site/*.html\n"
+      "@/gen/*.md = capture render src/*.txt\n"
+      "@/gen/other.txt = capture echo other\n");
+
+  const BuildDirectoryTree tree(
+      source, [](Command command) { return finished(built(command.text)); });
+
+  EXPECT_EQ(read_output(tree, "site/a.html"), "pandoc @/gen/a.md -o %out");
+  EXPECT_EQ(read_output(tree, "copy/a.html"), "pandoc @/gen/a.md -o %out");
+  EXPECT_FALSE(tree.status("site/other.html").has_value());
+
+  source.write_file("src/b.txt", "b");
+  EXPECT_TRUE(tree.status("copy/b.html").has_value());
+
+  source.remove("src/a.txt");
+  EXPECT_FALSE(tree.status("gen/a.md").has_value());
+  EXPECT_FALSE(tree.status("site/a.html").has_value());
+  EXPECT_FALSE(tree.status("copy/a.html").has_value());
+  EXPECT_TRUE(tree.status("copy/b.html").has_value());
+}
+
 }  // namespace

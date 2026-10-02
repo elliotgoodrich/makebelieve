@@ -33,6 +33,7 @@
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -141,10 +142,10 @@ std::string trace_snapshot() {
   return g_tracer != nullptr ? g_tracer->snapshot() : std::string("[]\n");
 }
 
-// Reads the rules of the manifest in @a source, mapping each output to its
-// command, or describes - one problem per line - why the manifest could not be
-// read or has lines it cannot accept. No manifest at all means no rules.
-std::expected<std::map<std::filesystem::path, Command>, std::string> read_rules(
+// Reads the rules of the manifest in @a source, or describes - one problem per
+// line - why the manifest could not be read or has lines it cannot accept. No
+// manifest at all means no rules.
+std::expected<std::vector<Manifest::Rule>, std::string> read_rules(
     const DirectoryTree& source) {
   const std::expected<std::string, std::error_code> manifest =
       read_all(source, k_manifest_name);
@@ -169,11 +170,70 @@ std::expected<std::map<std::filesystem::path, Command>, std::string> read_rules(
     return std::unexpected(std::move(problems));
   }
 
+  return std::vector<Manifest::Rule>(parsed.rules().begin(),
+                                     parsed.rules().end());
+}
+
+// Maps each output @a rules declare to its command, a wildcard rule declaring
+// one for every file in @a source its pattern matches right now.
+std::map<std::filesystem::path, Command> expand_rules(
+    const DirectoryTree& source,
+    const std::vector<Manifest::Rule>& rules) {
   std::map<std::filesystem::path, Command> commands;
-  for (const Manifest::Rule& rule : parsed.rules()) {
+  const auto declare = [&](const Manifest::Rule& rule) {
     commands.emplace(rule.output, Command{.output = rule.output,
                                           .action = rule.action,
                                           .text = rule.command});
+  };
+  for (const Manifest::Rule& rule : rules) {
+    if (!rule.is_wildcard()) {
+      declare(rule);
+      continue;
+    }
+    if (rule.wildcard_over_outputs) {
+      continue;  // below, once there are outputs to match
+    }
+    // A directory that is missing or cannot be listed matches nothing.
+    const auto entries = source.ls(rule.wildcard_source.parent_path());
+    if (!entries.has_value()) {
+      continue;
+    }
+    for (const TreeEntry& entry : *entries) {
+      if (!std::holds_alternative<FileInfo>(entry.info)) {
+        continue;
+      }
+      if (const std::optional<Manifest::Rule> matched =
+              Manifest::instantiate(rule, entry.name.generic_string())) {
+        declare(*matched);
+      }
+    }
+  }
+
+  // A wildcard over outputs matches those declared so far, which may be what
+  // lets another match, so go round until nothing is added. The manifest
+  // rejects wildcards that could feed themselves, so this ends.
+  for (bool added = true; added;) {
+    added = false;
+    for (const Manifest::Rule& rule : rules) {
+      if (!rule.wildcard_over_outputs) {
+        continue;
+      }
+      std::vector<Manifest::Rule> matches;
+      for (const auto& [output, command] : commands) {
+        if (output.parent_path() != rule.wildcard_source.parent_path()) {
+          continue;
+        }
+        if (std::optional<Manifest::Rule> matched =
+                Manifest::instantiate(rule, output.filename().generic_string());
+            matched.has_value() && !commands.contains(matched->output)) {
+          matches.push_back(std::move(*matched));
+        }
+      }
+      for (const Manifest::Rule& matched : matches) {
+        declare(matched);
+        added = true;
+      }
+    }
   }
   return commands;
 }
@@ -202,8 +262,14 @@ class BuildDirectoryTree::Impl {
   // runner or a subscriber reading back through us cannot deadlock on it.
   std::mutex m_mutex;
 
+  // The rules of the manifest as last accepted, and every directory whose list
+  // of children decides which files their wildcards match. Touched only by the
+  // constructor and the source-change callback, so unguarded.
+  std::vector<Manifest::Rule> m_rules;
+  std::unordered_set<std::filesystem::path> m_wildcard_directories;
+
   // Every declared output mapped to the command that (re)builds it, following
-  // the manifest as it changes.
+  // the manifest and the files its wildcards match as they change.
   std::map<std::filesystem::path, Command> m_commands;
 
   // Outputs that need (re)building: every output starts stale, a successful
@@ -300,11 +366,11 @@ class BuildDirectoryTree::Impl {
           &m_own_coordinator.emplace(unlimited_permits(), Attribution::none(),
                                      m_own_workers.emplace(1).get_scheduler());
     }
-    const auto commands = read_rules(m_source);
-    if (!commands.has_value()) {
-      throw std::runtime_error(commands.error());
+    auto rules = read_rules(m_source);
+    if (!rules.has_value()) {
+      throw std::runtime_error(rules.error());
     }
-    apply_rules(*commands);
+    set_rules(std::move(*rules));
 
     // Subscribe only once the outputs are in place, so the callback cannot race
     // the constructor.
@@ -780,14 +846,33 @@ class BuildDirectoryTree::Impl {
   // Rereads the manifest and applies its rules, or reports why it cannot and
   // keeps serving the current ones.
   void reload_manifest() {
-    const auto commands = read_rules(m_source);
-    if (!commands.has_value()) {
+    auto rules = read_rules(m_source);
+    if (!rules.has_value()) {
       if (m_on_manifest_error) {
-        m_on_manifest_error(commands.error());
+        m_on_manifest_error(rules.error());
       }
       return;
     }
-    apply_rules(*commands);
+    set_rules(std::move(*rules));
+  }
+
+  // Takes @a rules as the manifest's and declares the outputs they stand for.
+  void set_rules(std::vector<Manifest::Rule> rules) {
+    m_rules = std::move(rules);
+    m_wildcard_directories.clear();
+    for (const Manifest::Rule& rule : m_rules) {
+      if (!rule.is_wildcard()) {
+        continue;
+      }
+      // Its ancestors too, down to the root: the directory itself may be the
+      // thing that comes or goes.
+      std::filesystem::path directory = rule.wildcard_source.parent_path();
+      while (m_wildcard_directories.insert(directory).second &&
+             !directory.empty()) {
+        directory = directory.parent_path();
+      }
+    }
+    apply_rules(expand_rules(m_source, m_rules));
   }
 
   // Brings the declared outputs in line with @a commands: a new rule's output
@@ -861,7 +946,8 @@ class BuildDirectoryTree::Impl {
     invalidate(std::move(changed));
   }
 
-  // Reloads the manifest if it may have changed, then collects the outputs
+  // Reloads the manifest if it may have changed, or matches its wildcards
+  // again if the files they match may have, then collects the outputs
   // depending on whatever changed and invalidates each. Invalidation runs
   // outside the lock, since it may start an eager rebuild.
   void on_source_change(const DirectoryTreeDiff& diff) {
@@ -872,6 +958,12 @@ class BuildDirectoryTree::Impl {
         std::ranges::contains(diff.entries_changed,
                               std::filesystem::path(k_manifest_name))) {
       reload_manifest();
+    } else if (std::ranges::any_of(diff.child_lists_changed,
+                                   [&](const std::filesystem::path& directory) {
+                                     return m_wildcard_directories.contains(
+                                         directory.lexically_normal());
+                                   })) {
+      apply_rules(expand_rules(m_source, m_rules));
     }
 
     std::vector<std::filesystem::path> affected;
