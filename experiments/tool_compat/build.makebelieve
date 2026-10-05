@@ -48,3 +48,9 @@
 @/45.txt = run cmake -E sleep 1 && cmake -E copy input.txt %out
 @/46.txt = run cmake -E sleep 1 && cmake -E copy input.txt %out
 @/47.txt = run cmake -E sleep 1 && cmake -E copy input.txt %out
+
+# The same for tools that run JavaScript, copying input.js.
+@/00.js = run cmake -E sleep 1 && cmake -E copy input.js %out
+@/01.js = run cmake -E sleep 1 && cmake -E copy input.js %out
+@/00.mjs = run cmake -E sleep 1 && cmake -E copy input.js %out
+@/01.mjs = run cmake -E sleep 1 && cmake -E copy input.js %out

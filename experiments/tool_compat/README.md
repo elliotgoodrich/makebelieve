@@ -5,7 +5,9 @@ Checks whether common tools read generated outputs correctly.
 `build.makebelieve` declares 48 outputs, `00.txt` to `47.txt`, each of which
 waits a second and then copies `input.txt`. The scripts mount it, give every
 tool invocation an output of its own, and run the invocation on `input.txt`
-and on its output before the output has been built.
+and on its output before the output has been built. Tools that run
+JavaScript instead use `input.js` and the outputs `00.js`, `01.js`, `00.mjs`
+and `01.mjs` that copy it, on Windows only.
 
 | Result | Meaning |
 | --- | --- |

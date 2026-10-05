@@ -56,7 +56,7 @@ ones that ship with Git for Windows.
 | `git` | `hash-object --no-filters` | Yes |
 | `md5sum` | none | Yes |
 | `more` (`cmd`) | file on standard input | Yes |
-| `node` | `fs.readFileSync`; `fs.createReadStream` | Yes |
+| `node` | `fs.readFileSync`; `fs.createReadStream`; run a `.js` script; run a `.mjs` script; `require()`; `import()` | Yes |
 | `python` | `open().read()`; `mmap` (read-only) | Yes |
 | `robocopy` | `/R:0 /W:0`; `/R:1 /W:1` | Yes, but see [below](#robocopy) |
 | `Select-String` | `-Pattern` | Yes |
