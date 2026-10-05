@@ -153,8 +153,8 @@ TEST_F(RealDirectoryTree, MatchesAnEquivalentInMemoryDirectoryTree) {
 }
 
 // ---------------------------------------------------------------------------
-// Paths that escape the root. status() and ls() collapse every failure into one
-// code, so one table can assert the same expectation across all four calls.
+// Paths that escape the root. Every call reports an escape as one code, so one
+// table can assert the same expectation across all four calls.
 // ---------------------------------------------------------------------------
 
 struct EscapeCase {
@@ -210,11 +210,23 @@ INSTANTIATE_TEST_SUITE_P(
 
 enum class Kind { File, Directory, Error };
 
+// What the OS reports for a path that runs through a file as if it were a
+// directory, and for listing a file.
+#ifdef _WIN32
+constexpr std::errc k_through_a_file = std::errc::no_such_file_or_directory;
+// ERROR_DIRECTORY, which has no portable equivalent.
+const std::error_condition k_listing_a_file(267, std::system_category());
+#else
+constexpr std::errc k_through_a_file = std::errc::not_a_directory;
+const std::error_condition k_listing_a_file = std::errc::not_a_directory;
+#endif
+
 struct StatusCase {
   std::string_view label;
   std::filesystem::path input;
   Kind expected;
   std::size_t size;
+  std::errc error = std::errc::no_such_file_or_directory;
 };
 
 class StatusEntry : public RealDirectoryTree,
@@ -227,7 +239,7 @@ TEST_P(StatusEntry, MatchesExpectation) {
 
   if (c.expected == Kind::Error) {
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), std::errc::no_such_file_or_directory);
+    EXPECT_EQ(result.error(), c.error) << result.error().message();
     return;
   }
 
@@ -259,12 +271,12 @@ INSTANTIATE_TEST_SUITE_P(
         // lexical and never consults the disk.
         StatusCase{"round_trip_through_nothing", "missing/../hello.txt",
                    Kind::File, 11},
-        // Every failure collapses to one code, whatever the OS reported.
+        // A failure is reported as the OS gave it.
         StatusCase{"missing", "missing.txt", Kind::Error, 0},
         StatusCase{"missing_under_a_directory", "sub/missing.txt", Kind::Error,
                    0},
         StatusCase{"file_used_as_a_directory", "hello.txt/nested", Kind::Error,
-                   0}),
+                   0, k_through_a_file}),
     [](const ::testing::TestParamInfo<StatusCase>& info) {
       return std::string(info.param.label);
     });
@@ -297,8 +309,9 @@ TEST_F(RealDirectoryTree, MTimeMatchesTheFileSystem) {
 struct LsCase {
   std::string_view label;
   std::filesystem::path input;
-  // nullopt means the call is expected to fail.
+  // nullopt means the call is expected to fail, with `error`.
   std::optional<std::vector<std::string>> expected;
+  std::error_condition error = std::errc::no_such_file_or_directory;
 };
 
 class LsListing : public RealDirectoryTree,
@@ -311,7 +324,7 @@ TEST_P(LsListing, MatchesExpectation) {
 
   if (!c.expected.has_value()) {
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), std::errc::no_such_file_or_directory);
+    EXPECT_EQ(result.error(), c.error) << result.error().message();
     return;
   }
 
@@ -331,8 +344,8 @@ INSTANTIATE_TEST_SUITE_P(
         LsCase{"round_trip_through_nothing", "missing/../sub",
                std::vector<std::string>{"deeper", "nested.txt"}},
         // Listing a file is an error, as is listing what is not there.
-        LsCase{"file", "hello.txt", std::nullopt},
-        LsCase{"nested_file", "sub/nested.txt", std::nullopt},
+        LsCase{"file", "hello.txt", std::nullopt, k_listing_a_file},
+        LsCase{"nested_file", "sub/nested.txt", std::nullopt, k_listing_a_file},
         LsCase{"missing", "missing", std::nullopt}),
     [](const ::testing::TestParamInfo<LsCase>& info) {
       return std::string(info.param.label);

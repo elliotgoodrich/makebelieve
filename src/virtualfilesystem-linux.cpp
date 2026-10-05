@@ -478,7 +478,7 @@ class VirtualFileSystem::Impl {
           out->st_nlink = 2;
           return 0;
         default:
-          return -ENOENT;
+          return -to_errno(status.error());
       }
     }
 
