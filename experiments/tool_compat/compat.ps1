@@ -15,7 +15,8 @@ if (-not (Test-Path $Makebelieve)) { throw "makebelieve not found at $Makebeliev
 $work = Join-Path ([IO.Path]::GetTempPath()) "makebelieve-compat-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
 $srcdir = "$work\src"; $destdir = "$work\dest"; $mnt = "$work\mnt"
 New-Item -ItemType Directory -Force $srcdir, $destdir | Out-Null
-Copy-Item "$PSScriptRoot\build.makebelieve", "$PSScriptRoot\input.txt" $srcdir
+Copy-Item "$PSScriptRoot\build.makebelieve", "$PSScriptRoot\input.txt", "$PSScriptRoot\input.js" $srcdir
+Copy-Item "$PSScriptRoot\input.js" "$srcdir\input.mjs"
 $src = "$srcdir\input.txt"
 $gitusr = if (Get-Command git -ErrorAction SilentlyContinue) {
   Join-Path (Split-Path (Split-Path (Get-Command git).Source)) 'usr\bin'
@@ -42,8 +43,12 @@ function ChromeText([string]$url) {
 }
 
 # Tool, flags tested, the program it needs (if any), and a script block taking
-# the file under test that returns output to compare with the source's.
-function T($tool, $flags, $needs, $run) { [pscustomobject]@{ Tool = $tool; Flags = $flags; Needs = $needs; Run = $run } }
+# the file under test that returns output to compare with the source's. The
+# source is input.txt unless another is named, and its outputs share its
+# extension.
+function T($tool, $flags, $needs, $run, $source = 'input.txt') {
+  [pscustomobject]@{ Tool = $tool; Flags = $flags; Needs = $needs; Run = $run; Source = $source }
+}
 $tests = @(
   T 'cat' 'none' "$gitusr\cat.exe" { param($p) & "$gitusr\cat.exe" (Slash $p) | Out-String }
   T 'certutil' '`-hashfile FILE MD5`' 'certutil' { param($p) (certutil -hashfile $p MD5)[1] }
@@ -75,6 +80,10 @@ $tests = @(
   T 'more (cmd)' 'file on standard input' $null { param($p) cmd /c "more < `"$p`"" | Out-String }
   T 'node' '`fs.readFileSync`' 'node' { param($p) node -e "console.log(require('fs').readFileSync(process.argv[1]).subarray(-40).toString())" $p }
   T 'node' '`fs.createReadStream`' 'node' { param($p) node -e "let n=0; require('fs').createReadStream(process.argv[1]).on('data',c=>n+=c.length).on('end',()=>console.log(n))" $p }
+  T 'node' 'run a `.js` script' 'node' { param($p) node $p } 'input.js'
+  T 'node' 'run a `.mjs` script' 'node' { param($p) node $p } 'input.mjs'
+  T 'node' '`require()`' 'node' { param($p) node -e "require(process.argv[1])" $p } 'input.js'
+  T 'node' '`import()`' 'node' { param($p) node -e "import(require('url').pathToFileURL(process.argv[1]))" $p } 'input.mjs'
   T 'python' '`open().read()`' 'python' { param($p) python -c "import sys; print(open(sys.argv[1], 'rb').read()[-40:])" $p }
   T 'python' '`mmap` (read-only)' 'python' { param($p) python -c "import mmap, sys; f = open(sys.argv[1], 'rb'); print(mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)[-40:])" $p }
   T 'robocopy' '`/R:0 /W:0`' 'robocopy' { param($p) $d = Fresh; robocopy (Split-Path $p) $d (Leaf $p) /R:0 /W:0 | Out-Null; if (Test-Path "$d\$(Leaf $p)") { [IO.File]::ReadAllText("$d\$(Leaf $p)") } }
@@ -104,16 +113,17 @@ try {
 
   '| Tool | Flags tested | Compatible |'
   '| --- | --- | --- |'
-  $i = 0
+  $next = @{}
   foreach ($t in $tests) {
     if ($Only -and $t.Tool -notmatch $Only) { continue }
     if ($t.Needs -and -not (Get-Command $t.Needs -ErrorAction SilentlyContinue)) {
       "| $(Name $t.Tool) | $($t.Flags) | Not installed |"
       continue
     }
-    $output = '{0}\{1:D2}.txt' -f $mnt, $i
-    $i++
-    $expected = (& $t.Run $src 2>&1 | Out-String).Trim()
+    $ext = [IO.Path]::GetExtension($t.Source)
+    $output = '{0}\{1:D2}{2}' -f $mnt, [int]$next[$ext], $ext
+    $next[$ext] = [int]$next[$ext] + 1
+    $expected = (& $t.Run "$srcdir\$($t.Source)" 2>&1 | Out-String).Trim()
     $actual = (& $t.Run $output 2>&1 | Out-String).Trim()
     $result = if ($actual -ceq $expected) { 'Yes' } else { 'No' }
     "| $(Name $t.Tool) | $($t.Flags) | $result |"
