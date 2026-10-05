@@ -307,68 +307,64 @@ std::optional<std::filesystem::path> RealDirectoryTree::Impl::resolve(
 
 std::expected<EntryInfo, std::error_code> RealDirectoryTree::Impl::status(
     const std::filesystem::path& path) const {
-  // resolve() yields nullopt for an escape and the stat step yields nullopt for
-  // an on-disk failure; both collapse to one absent optional, which the tail
-  // turns into the single error code the interface promises for "no such
-  // entry". A caller that needs to tell the two apart does not exist yet.
-  const std::optional<EntryInfo> found = resolve(path).and_then(
-      [](const std::filesystem::path& absolute) -> std::optional<EntryInfo> {
-        WIN32_FILE_ATTRIBUTE_DATA data{};
-        if (!GetFileAttributesExW(absolute.c_str(), GetFileExInfoStandard,
-                                  &data)) {
-          return std::nullopt;
-        }
-        return make_info(data.dwFileAttributes, data.nFileSizeHigh,
-                         data.nFileSizeLow, data.ftLastWriteTime);
-      });
-
-  if (found.has_value()) {
-    return *found;
+  // An escape reads as "no such entry"; an on-disk failure is reported as the
+  // OS gave it, so a mount can tell a reader "access denied" or "path not
+  // found" rather than claiming the entry itself is missing.
+  const std::optional<std::filesystem::path> absolute = resolve(path);
+  if (!absolute.has_value()) {
+    return std::unexpected(
+        std::make_error_code(std::errc::no_such_file_or_directory));
   }
-  return std::unexpected(
-      std::make_error_code(std::errc::no_such_file_or_directory));
+  WIN32_FILE_ATTRIBUTE_DATA data{};
+  if (!GetFileAttributesExW(absolute->c_str(), GetFileExInfoStandard, &data)) {
+    return std::unexpected(last_error_code());
+  }
+  return make_info(data.dwFileAttributes, data.nFileSizeHigh, data.nFileSizeLow,
+                   data.ftLastWriteTime);
 }
 
 std::expected<std::vector<TreeEntry>, std::error_code>
 RealDirectoryTree::Impl::ls(const std::filesystem::path& path) const {
-  // and_then runs the enumeration only for a path that stayed inside the root.
-  // A present-but-empty vector (an empty directory) is a success; only a failed
-  // FindFirstFileExW yields nullopt and therefore the error below.
-  const std::optional<std::vector<TreeEntry>> listed =
-      resolve(path).and_then([](const std::filesystem::path& absolute)
-                                 -> std::optional<std::vector<TreeEntry>> {
-        // FindExInfoBasic skips the 8.3 short name, which we never use, and
-        // LARGE_FETCH batches directory reads. Both matter for the wide
-        // directories a build tree tends to have.
-        WIN32_FIND_DATAW data{};
-        const std::filesystem::path pattern = absolute / L"*";
-        const UniqueFindHandle find(FindFirstFileExW(
-            pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch,
-            nullptr, FIND_FIRST_EX_LARGE_FETCH));
-        if (!find.valid()) {
-          return std::nullopt;
-        }
-
-        std::vector<TreeEntry> entries;
-        do {
-          const std::wstring_view name = data.cFileName;
-          if (name == L"." || name == L"..") {
-            continue;
-          }
-          entries.emplace_back(
-              std::filesystem::path(name),
-              make_info(data.dwFileAttributes, data.nFileSizeHigh,
-                        data.nFileSizeLow, data.ftLastWriteTime));
-        } while (FindNextFileW(find.get(), &data));
-
-        return entries;
-      });
-
-  if (listed.has_value()) {
-    return *listed;
+  // An escape reads as "no such entry"; a failure to list the directory is
+  // reported as the OS gave it. A present-but-empty vector (an empty
+  // directory) is a success.
+  const std::optional<std::filesystem::path> resolved = resolve(path);
+  if (!resolved.has_value()) {
+    return std::unexpected(
+        std::make_error_code(std::errc::no_such_file_or_directory));
   }
-  return std::unexpected(
-      std::make_error_code(std::errc::no_such_file_or_directory));
+  // FindExInfoBasic skips the 8.3 short name, which we never use, and
+  // LARGE_FETCH batches directory reads. Both matter for the wide directories a
+  // build tree tends to have.
+  WIN32_FIND_DATAW data{};
+  const std::filesystem::path pattern = *resolved / L"*";
+  const UniqueFindHandle find(FindFirstFileExW(
+      pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr,
+      FIND_FIRST_EX_LARGE_FETCH));
+  if (!find.valid()) {
+    // Only a volume's root has no "." to find, and so reports an empty listing
+    // this way.
+    if (GetLastError() == ERROR_FILE_NOT_FOUND) {
+      return std::vector<TreeEntry>{};
+    }
+    return std::unexpected(last_error_code());
+  }
+
+  std::vector<TreeEntry> entries;
+  do {
+    const std::wstring_view name = data.cFileName;
+    if (name == L"." || name == L"..") {
+      continue;
+    }
+    entries.emplace_back(std::filesystem::path(name),
+                         make_info(data.dwFileAttributes, data.nFileSizeHigh,
+                                   data.nFileSizeLow, data.ftLastWriteTime));
+  } while (FindNextFileW(find.get(), &data));
+  // FindNextFileW reports the end and a failure the same way.
+  if (GetLastError() != ERROR_NO_MORE_FILES) {
+    return std::unexpected(last_error_code());
+  }
+  return entries;
 }
 
 std::expected<std::string, std::error_code> RealDirectoryTree::Impl::read(

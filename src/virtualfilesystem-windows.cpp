@@ -599,7 +599,7 @@ class VirtualFileSystem::Impl {
     const std::expected<EntryInfo, std::error_code> status =
         m_tree.status(to_tree_path(name));
     if (!status.has_value()) {
-      return STATUS_OBJECT_NAME_NOT_FOUND;
+      return to_ntstatus(status.error());
     }
 
     if (attributes != nullptr) {
@@ -651,7 +651,7 @@ class VirtualFileSystem::Impl {
     const std::filesystem::path path = to_tree_path(name);
     std::expected<EntryInfo, std::error_code> status = m_tree.status(path);
     if (!status) {
-      return STATUS_OBJECT_NAME_NOT_FOUND;
+      return to_ntstatus(status.error());
     }
     static_cast<void>(granted_access);
 

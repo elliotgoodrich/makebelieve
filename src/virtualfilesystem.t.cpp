@@ -685,6 +685,52 @@ class FailingReadTree : public makebelieve::DirectoryTree {
   }
 };
 
+// Forwards to another tree but fails status() of one path with a fixed error,
+// to see what someone looking that path up through the mount is told.
+class FailingStatusTree : public makebelieve::DirectoryTree {
+  const makebelieve::DirectoryTree& m_inner;
+  std::filesystem::path m_path;
+  std::error_code m_error;
+
+ public:
+  FailingStatusTree(const makebelieve::DirectoryTree& inner,
+                    std::filesystem::path path,
+                    std::error_code error)
+      : m_inner(inner), m_path(std::move(path)), m_error(error) {}
+
+  [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
+      const std::filesystem::path& path) const override {
+    if (path == m_path) {
+      return std::unexpected(m_error);
+    }
+    return m_inner.status(path);
+  }
+
+  [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
+                              std::error_code>
+  ls(const std::filesystem::path& path) const override {
+    return m_inner.ls(path);
+  }
+
+  [[nodiscard]] makebelieve::OpenSender open(
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& context) const override {
+    return m_inner.open(path, context);
+  }
+
+  [[nodiscard]] makebelieve::ReadSender read(const std::filesystem::path& path,
+                                             makebelieve::Offset offset,
+                                             std::size_t size) const override {
+    return m_inner.read(path, offset, size);
+  }
+
+  [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
+      const std::function<void(const makebelieve::DirectoryTreeDiff&)>&
+          callback) const override {
+    return m_inner.subscribe_to_changes(callback);
+  }
+};
+
 // Forwards to an in-memory tree, but open() writes a file's final contents
 // first, like BuildDirectoryTree. Counts its opens.
 class SettleOnOpenTree : public makebelieve::DirectoryTree {
@@ -1552,6 +1598,33 @@ TEST_F(VirtualFileSystem, SurfacesTheTreesReadError) {
     const makebelieve::VirtualFileSystem vfs(failing, at, notifier());
     const std::error_code error = read_error(at / "a.txt");
     EXPECT_TRUE(error == std::errc::permission_denied)
+        << error.value() << ": " << error.message();
+  }
+}
+
+// A path the tree cannot look up for some reason other than its absence is not
+// reported as missing: the reader is told why, in either category the tree
+// used, and an error with no platform meaning reads as an I/O error.
+TEST_F(VirtualFileSystem, SurfacesTheTreesStatusError) {
+  tree().write_file("a.txt", "abc");
+  struct Case {
+    std::error_code reported;
+    std::error_condition expected;
+  };
+  const std::array<Case, 3> cases{
+      Case{std::make_error_code(std::errc::permission_denied),
+           std::errc::permission_denied},
+      Case{native_access_denied(), std::errc::permission_denied},
+      Case{std::make_error_code(std::future_errc::broken_promise),
+           native_io_error().default_error_condition()}};
+  for (std::size_t i = 0; i < cases.size(); ++i) {
+    SCOPED_TRACE(cases[i].reported.message());
+    const FailingStatusTree failing(tree(), "a.txt", cases[i].reported);
+    const std::filesystem::path at =
+        scratch() / ("failing" + std::to_string(i));
+    const makebelieve::VirtualFileSystem vfs(failing, at, notifier());
+    const std::error_code error = read_error(at / "a.txt");
+    EXPECT_TRUE(error == cases[i].expected)
         << error.value() << ": " << error.message();
   }
 }

@@ -199,82 +199,73 @@ std::optional<std::filesystem::path> RealDirectoryTree::Impl::resolve(
 
 std::expected<EntryInfo, std::error_code> RealDirectoryTree::Impl::status(
     const std::filesystem::path& path) const {
-  // resolve() yields nullopt for an escape and the stat step yields nullopt for
-  // an on-disk failure; both collapse to one absent optional, which the tail
-  // turns into the single error code the interface promises for "no such
-  // entry". A caller that needs to tell the two apart does not exist yet.
-  const std::optional<EntryInfo> found = resolve(path).and_then(
-      [](const std::filesystem::path& absolute) -> std::optional<EntryInfo> {
-        // stat, not lstat: a symlink inside the root is followed, matching the
-        // documented behaviour (and the lexical-only escape guard above).
-        struct stat info {};
-        if (::stat(absolute.c_str(), &info) != 0) {
-          return std::nullopt;
-        }
-        return make_info(info);
-      });
-
-  if (found.has_value()) {
-    return *found;
+  // An escape reads as "no such entry"; an on-disk failure is reported as the
+  // OS gave it, so a mount can tell a reader "permission denied" or "not a
+  // directory" rather than claiming the entry is missing.
+  const std::optional<std::filesystem::path> absolute = resolve(path);
+  if (!absolute.has_value()) {
+    return std::unexpected(
+        std::make_error_code(std::errc::no_such_file_or_directory));
   }
-  return std::unexpected(
-      std::make_error_code(std::errc::no_such_file_or_directory));
+  // stat, not lstat: a symlink inside the root is followed, matching the
+  // documented behaviour (and the lexical-only escape guard above).
+  struct stat info {};
+  if (::stat(absolute->c_str(), &info) != 0) {
+    return std::unexpected(last_error_code());
+  }
+  return make_info(info);
 }
 
 std::expected<std::vector<TreeEntry>, std::error_code>
 RealDirectoryTree::Impl::ls(const std::filesystem::path& path) const {
-  // and_then runs the enumeration only for a path that stayed inside the root.
-  // A present-but-empty vector (an empty directory) is a success; only a failed
-  // opendir yields nullopt and therefore the error below.
-  const std::optional<std::vector<TreeEntry>> listed =
-      resolve(path).and_then([](const std::filesystem::path& absolute)
-                                 -> std::optional<std::vector<TreeEntry>> {
-        const UniqueDir dir(::opendir(absolute.c_str()), &::closedir);
-        if (dir == nullptr) {
-          return std::nullopt;
-        }
-        const int dir_fd = ::dirfd(dir.get());
-
-        std::vector<TreeEntry> entries;
-        while (true) {
-          // readdir reports end of directory and failure the same way, by
-          // returning null, so a cleared errno is the only thing that tells
-          // the two apart. It is cleared every iteration rather than once,
-          // because the fstatat below leaves one behind for every entry it
-          // skips.
-          errno = 0;
-          const dirent* entry = ::readdir(dir.get());
-          if (entry == nullptr) {
-            if (errno != 0) {
-              return std::nullopt;  // A real failure, not the end.
-            }
-            break;
-          }
-
-          const std::string_view name = entry->d_name;
-          if (name == "." || name == "..") {
-            continue;
-          }
-          // fstatat relative to the directory fd avoids rebuilding a full path
-          // per entry. An entry that vanished between readdir and here, or is
-          // unreachable, is skipped rather than failing the whole listing -
-          // the same tolerance the Windows backend has by omitting what it
-          // cannot describe.
-          struct stat info {};
-          if (::fstatat(dir_fd, entry->d_name, &info, 0) != 0) {
-            continue;
-          }
-          entries.push_back(
-              {.name = std::filesystem::path(name), .info = make_info(info)});
-        }
-        return entries;
-      });
-
-  if (listed.has_value()) {
-    return *listed;
+  // An escape reads as "no such entry"; a failure to open or read the
+  // directory is reported as the OS gave it. A present-but-empty vector (an
+  // empty directory) is a success.
+  const std::optional<std::filesystem::path> resolved = resolve(path);
+  if (!resolved.has_value()) {
+    return std::unexpected(
+        std::make_error_code(std::errc::no_such_file_or_directory));
   }
-  return std::unexpected(
-      std::make_error_code(std::errc::no_such_file_or_directory));
+  const UniqueDir dir(::opendir(resolved->c_str()), &::closedir);
+  if (dir == nullptr) {
+    return std::unexpected(last_error_code());
+  }
+  const int dir_fd = ::dirfd(dir.get());
+
+  std::vector<TreeEntry> entries;
+  while (true) {
+    // readdir reports end of directory and failure the same way, by
+    // returning null, so a cleared errno is the only thing that tells
+    // the two apart. It is cleared every iteration rather than once,
+    // because the fstatat below leaves one behind for every entry it
+    // skips.
+    errno = 0;
+    const dirent* entry = ::readdir(dir.get());
+    if (entry == nullptr) {
+      if (errno != 0) {
+        // A real failure, not the end.
+        return std::unexpected(last_error_code());
+      }
+      break;
+    }
+
+    const std::string_view name = entry->d_name;
+    if (name == "." || name == "..") {
+      continue;
+    }
+    // fstatat relative to the directory fd avoids rebuilding a full path
+    // per entry. An entry that vanished between readdir and here, or is
+    // unreachable, is skipped rather than failing the whole listing -
+    // the same tolerance the Windows backend has by omitting what it
+    // cannot describe.
+    struct stat info {};
+    if (::fstatat(dir_fd, entry->d_name, &info, 0) != 0) {
+      continue;
+    }
+    entries.push_back(
+        {.name = std::filesystem::path(name), .info = make_info(info)});
+  }
+  return entries;
 }
 
 // offset and size are the signature DirectoryTree::read() defines, so they
