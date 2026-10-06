@@ -10,13 +10,12 @@
 
 namespace makebelieve {
 
-/// @class IoContextPoller
-/// The platform half of `IoContext`: the handles registered with it, and one
-/// blocking wait until some of them are ready or it is woken. Used only from
-/// the context's thread, except for `wake`.
-class IoContextPoller {
-  struct State;
-  std::unique_ptr<State> m_state;
+/// @class NativeHandlePoller
+/// This is a mechanism to wait on multiple operating-system handles at once,
+/// while being able to be woken up from another thread.
+class NativeHandlePoller {
+  struct Impl;
+  std::unique_ptr<Impl> m_impl;
 
  public:
   /// What one blocking wait turned up: the key a ready handle was registered
@@ -24,20 +23,21 @@ class IoContextPoller {
   /// ready.
   using Ready = std::pair<void*, std::error_code>;
 
+  /// Creates a `NativeHandlePoller` currently waiting on no handles.
   /// @throws std::system_error if the platform's wait cannot be set up.
-  IoContextPoller();
-  ~IoContextPoller();
+  NativeHandlePoller();
+  ~NativeHandlePoller();
 
-  IoContextPoller(const IoContextPoller&) = delete;
-  IoContextPoller& operator=(const IoContextPoller&) = delete;
-  IoContextPoller(IoContextPoller&&) = delete;
-  IoContextPoller& operator=(IoContextPoller&&) = delete;
+  NativeHandlePoller(const NativeHandlePoller&) = delete;
+  NativeHandlePoller& operator=(const NativeHandlePoller&) = delete;
+  NativeHandlePoller(NativeHandlePoller&&) = delete;
+  NativeHandlePoller& operator=(NativeHandlePoller&&) = delete;
 
-  /// Starts watching @a handle, reporting it under @a key; the error if it
-  /// cannot be watched.
+  /// Starts watching @a handle, reporting it under @a key; returns an error if
+  /// it cannot be watched.
   [[nodiscard]] std::error_code add(NativeHandle handle, void* key);
 
-  /// Stops watching @a handle, which was added under @a key.
+  /// Stops watching @a handle, which was previously added under @a key.
   void remove(NativeHandle handle, void* key) noexcept;
 
   /// Blocks until a watched handle is ready or `wake` is called, appending

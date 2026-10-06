@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-#include "iocontextpoller.hpp"
+#include "nativehandlepoller.hpp"
 
 #include <array>
 #include <cerrno>
@@ -24,11 +24,11 @@ std::error_code last_error_code() {
 
 // An epoll instance, and an eventfd registered with it under a null key that
 // wake() writes to.
-struct IoContextPoller::State {
+struct NativeHandlePoller::Impl {
   int epoll = -1;
   int wakeup = -1;
 
-  State() {
+  Impl() {
     epoll = ::epoll_create1(EPOLL_CLOEXEC);
     if (epoll < 0) {
       throw std::system_error(last_error_code(), "epoll_create1");
@@ -48,38 +48,38 @@ struct IoContextPoller::State {
     }
   }
 
-  ~State() {
+  ~Impl() {
     ::close(wakeup);
     ::close(epoll);
   }
 
-  State(const State&) = delete;
-  State& operator=(const State&) = delete;
-  State(State&&) = delete;
-  State& operator=(State&&) = delete;
+  Impl(const Impl&) = delete;
+  Impl& operator=(const Impl&) = delete;
+  Impl(Impl&&) = delete;
+  Impl& operator=(Impl&&) = delete;
 };
 
-IoContextPoller::IoContextPoller() : m_state(std::make_unique<State>()) {}
+NativeHandlePoller::NativeHandlePoller() : m_impl(std::make_unique<Impl>()) {}
 
-IoContextPoller::~IoContextPoller() = default;
+NativeHandlePoller::~NativeHandlePoller() = default;
 
-std::error_code IoContextPoller::add(NativeHandle handle, void* key) {
+std::error_code NativeHandlePoller::add(NativeHandle handle, void* key) {
   // Level-triggered: a descriptor the caller has not drained is reported
   // again, which is what a fresh wait on it should see.
   epoll_event event{.events = EPOLLIN, .data = {.ptr = key}};
-  if (::epoll_ctl(m_state->epoll, EPOLL_CTL_ADD, handle, &event) != 0) {
+  if (::epoll_ctl(m_impl->epoll, EPOLL_CTL_ADD, handle, &event) != 0) {
     return last_error_code();
   }
   return {};
 }
 
-void IoContextPoller::remove(NativeHandle handle, void* /*key*/) noexcept {
-  ::epoll_ctl(m_state->epoll, EPOLL_CTL_DEL, handle, nullptr);
+void NativeHandlePoller::remove(NativeHandle handle, void* /*key*/) noexcept {
+  ::epoll_ctl(m_impl->epoll, EPOLL_CTL_DEL, handle, nullptr);
 }
 
-void IoContextPoller::wait(std::vector<Ready>& ready) {
+void NativeHandlePoller::wait(std::vector<Ready>& ready) {
   std::array<epoll_event, 64> events{};
-  const int count = ::epoll_wait(m_state->epoll, events.data(),
+  const int count = ::epoll_wait(m_impl->epoll, events.data(),
                                  static_cast<int>(events.size()), -1);
   // EINTR, or a failure there is nothing to do about but try again.
   for (int i = 0; i < count; ++i) {
@@ -89,7 +89,7 @@ void IoContextPoller::wait(std::vector<Ready>& ready) {
       // A cast does not silence warn_unused_result on GCC, so the result is
       // bound and discarded: a failed read only means another wake-up.
       const ssize_t drained =
-          ::read(m_state->wakeup, &discarded, sizeof(discarded));
+          ::read(m_impl->wakeup, &discarded, sizeof(discarded));
       static_cast<void>(drained);
     } else {
       // A hang-up or error counts as ready: the caller's read reports it.
@@ -98,10 +98,10 @@ void IoContextPoller::wait(std::vector<Ready>& ready) {
   }
 }
 
-void IoContextPoller::wake() noexcept {
+void NativeHandlePoller::wake() noexcept {
   const std::uint64_t one = 1;
   // Only a counter at its maximum fails, and that is already a wake-up.
-  const ssize_t written = ::write(m_state->wakeup, &one, sizeof(one));
+  const ssize_t written = ::write(m_impl->wakeup, &one, sizeof(one));
   static_cast<void>(written);
 }
 

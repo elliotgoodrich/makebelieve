@@ -39,7 +39,7 @@ add_library(makebelieve_core STATIC
   filesystemutil.cpp
   inmemorydirectorytree.cpp
   iocontext.cpp
-  iocontext-${MAKEBELIEVE_PLATFORM}.cpp
+  nativehandlepoller-${MAKEBELIEVE_PLATFORM}.cpp
   manifest.cpp
   processattribution-${MAKEBELIEVE_PLATFORM}.cpp
   processinfo-${MAKEBELIEVE_PLATFORM}.cpp
