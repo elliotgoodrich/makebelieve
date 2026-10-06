@@ -3,15 +3,18 @@
 
 #include "intrusivetask.hpp"
 #include "nativehandle.hpp"
+#include "nativehandlepoller.hpp"
 
 #include <exec/repeat_until.hpp>
 #include <stdexec/execution.hpp>
 
 #include <concepts>
-#include <memory>
+#include <mutex>
 #include <optional>
 #include <system_error>
+#include <thread>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 
 namespace makebelieve {
@@ -70,14 +73,27 @@ class IoContext {
                    OnReady on_ready);
 
  private:
-  class Impl;
   class Wait;
   template <class Receiver>
   class ScheduleOperation;
   template <class Receiver>
   class WaitOperation;
 
-  std::unique_ptr<Impl> m_impl;
+  NativeHandlePoller m_poller;
+
+  // Guards the queues below, which any thread may add to.
+  std::mutex m_mutex;
+  IntrusiveTask* m_first_task = nullptr;
+  IntrusiveTask* m_last_task = nullptr;
+  Wait* m_cancels = nullptr;
+  bool m_stopping = false;
+
+  // The waits whose handles are with the poller. Touched only by the context's
+  // thread.
+  std::unordered_set<Wait*> m_registered;
+
+  // Declared last so that everything it uses exists before it starts.
+  std::jthread m_thread;
 
   // Thread-safe: queue @a task to run on the context's thread.
   void submit(IntrusiveTask& task) noexcept;
@@ -87,6 +103,12 @@ class IoContext {
 
   // On the context's thread: arm @a wait and register its handle.
   void begin_wait(Wait& wait) noexcept;
+
+  // The context's thread.
+  void run();
+
+  // On the context's thread: resolves @a wait, which is no longer registered.
+  void finish(Wait& wait, std::error_code error, bool stopped) noexcept;
 };
 
 // A wait on one handle, as an `IoContext` keeps it while it is registered:
