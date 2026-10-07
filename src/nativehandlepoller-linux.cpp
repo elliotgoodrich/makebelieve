@@ -22,8 +22,8 @@ std::error_code last_error_code() {
 
 }  // namespace
 
-// An epoll instance, and an eventfd registered with it under a null key that
-// wake() writes to.
+// An epoll instance, and an eventfd registered with it under a null context
+// that wake() writes to.
 struct NativeHandlePoller::Impl {
   int epoll = -1;
   int wakeup = -1;
@@ -63,28 +63,30 @@ NativeHandlePoller::NativeHandlePoller() : m_impl(std::make_unique<Impl>()) {}
 
 NativeHandlePoller::~NativeHandlePoller() = default;
 
-std::error_code NativeHandlePoller::add(NativeHandle handle, void* key) {
+// The registration is the descriptor itself, which is all epoll removes by.
+NativeHandlePoller::Token NativeHandlePoller::add(NativeHandle handle,
+                                                  void* context) {
   // Level-triggered: a descriptor the caller has not drained is reported
   // again, which is what a fresh wait on it should see.
-  epoll_event event{.events = EPOLLIN, .data = {.ptr = key}};
+  epoll_event event{.events = EPOLLIN, .data = {.ptr = context}};
   if (::epoll_ctl(m_impl->epoll, EPOLL_CTL_ADD, handle, &event) != 0) {
-    return last_error_code();
+    throw std::system_error(last_error_code(), "epoll_ctl");
   }
-  return {};
+  return static_cast<Token>(handle);
 }
 
-void NativeHandlePoller::remove(NativeHandle handle, void* /*key*/) noexcept {
-  ::epoll_ctl(m_impl->epoll, EPOLL_CTL_DEL, handle, nullptr);
+void NativeHandlePoller::remove(Token token) noexcept {
+  ::epoll_ctl(m_impl->epoll, EPOLL_CTL_DEL, static_cast<int>(token), nullptr);
 }
 
-void NativeHandlePoller::wait(std::vector<Ready>& ready) {
+void NativeHandlePoller::wait(std::vector<void*>& ready) {
   std::array<epoll_event, 64> events{};
   const int count = ::epoll_wait(m_impl->epoll, events.data(),
                                  static_cast<int>(events.size()), -1);
   // EINTR, or a failure there is nothing to do about but try again.
   for (int i = 0; i < count; ++i) {
-    void* const key = events[static_cast<std::size_t>(i)].data.ptr;
-    if (key == nullptr) {
+    void* const context = events[static_cast<std::size_t>(i)].data.ptr;
+    if (context == nullptr) {
       std::uint64_t discarded = 0;
       // A cast does not silence warn_unused_result on GCC, so the result is
       // bound and discarded: a failed read only means another wake-up.
@@ -93,7 +95,7 @@ void NativeHandlePoller::wait(std::vector<Ready>& ready) {
       static_cast<void>(drained);
     } else {
       // A hang-up or error counts as ready: the caller's read reports it.
-      ready.emplace_back(key, std::error_code{});
+      ready.push_back(context);
     }
   }
 }
