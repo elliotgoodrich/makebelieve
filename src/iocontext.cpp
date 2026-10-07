@@ -3,6 +3,8 @@
 
 #include "tracer.hpp"
 
+#include <cassert>
+#include <cstddef>
 #include <mutex>
 #include <system_error>
 #include <utility>
@@ -51,15 +53,12 @@ void IoContext::begin_wait(Wait& wait) noexcept {
   wait.arm();
   std::error_code error;
   try {
-    m_registered.insert(&wait);
+    wait.registration = m_poller.add(wait.handle, &wait);
+    ++m_registered;
+  } catch (const std::system_error& e) {
+    error = e.code();
   } catch (...) {
     error = std::make_error_code(std::errc::not_enough_memory);
-  }
-  if (!error) {
-    error = m_poller.add(wait.handle, &wait);
-    if (error) {
-      m_registered.erase(&wait);
-    }
   }
   if (error) {
     finish(wait, error, false);
@@ -68,7 +67,7 @@ void IoContext::begin_wait(Wait& wait) noexcept {
 
 void IoContext::run() {
   MB_TRACE_THREAD_NAME("io");
-  std::vector<NativeHandlePoller::Ready> ready;
+  std::vector<void*> ready;
   while (true) {
     IntrusiveTask* tasks = nullptr;
     Wait* cancels = nullptr;
@@ -93,35 +92,35 @@ void IoContext::run() {
 
     // A cancellation queued by a stop callback that fires while its wait is
     // armed above waits for the next pass; the poller has been woken for it.
+    // Each wait here is still registered: finishing a wait first drops any
+    // cancellation still queued for it.
     while (cancels != nullptr) {
       Wait* const wait = std::exchange(cancels, cancels->next_cancel);
-      if (m_registered.erase(wait) != 0) {
-        m_poller.remove(wait->handle, wait);
-        finish(*wait, {}, true);
-      }
+      unregister(*wait);
+      finish(*wait, {}, true);
     }
 
     if (stopping) {
-      // Nothing should be left waiting; stop whatever is rather than hang.
-      for (Wait* const wait : std::exchange(m_registered, {})) {
-        m_poller.remove(wait->handle, wait);
-        finish(*wait, {}, true);
-      }
+      assert(m_registered == 0 && "IoContext destroyed while still waiting");
       return;
     }
 
+    // Each wait is reported at most once, and none can be freed by another's
+    // completion before it has completed itself, so each is still registered.
     ready.clear();
     m_poller.wait(ready);
-    for (const auto& [key, error] : ready) {
-      auto* const wait = static_cast<Wait*>(key);
-      // Only a wait still registered: an earlier one in this batch may have
-      // completed and freed another.
-      if (m_registered.erase(wait) != 0) {
-        m_poller.remove(wait->handle, wait);
-        finish(*wait, error, false);
-      }
+    for (void* const context : ready) {
+      auto* const wait = static_cast<Wait*>(context);
+      unregister(*wait);
+      finish(*wait, {}, false);
     }
   }
+}
+
+void IoContext::unregister(Wait& wait) noexcept {
+  assert(m_registered > 0);
+  --m_registered;
+  m_poller.remove(wait.registration);
 }
 
 // The stop callback goes first, so none can queue a cancellation after the one

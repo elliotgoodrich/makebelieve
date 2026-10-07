@@ -2,11 +2,10 @@
 #include "nativehandlepoller.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <system_error>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include <windows.h>
@@ -19,23 +18,34 @@ std::error_code last_error_code() {
   return {static_cast<int>(GetLastError()), std::system_category()};
 }
 
-// What a handle's wait posts to the port once it is signalled: the key it was
-// added under and which registration of that key it was, so a completion
-// posted just before the wait was removed cannot be mistaken for one from a
-// later wait that reuses the key.
-struct Registration {
+// One handle's wait, which posts itself to the port, as the completion key,
+// once the handle is signalled. Its address is the registration `add` hands
+// out. A packet cannot be taken back out of the port, so one posted just
+// before the wait was removed keeps it alive until wait() dequeues it.
+struct RegisteredWait {
   HANDLE port;
-  void* key;
-  DWORD generation;
+  void* context;
   HANDLE wait = nullptr;
+
+  // Set on the system's wait thread just before posting, which happens at
+  // most once.
+  std::atomic<bool> posted = false;
+
+  // On the context's thread: whether wait() has dequeued the packet, and
+  // whether remove() has left the wait for wait() to free.
+  bool consumed = false;
+  bool removed = false;
+
+  RegisteredWait(HANDLE port, void* context) noexcept
+      : port(port), context(context) {}
 };
 
 // Runs on one of the system's wait threads, so it only posts.
 void CALLBACK on_signalled(void* context, BOOLEAN /*timed_out*/) {
-  const auto* registration = static_cast<const Registration*>(context);
-  PostQueuedCompletionStatus(registration->port, registration->generation,
-                             reinterpret_cast<ULONG_PTR>(registration->key),
-                             nullptr);
+  auto* const registered = static_cast<RegisteredWait*>(context);
+  registered->posted.store(true, std::memory_order_release);
+  PostQueuedCompletionStatus(registered->port, 0,
+                             reinterpret_cast<ULONG_PTR>(registered), nullptr);
 }
 
 }  // namespace
@@ -46,11 +56,6 @@ void CALLBACK on_signalled(void* context, BOOLEAN /*timed_out*/) {
 // completion with a null key is wake().
 struct NativeHandlePoller::Impl {
   HANDLE port = nullptr;
-  DWORD next_generation = 0;
-
-  // Keyed by what each handle was added under. Heap-allocated, as each wait
-  // holds its registration's address.
-  std::unordered_map<void*, std::unique_ptr<Registration>> registrations;
 
   Impl() : port(CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1)) {
     if (port == nullptr) {
@@ -58,7 +63,20 @@ struct NativeHandlePoller::Impl {
     }
   }
 
-  ~Impl() { CloseHandle(port); }
+  // Frees the waits still waiting for their packets to be dequeued.
+  ~Impl() {
+    std::array<OVERLAPPED_ENTRY, 64> entries{};
+    ULONG count = 0;
+    while (GetQueuedCompletionStatusEx(port, entries.data(),
+                                       static_cast<ULONG>(entries.size()),
+                                       &count, 0, FALSE)) {
+      for (ULONG i = 0; i < count; ++i) {
+        // Only removed waits can be left: all others have been removed first.
+        delete reinterpret_cast<RegisteredWait*>(entries[i].lpCompletionKey);
+      }
+    }
+    CloseHandle(port);
+  }
 
   Impl(const Impl&) = delete;
   Impl& operator=(const Impl&) = delete;
@@ -70,34 +88,35 @@ NativeHandlePoller::NativeHandlePoller() : m_impl(std::make_unique<Impl>()) {}
 
 NativeHandlePoller::~NativeHandlePoller() = default;
 
-std::error_code NativeHandlePoller::add(NativeHandle handle, void* key) {
-  auto registration = std::make_unique<Registration>(
-      Registration{.port = m_impl->port,
-                   .key = key,
-                   .generation = ++m_impl->next_generation});
+NativeHandlePoller::Token NativeHandlePoller::add(NativeHandle handle,
+                                                  void* context) {
+  auto registered = std::make_unique<RegisteredWait>(m_impl->port, context);
   // Once only: a signalled handle is reported once, as a wait on it would, and
   // is watched again only if it is added again.
   if (!RegisterWaitForSingleObject(
-          &registration->wait, handle, &on_signalled, registration.get(),
-          INFINITE, WT_EXECUTEONLYONCE | WT_EXECUTEINWAITTHREAD)) {
-    return last_error_code();
+          &registered->wait, handle, &on_signalled, registered.get(), INFINITE,
+          WT_EXECUTEONLYONCE | WT_EXECUTEINWAITTHREAD)) {
+    throw std::system_error(last_error_code(), "RegisterWaitForSingleObject");
   }
-  m_impl->registrations.insert_or_assign(key, std::move(registration));
-  return {};
+  return static_cast<Token>(
+      reinterpret_cast<std::uintptr_t>(registered.release()));
 }
 
-void NativeHandlePoller::remove(NativeHandle /*handle*/, void* key) noexcept {
-  const auto it = m_impl->registrations.find(key);
-  if (it == m_impl->registrations.end()) {
-    return;
+void NativeHandlePoller::remove(Token token) noexcept {
+  auto* const registered =
+      reinterpret_cast<RegisteredWait*>(static_cast<std::uintptr_t>(token));
+  // Blocks until a callback already running has posted, so nothing touches
+  // the wait from the system's side once this returns.
+  UnregisterWaitEx(registered->wait, INVALID_HANDLE_VALUE);
+  if (registered->posted.load(std::memory_order_acquire) &&
+      !registered->consumed) {
+    registered->removed = true;  // wait() frees it with its packet.
+  } else {
+    delete registered;
   }
-  // Blocks until a callback already running has posted, so the registration
-  // outlives any use of it. What it posted is dropped by wait().
-  UnregisterWaitEx(it->second->wait, INVALID_HANDLE_VALUE);
-  m_impl->registrations.erase(it);
 }
 
-void NativeHandlePoller::wait(std::vector<Ready>& ready) {
+void NativeHandlePoller::wait(std::vector<void*>& ready) {
   std::array<OVERLAPPED_ENTRY, 64> entries{};
   ULONG count = 0;
   if (!GetQueuedCompletionStatusEx(m_impl->port, entries.data(),
@@ -106,15 +125,16 @@ void NativeHandlePoller::wait(std::vector<Ready>& ready) {
     return;  // Nothing there is to be done about but try again.
   }
   for (ULONG i = 0; i < count; ++i) {
-    const OVERLAPPED_ENTRY& entry = entries[i];
-    void* const key = reinterpret_cast<void*>(entry.lpCompletionKey);
-    if (key == nullptr) {
+    auto* const registered =
+        reinterpret_cast<RegisteredWait*>(entries[i].lpCompletionKey);
+    if (registered == nullptr) {
       continue;  // wake()
     }
-    const auto it = m_impl->registrations.find(key);
-    if (it != m_impl->registrations.end() &&
-        it->second->generation == entry.dwNumberOfBytesTransferred) {
-      ready.emplace_back(key, std::error_code{});
+    if (registered->removed) {
+      delete registered;
+    } else {
+      registered->consumed = true;
+      ready.push_back(registered->context);
     }
   }
 }

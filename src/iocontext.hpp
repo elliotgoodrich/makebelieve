@@ -9,12 +9,12 @@
 #include <stdexec/execution.hpp>
 
 #include <concepts>
+#include <cstddef>
 #include <mutex>
 #include <optional>
 #include <system_error>
 #include <thread>
 #include <type_traits>
-#include <unordered_set>
 #include <utility>
 
 namespace makebelieve {
@@ -88,9 +88,9 @@ class IoContext {
   Wait* m_cancels = nullptr;
   bool m_stopping = false;
 
-  // The waits whose handles are with the poller. Touched only by the context's
-  // thread.
-  std::unordered_set<Wait*> m_registered;
+  // How many waits have their handles with the poller, to check that none is
+  // left when the context stops. Touched only by the context's thread.
+  std::size_t m_registered = 0;
 
   // Declared last so that everything it uses exists before it starts.
   std::jthread m_thread;
@@ -106,6 +106,10 @@ class IoContext {
 
   // The context's thread.
   void run();
+
+  // On the context's thread: take @a wait, which is registered, back from the
+  // poller.
+  void unregister(Wait& wait) noexcept;
 
   // On the context's thread: resolves @a wait, which is no longer registered.
   void finish(Wait& wait, std::error_code error, bool stopped) noexcept;
@@ -160,6 +164,9 @@ class IoContext::Wait {
  public:
   /// What is waited on.
   NativeHandle handle;
+
+  /// Identifies the handle's watch with the poller while it is registered.
+  NativeHandlePoller::Token registration{};
 
   /// Links the wait into the context's list of cancellations, guarded by the
   /// context's lock.
