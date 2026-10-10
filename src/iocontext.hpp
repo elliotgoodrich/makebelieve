@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-#include "intrusivetask.hpp"
 #include "nativehandle.hpp"
 #include "nativehandlepoller.hpp"
 
@@ -10,6 +9,7 @@
 
 #include <concepts>
 #include <cstddef>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <system_error>
@@ -18,6 +18,86 @@
 #include <utility>
 
 namespace makebelieve {
+
+class IoContext;
+
+namespace detail {
+
+// Work queued to run on an `IoContext`'s thread. An operation state derives
+// from it, so the queue needs no allocation and queueing cannot fail.
+class IoContextTask {
+ public:
+  // The next task in the context's queue, guarded by the context's lock.
+  IoContextTask* next = nullptr;
+
+  // Runs the task on the context's thread. May destroy it.
+  virtual void execute() noexcept = 0;
+
+  IoContextTask(const IoContextTask&) = delete;
+  IoContextTask& operator=(const IoContextTask&) = delete;
+  IoContextTask(IoContextTask&&) = delete;
+  IoContextTask& operator=(IoContextTask&&) = delete;
+
+ protected:
+  IoContextTask() = default;
+  ~IoContextTask() = default;  // Never deleted through this base.
+};
+
+// A wait on one handle, as an `IoContext` keeps it while it is registered:
+// the handle, the links the context lists it by, and the part that depends on
+// who is waiting - installing and removing the stop callback, and completing
+// the sender - which the operation state that derives from it supplies.
+class IoContextWait {
+ public:
+  // What is waited on.
+  NativeHandle handle;
+
+  // Identifies the handle's watch with the poller while it is registered.
+  NativeHandlePoller::Token registration{};
+
+  // Links the wait into the context's list of cancellations, guarded by the
+  // context's lock.
+  IoContextWait* next_cancel = nullptr;
+  bool cancel_queued = false;
+
+  // Installs the stop callback. May run the callback inline.
+  virtual void arm() noexcept = 0;
+
+  // Removes the stop callback, waiting out one running on another thread.
+  virtual void disarm() noexcept = 0;
+
+  // Completes the sender: stopped if @a stopped, otherwise with @a error if
+  // set, otherwise with no value.
+  virtual void complete(std::error_code error, bool stopped) noexcept = 0;
+
+  IoContextWait(const IoContextWait&) = delete;
+  IoContextWait& operator=(const IoContextWait&) = delete;
+  IoContextWait(IoContextWait&&) = delete;
+  IoContextWait& operator=(IoContextWait&&) = delete;
+
+ protected:
+  explicit IoContextWait(NativeHandle handle) noexcept : handle(handle) {}
+  ~IoContextWait() = default;  // Never deleted through this base.
+};
+
+// How `IoContext::Scheduler::Sender` completes.
+using IoContextScheduleSignatures =
+    stdexec::completion_signatures<stdexec::set_value_t(),
+                                   stdexec::set_stopped_t()>;
+
+// How `IoContext::WaitSender` completes.
+using IoContextWaitSignatures =
+    stdexec::completion_signatures<stdexec::set_value_t(),
+                                   stdexec::set_error_t(std::error_code),
+                                   stdexec::set_stopped_t()>;
+
+template <stdexec::receiver_of<detail::IoContextScheduleSignatures> Receiver>
+class IoContextScheduleOperation;
+
+template <stdexec::receiver_of<detail::IoContextWaitSignatures> Receiver>
+class IoContextWaitOperation;
+
+}  // namespace detail
 
 /// @class IoContext
 /// Waits on operating-system handles on behalf of senders: a Linux file
@@ -32,6 +112,11 @@ namespace makebelieve {
 /// @pre Nothing is waiting on the context, or queued on its scheduler, when it
 /// is destroyed.
 class IoContext {
+  template <stdexec::receiver_of<detail::IoContextScheduleSignatures> Receiver>
+  friend class detail::IoContextScheduleOperation;
+  template <stdexec::receiver_of<detail::IoContextWaitSignatures> Receiver>
+  friend class detail::IoContextWaitOperation;
+
  public:
   /// A file descriptor on Linux, a `HANDLE` on Windows.
   using NativeHandle = makebelieve::NativeHandle;
@@ -60,32 +145,37 @@ class IoContext {
   /// time, and @a handle stays open until the sender completes.
   [[nodiscard]] WaitSender async_wait(NativeHandle handle) noexcept;
 
-  /// Starts a loop in @a scope that waits on @a handle and calls @a on_ready,
-  /// on the context's thread, each time it is ready - until @a scope is
-  /// stopped or waiting on @a handle fails. @a on_ready consumes the readiness
-  /// (reads the descriptor, resets the event), or it is called again at once.
-  /// @pre The owner of @a scope stops and joins it before @a handle is closed,
-  /// and not from the context's thread.
+  /// A sender that waits on @a handle and calls @a on_ready, on the context's
+  /// thread, each time it is ready - completing stopped once a stop is
+  /// requested, or with no value once waiting on @a handle fails. @a on_ready
+  /// consumes the readiness (reads the descriptor, resets the event), or it is
+  /// called again at once. Spawned into a `counting_scope`, it is stopped by
+  /// stopping the scope.
+  /// @pre Nothing else waits on @a handle through this context at the same
+  /// time, and @a handle stays open until the sender completes.
   template <std::invocable OnReady>
     requires std::is_nothrow_invocable_v<OnReady&>
+  [[nodiscard]] stdexec::sender_of<stdexec::set_value_t(), stdexec::env<>> auto
+  watch(NativeHandle handle, OnReady on_ready);
+
+  /// Spawns `watch(handle, on_ready)` into @a scope, so that stopping the
+  /// scope ends it. Defined out of line, so its callers instantiate none of
+  /// the sender.
+  /// @pre As for `watch`, and @a on_ready is not empty. The owner of @a scope
+  /// stops and joins it before @a handle is closed, and not from the
+  /// context's thread.
   void spawn_watch(NativeHandle handle,
                    stdexec::counting_scope& scope,
-                   OnReady on_ready);
+                   std::move_only_function<void() noexcept> on_ready);
 
  private:
-  class Wait;
-  template <class Receiver>
-  class ScheduleOperation;
-  template <class Receiver>
-  class WaitOperation;
-
   NativeHandlePoller m_poller;
 
   // Guards the queues below, which any thread may add to.
   std::mutex m_mutex;
-  IntrusiveTask* m_first_task = nullptr;
-  IntrusiveTask* m_last_task = nullptr;
-  Wait* m_cancels = nullptr;
+  detail::IoContextTask* m_first_task = nullptr;
+  detail::IoContextTask* m_last_task = nullptr;
+  detail::IoContextWait* m_cancels = nullptr;
   bool m_stopping = false;
 
   // How many waits have their handles with the poller, to check that none is
@@ -96,125 +186,36 @@ class IoContext {
   std::jthread m_thread;
 
   // Thread-safe: queue @a task to run on the context's thread.
-  void submit(IntrusiveTask& task) noexcept;
+  void submit(detail::IoContextTask& task) noexcept;
 
   // Thread-safe: ask the context's thread to stop @a wait.
-  void cancel(Wait& wait) noexcept;
+  void cancel(detail::IoContextWait& wait) noexcept;
 
   // On the context's thread: arm @a wait and register its handle.
-  void begin_wait(Wait& wait) noexcept;
+  void begin_wait(detail::IoContextWait& wait) noexcept;
 
   // The context's thread.
   void run();
 
   // On the context's thread: take @a wait, which is registered, back from the
   // poller.
-  void unregister(Wait& wait) noexcept;
+  void unregister(detail::IoContextWait& wait) noexcept;
 
   // On the context's thread: resolves @a wait, which is no longer registered.
-  void finish(Wait& wait, std::error_code error, bool stopped) noexcept;
+  void finish(detail::IoContextWait& wait,
+              std::error_code error,
+              bool stopped) noexcept;
 };
 
-// A wait on one handle, as an `IoContext` keeps it while it is registered:
-// the handle, the links the context lists it by, and the part that depends on
-// who is waiting - installing and removing the stop callback, and completing
-// the sender - erased from a `T` it does not own in the same way as
-// `IntrusiveTask`. Lives in the operation state that waits.
-class IoContext::Wait {
-  struct Concept {
-    virtual void arm(void* target) const noexcept = 0;
-    virtual void disarm(void* target) const noexcept = 0;
-    virtual void complete(void* target,
-                          std::error_code error,
-                          bool stopped) const noexcept = 0;
+namespace detail {
 
-   protected:
-    Concept() = default;
-    ~Concept() = default;  // Only the singletons exist, and are never deleted.
-
-   public:
-    Concept(const Concept&) = delete;
-    Concept& operator=(const Concept&) = delete;
-    Concept(Concept&&) = delete;
-    Concept& operator=(Concept&&) = delete;
-  };
-
-  template <class T>
-  struct Model final : Concept {
-    static const Model singleton;
-
-    void arm(void* target) const noexcept override {
-      static_cast<T*>(target)->arm();
-    }
-
-    void disarm(void* target) const noexcept override {
-      static_cast<T*>(target)->disarm();
-    }
-
-    void complete(void* target,
-                  std::error_code error,
-                  bool stopped) const noexcept override {
-      static_cast<T*>(target)->complete(error, stopped);
-    }
-  };
-
-  void* m_target;
-  const Concept* m_concept;
-
- public:
-  /// What is waited on.
-  NativeHandle handle;
-
-  /// Identifies the handle's watch with the poller while it is registered.
-  NativeHandlePoller::Token registration{};
-
-  /// Links the wait into the context's list of cancellations, guarded by the
-  /// context's lock.
-  Wait* next_cancel = nullptr;
-  bool cancel_queued = false;
-
-  template <class T>
-    requires requires(T& target, std::error_code error, bool stopped) {
-      { target.arm() } noexcept;
-      { target.disarm() } noexcept;
-      { target.complete(error, stopped) } noexcept;
-    }
-  Wait(T& target, NativeHandle handle) noexcept
-      : m_target(&target), m_concept(&Model<T>::singleton), handle(handle) {}
-
-  Wait(const Wait&) = delete;
-  Wait& operator=(const Wait&) = delete;
-  Wait(Wait&&) = delete;
-  Wait& operator=(Wait&&) = delete;
-  ~Wait() = default;
-
-  /// Installs the stop callback. May run the callback inline.
-  void arm() const noexcept { m_concept->arm(m_target); }
-
-  /// Removes the stop callback, waiting out one running on another thread.
-  void disarm() const noexcept { m_concept->disarm(m_target); }
-
-  /// Completes the sender: stopped if @a stopped, otherwise with @a error if
-  /// set, otherwise with no value.
-  void complete(std::error_code error, bool stopped) const noexcept {
-    m_concept->complete(m_target, error, stopped);
-  }
-};
-
-template <class T>
-constinit const IoContext::Wait::Model<T>
-    IoContext::Wait::Model<T>::singleton{};
-
-template <class Receiver>
-class IoContext::ScheduleOperation {
-  friend class IntrusiveTask;
-
+template <stdexec::receiver_of<detail::IoContextScheduleSignatures> Receiver>
+class IoContextScheduleOperation final : IoContextTask {
   IoContext* m_context;
   Receiver m_receiver;
-  IntrusiveTask m_task{*this};
 
   // Run on the context's thread once queued.
-  void operator()() noexcept {
+  void execute() noexcept override {
     if (stdexec::get_stop_token(stdexec::get_env(m_receiver))
             .stop_requested()) {
       stdexec::set_stopped(std::move(m_receiver));
@@ -226,49 +227,45 @@ class IoContext::ScheduleOperation {
  public:
   using operation_state_concept = stdexec::operation_state_t;
 
-  ScheduleOperation(IoContext& context, Receiver receiver)
+  IoContextScheduleOperation(IoContext& context, Receiver receiver)
       : m_context(&context), m_receiver(std::move(receiver)) {}
 
-  ScheduleOperation(const ScheduleOperation&) = delete;
-  ScheduleOperation& operator=(const ScheduleOperation&) = delete;
-  ScheduleOperation(ScheduleOperation&&) = delete;
-  ScheduleOperation& operator=(ScheduleOperation&&) = delete;
-  ~ScheduleOperation() = default;
+  IoContextScheduleOperation(const IoContextScheduleOperation&) = delete;
+  IoContextScheduleOperation& operator=(const IoContextScheduleOperation&) =
+      delete;
+  IoContextScheduleOperation(IoContextScheduleOperation&&) = delete;
+  IoContextScheduleOperation& operator=(IoContextScheduleOperation&&) = delete;
+  ~IoContextScheduleOperation() = default;
 
-  void start() & noexcept { m_context->submit(m_task); }
+  void start() & noexcept { m_context->submit(*this); }
 };
 
-// Started by queueing a task that, on the context's thread, arms the stop
-// callback and registers the handle; the context then resolves the wait
+// Started by queueing itself as a task that, on the context's thread, arms the
+// stop callback and registers the handle; the context then resolves the wait
 // exactly once, by disarming and completing it.
-template <class Receiver>
-class IoContext::WaitOperation {
-  friend class IntrusiveTask;
-  friend class Wait;
-
+template <stdexec::receiver_of<detail::IoContextWaitSignatures> Receiver>
+class IoContextWaitOperation final : IoContextTask, IoContextWait {
   struct OnStop {
-    WaitOperation* self;
-    void operator()() const noexcept { self->m_context->cancel(self->m_wait); }
+    IoContextWaitOperation* self;
+    void operator()() const noexcept { self->m_context->cancel(*self); }
   };
   using Token = stdexec::stop_token_of_t<stdexec::env_of_t<Receiver>>;
 
   IoContext* m_context;
   Receiver m_receiver;
   std::optional<stdexec::stop_callback_for_t<Token, OnStop>> m_on_stop;
-  IntrusiveTask m_start{*this};
-  Wait m_wait;
 
   // Run on the context's thread once queued: arms and registers the wait.
-  void operator()() noexcept { m_context->begin_wait(m_wait); }
+  void execute() noexcept override { m_context->begin_wait(*this); }
 
-  void arm() noexcept {
+  void arm() noexcept override {
     m_on_stop.emplace(stdexec::get_stop_token(stdexec::get_env(m_receiver)),
                       OnStop{this});
   }
 
-  void disarm() noexcept { m_on_stop.reset(); }
+  void disarm() noexcept override { m_on_stop.reset(); }
 
-  void complete(std::error_code error, bool stopped) noexcept {
+  void complete(std::error_code error, bool stopped) noexcept override {
     if (stopped) {
       stdexec::set_stopped(std::move(m_receiver));
     } else if (error) {
@@ -281,19 +278,23 @@ class IoContext::WaitOperation {
  public:
   using operation_state_concept = stdexec::operation_state_t;
 
-  WaitOperation(IoContext& context, NativeHandle handle, Receiver receiver)
-      : m_context(&context),
-        m_receiver(std::move(receiver)),
-        m_wait(*this, handle) {}
+  IoContextWaitOperation(IoContext& context,
+                         NativeHandle handle,
+                         Receiver receiver)
+      : IoContextWait(handle),
+        m_context(&context),
+        m_receiver(std::move(receiver)) {}
 
-  WaitOperation(const WaitOperation&) = delete;
-  WaitOperation& operator=(const WaitOperation&) = delete;
-  WaitOperation(WaitOperation&&) = delete;
-  WaitOperation& operator=(WaitOperation&&) = delete;
-  ~WaitOperation() = default;
+  IoContextWaitOperation(const IoContextWaitOperation&) = delete;
+  IoContextWaitOperation& operator=(const IoContextWaitOperation&) = delete;
+  IoContextWaitOperation(IoContextWaitOperation&&) = delete;
+  IoContextWaitOperation& operator=(IoContextWaitOperation&&) = delete;
+  ~IoContextWaitOperation() = default;
 
-  void start() & noexcept { m_context->submit(m_start); }
+  void start() & noexcept { m_context->submit(*this); }
 };
+
+}  // namespace detail
 
 class IoContext::Scheduler {
   IoContext* m_context;
@@ -313,15 +314,15 @@ class IoContext::Scheduler {
 
    public:
     using sender_concept = stdexec::sender_t;
-    using completion_signatures =
-        stdexec::completion_signatures<stdexec::set_value_t(),
-                                       stdexec::set_stopped_t()>;
+    using completion_signatures = detail::IoContextScheduleSignatures;
 
     explicit Sender(IoContext& context) noexcept : m_context(&context) {}
 
-    template <class Receiver>
-    ScheduleOperation<Receiver> connect(Receiver receiver) const {
-      return ScheduleOperation<Receiver>(*m_context, std::move(receiver));
+    template <stdexec::receiver_of<completion_signatures> Receiver>
+    detail::IoContextScheduleOperation<Receiver> connect(
+        Receiver receiver) const {
+      return detail::IoContextScheduleOperation<Receiver>(*m_context,
+                                                          std::move(receiver));
     }
 
     [[nodiscard]] Env get_env() const noexcept { return Env{m_context}; }
@@ -343,17 +344,15 @@ class IoContext::WaitSender {
 
  public:
   using sender_concept = stdexec::sender_t;
-  using completion_signatures =
-      stdexec::completion_signatures<stdexec::set_value_t(),
-                                     stdexec::set_error_t(std::error_code),
-                                     stdexec::set_stopped_t()>;
+  using completion_signatures = detail::IoContextWaitSignatures;
 
   WaitSender(IoContext& context, NativeHandle handle) noexcept
       : m_context(&context), m_handle(handle) {}
 
-  template <class Receiver>
-  WaitOperation<Receiver> connect(Receiver receiver) const {
-    return WaitOperation<Receiver>(*m_context, m_handle, std::move(receiver));
+  template <stdexec::receiver_of<completion_signatures> Receiver>
+  detail::IoContextWaitOperation<Receiver> connect(Receiver receiver) const {
+    return detail::IoContextWaitOperation<Receiver>(*m_context, m_handle,
+                                                    std::move(receiver));
   }
 };
 
@@ -366,20 +365,22 @@ inline IoContext::WaitSender IoContext::async_wait(
   return {*this, handle};
 }
 
+// `repeat_until` connects its child afresh for each wait, copying it, so
+// @a on_ready - which need not be copyable - stays in `let_value`'s operation
+// state and each wait refers to it.
 template <std::invocable OnReady>
   requires std::is_nothrow_invocable_v<OnReady&>
-void IoContext::spawn_watch(NativeHandle handle,
-                            stdexec::counting_scope& scope,
-                            OnReady on_ready) {
-  stdexec::spawn(
-      async_wait(handle) |
-          stdexec::then([on_ready = std::move(on_ready)]() mutable noexcept {
-            on_ready();
-            return false;
-          }) |
-          exec::repeat_until() |
-          stdexec::upon_error([](const auto& /*error*/) noexcept {}),
-      scope.get_token());
+stdexec::sender_of<stdexec::set_value_t(), stdexec::env<>> auto
+IoContext::watch(NativeHandle handle, OnReady on_ready) {
+  return stdexec::just(std::move(on_ready), async_wait(handle)) |
+         stdexec::let_value([](OnReady& callback, WaitSender& wait) noexcept {
+           return wait | stdexec::then([&callback]() noexcept {
+                    callback();
+                    return false;
+                  }) |
+                  exec::repeat_until();
+         }) |
+         stdexec::upon_error([](const auto& /*error*/) noexcept {});
 }
 
 }  // namespace makebelieve

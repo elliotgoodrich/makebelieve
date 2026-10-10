@@ -5,6 +5,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <functional>
 #include <mutex>
 #include <system_error>
 #include <utility>
@@ -22,7 +23,14 @@ IoContext::~IoContext() {
   m_poller.wake();
 }
 
-void IoContext::submit(IntrusiveTask& task) noexcept {
+void IoContext::spawn_watch(NativeHandle handle,
+                            stdexec::counting_scope& scope,
+                            std::move_only_function<void() noexcept> on_ready) {
+  stdexec::spawn(watch(handle, std::move(on_ready)), scope.get_token());
+}
+
+void IoContext::submit(detail::IoContextTask& task) noexcept {
+  assert(task.next == nullptr && "task already queued");
   {
     const std::lock_guard lock(m_mutex);
     task.next = nullptr;
@@ -36,7 +44,7 @@ void IoContext::submit(IntrusiveTask& task) noexcept {
   m_poller.wake();
 }
 
-void IoContext::cancel(Wait& wait) noexcept {
+void IoContext::cancel(detail::IoContextWait& wait) noexcept {
   {
     const std::lock_guard lock(m_mutex);
     if (wait.cancel_queued) {
@@ -49,7 +57,7 @@ void IoContext::cancel(Wait& wait) noexcept {
   m_poller.wake();
 }
 
-void IoContext::begin_wait(Wait& wait) noexcept {
+void IoContext::begin_wait(detail::IoContextWait& wait) noexcept {
   wait.arm();
   std::error_code error;
   try {
@@ -69,15 +77,16 @@ void IoContext::run() {
   MB_TRACE_THREAD_NAME("io");
   std::vector<void*> ready;
   while (true) {
-    IntrusiveTask* tasks = nullptr;
-    Wait* cancels = nullptr;
+    detail::IoContextTask* tasks = nullptr;
+    detail::IoContextWait* cancels = nullptr;
     bool stopping = false;
     {
       const std::lock_guard lock(m_mutex);
       tasks = std::exchange(m_first_task, nullptr);
       m_last_task = nullptr;
       cancels = std::exchange(m_cancels, nullptr);
-      for (Wait* wait = cancels; wait != nullptr; wait = wait->next_cancel) {
+      for (detail::IoContextWait* wait = cancels; wait != nullptr;
+           wait = wait->next_cancel) {
         wait->cancel_queued = false;
       }
       stopping = m_stopping;
@@ -86,8 +95,8 @@ void IoContext::run() {
     // Read each link before running the task, which may complete and free
     // it.
     while (tasks != nullptr) {
-      IntrusiveTask* const task = std::exchange(tasks, tasks->next);
-      (*task)();
+      detail::IoContextTask* const task = std::exchange(tasks, tasks->next);
+      task->execute();
     }
 
     // A cancellation queued by a stop callback that fires while its wait is
@@ -95,7 +104,8 @@ void IoContext::run() {
     // Each wait here is still registered: finishing a wait first drops any
     // cancellation still queued for it.
     while (cancels != nullptr) {
-      Wait* const wait = std::exchange(cancels, cancels->next_cancel);
+      detail::IoContextWait* const wait =
+          std::exchange(cancels, cancels->next_cancel);
       unregister(*wait);
       finish(*wait, {}, true);
     }
@@ -110,14 +120,14 @@ void IoContext::run() {
     ready.clear();
     m_poller.wait(ready);
     for (void* const context : ready) {
-      auto* const wait = static_cast<Wait*>(context);
+      auto* const wait = static_cast<detail::IoContextWait*>(context);
       unregister(*wait);
       finish(*wait, {}, false);
     }
   }
 }
 
-void IoContext::unregister(Wait& wait) noexcept {
+void IoContext::unregister(detail::IoContextWait& wait) noexcept {
   assert(m_registered > 0);
   --m_registered;
   m_poller.remove(wait.registration);
@@ -125,14 +135,14 @@ void IoContext::unregister(Wait& wait) noexcept {
 
 // The stop callback goes first, so none can queue a cancellation after the one
 // dropped here.
-void IoContext::finish(Wait& wait,
+void IoContext::finish(detail::IoContextWait& wait,
                        std::error_code error,
                        bool stopped) noexcept {
   wait.disarm();
   {
     const std::lock_guard lock(m_mutex);
     if (wait.cancel_queued) {
-      Wait** link = &m_cancels;
+      detail::IoContextWait** link = &m_cancels;
       while (*link != &wait) {
         link = &(*link)->next_cancel;
       }

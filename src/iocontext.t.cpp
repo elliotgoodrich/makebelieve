@@ -243,6 +243,38 @@ TEST(IoContext, SpawnWatchCallsBackEachTimeUntilStopped) {
   EXPECT_EQ(wakes, 3);
 }
 
+TEST(IoContext, WatchCallsBackEachTimeUntilStopped) {
+  IoContext io;
+  const Signal signal;
+  std::mutex mutex;
+  std::condition_variable woken;
+  int wakes = 0;
+  ex::counting_scope scope;
+  ex::spawn(io.watch(signal.handle(),
+                     [&]() noexcept {
+                       signal.reset();
+                       {
+                         const std::lock_guard lock(mutex);
+                         ++wakes;
+                       }
+                       woken.notify_all();
+                     }),
+            scope.get_token());
+
+  for (int expected = 1; expected <= 3; ++expected) {
+    signal.set();
+    std::unique_lock lock(mutex);
+    ASSERT_TRUE(woken.wait_for(lock, 10s, [&] { return wakes >= expected; }));
+  }
+
+  scope.request_stop();
+  ex::sync_wait(scope.join());
+  signal.set();
+  std::this_thread::sleep_for(50ms);
+  const std::lock_guard lock(mutex);
+  EXPECT_EQ(wakes, 3);
+}
+
 // Far more than the 63 handles one WaitForMultipleObjects can watch.
 TEST(IoContext, WaitsOnManyHandlesAtOnce) {
   IoContext io;
