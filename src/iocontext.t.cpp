@@ -114,7 +114,7 @@ Outcome wait_on(IoContext& io,
 }
 
 // Watches @a handle, calling @a on_ready, stoppable through @a stop, recording
-// where it completed - `Outcome::ready` standing for no value.
+// where it completed. A watch never completes with a value.
 template <class OnReady>
 Outcome watch_on(IoContext& io,
                  IoContext::NativeHandle handle,
@@ -129,15 +129,21 @@ Outcome watch_on(IoContext& io,
   auto result =
       ex::sync_wait(ex::write_env(io.watch(handle, std::move(on_ready)),
                                   ex::prop{ex::get_stop_token, stop}) |
-                    ex::then([record]() noexcept {
+                    ex::upon_error([record](std::error_code) noexcept {
                       record();
-                      return Outcome::ready;
+                      return Outcome::error;
                     }) |
                     ex::upon_stopped([record]() noexcept {
                       record();
                       return Outcome::stopped;
                     }));
   return std::get<0>(result.value());
+}
+
+// What a spawned watch is given to call if it fails, which no test here
+// expects of a handle it waits on.
+void fail_watch(std::error_code error) noexcept {
+  ADD_FAILURE() << "watch failed: " << error.message();
 }
 
 std::thread::id context_thread(IoContext& io) {
@@ -263,14 +269,17 @@ TEST(IoContext, SpawnWatchCallsBackEachTimeUntilStopped) {
   std::condition_variable woken;
   int wakes = 0;
   ex::counting_scope scope;
-  io.spawn_watch(signal.handle(), scope, [&]() noexcept {
-    signal.reset();
-    {
-      const std::lock_guard lock(mutex);
-      ++wakes;
-    }
-    woken.notify_all();
-  });
+  io.spawn_watch(
+      signal.handle(), scope,
+      [&]() noexcept {
+        signal.reset();
+        {
+          const std::lock_guard lock(mutex);
+          ++wakes;
+        }
+        woken.notify_all();
+      },
+      fail_watch);
 
   for (int expected = 1; expected <= 3; ++expected) {
     signal.set();
@@ -284,6 +293,7 @@ TEST(IoContext, SpawnWatchCallsBackEachTimeUntilStopped) {
   std::this_thread::sleep_for(50ms);
   const std::lock_guard lock(mutex);
   EXPECT_EQ(wakes, 3);
+  EXPECT_FALSE(io.watch_failure_token().stop_requested());
 }
 
 TEST(IoContext, WatchCallsBackEachTimeUntilStopped) {
@@ -301,7 +311,8 @@ TEST(IoContext, WatchCallsBackEachTimeUntilStopped) {
                          ++wakes;
                        }
                        woken.notify_all();
-                     }),
+                     }) |
+                ex::upon_error([](std::error_code) noexcept {}),
             scope.get_token());
 
   for (int expected = 1; expected <= 3; ++expected) {
@@ -325,13 +336,16 @@ TEST(IoContext, WatchCallsBackOncePerEventOnTheContextsThread) {
   std::atomic<int> wakes = 0;
   std::atomic<int> elsewhere = 0;
   ex::counting_scope scope;
-  io.spawn_watch(signal.handle(), scope, [&]() noexcept {
-    signal.reset();
-    if (std::this_thread::get_id() != io_thread) {
-      ++elsewhere;
-    }
-    ++wakes;
-  });
+  io.spawn_watch(
+      signal.handle(), scope,
+      [&]() noexcept {
+        signal.reset();
+        if (std::this_thread::get_id() != io_thread) {
+          ++elsewhere;
+        }
+        ++wakes;
+      },
+      fail_watch);
 
   constexpr int k_events = 1000;
   for (int expected = 1; expected <= k_events; ++expected) {
@@ -415,16 +429,19 @@ TEST(IoContext, ASpawnedWatchCanStopItsScopeFromItsCallback) {
   const Signal signal;
   std::atomic<int> wakes = 0;
   ex::counting_scope scope;
-  io.spawn_watch(signal.handle(), scope, [&]() noexcept {
-    ++wakes;
-    scope.request_stop();
-  });
+  io.spawn_watch(
+      signal.handle(), scope,
+      [&]() noexcept {
+        ++wakes;
+        scope.request_stop();
+      },
+      fail_watch);
   signal.set();
   ex::sync_wait(scope.join());
   EXPECT_EQ(wakes.load(), 1);
 }
 
-TEST(IoContext, AnUnwaitableHandleCompletesAWatch) {
+TEST(IoContext, AnUnwaitableHandleFailsAWatch) {
   IoContext io;
 #ifdef _WIN32
   const IoContext::NativeHandle bad = nullptr;
@@ -435,9 +452,58 @@ TEST(IoContext, AnUnwaitableHandleCompletesAWatch) {
   std::thread::id completed_on;
   EXPECT_EQ(watch_on(
                 io, bad, [&]() noexcept { ++wakes; }, {}, &completed_on),
-            Outcome::ready);
+            Outcome::error);
   EXPECT_EQ(completed_on, context_thread(io));
   EXPECT_EQ(wakes, 0);
+}
+
+#ifdef _WIN32
+// Breaks the @pre that the handle stays open, as the only way to make a watch
+// fail once it is registered: closing the handle from the callback makes
+// rearming it fail.
+TEST(IoContext, AWatchThatCannotBeRearmedFails) {
+  IoContext io;
+  const HANDLE event = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+  int wakes = 0;
+  std::thread::id completed_on;
+  EXPECT_EQ(watch_on(
+                io, event,
+                [&]() noexcept {
+                  ++wakes;
+                  CloseHandle(event);
+                },
+                {}, &completed_on),
+            Outcome::error);
+  EXPECT_EQ(completed_on, context_thread(io));
+  EXPECT_EQ(wakes, 1);
+}
+#endif
+
+// The failure is reported first, so that it is said before anything waiting
+// on the token starts to stop.
+TEST(IoContext, ASpawnedWatchReportsItsFailureThenRequestsAStop) {
+  IoContext io;
+#ifdef _WIN32
+  const IoContext::NativeHandle bad = nullptr;
+#else
+  const IoContext::NativeHandle bad = -1;
+#endif
+  std::error_code reported;
+  std::thread::id reported_on;
+  bool stop_requested_first = true;
+  ex::counting_scope scope;
+  io.spawn_watch(
+      bad, scope, []() noexcept {},
+      [&](std::error_code error) noexcept {
+        reported = error;
+        reported_on = std::this_thread::get_id();
+        stop_requested_first = io.watch_failure_token().stop_requested();
+      });
+  ex::sync_wait(scope.join());
+  EXPECT_TRUE(reported);
+  EXPECT_EQ(reported_on, context_thread(io));
+  EXPECT_FALSE(stop_requested_first);
+  EXPECT_TRUE(io.watch_failure_token().stop_requested());
 }
 
 // Far more than the 63 handles one WaitForMultipleObjects can watch.
@@ -668,11 +734,13 @@ TEST(IoContext, StressRacesWatchesAgainstStops) {
   for (int i = 0; i < k_background; ++i) {
     background_signals.push_back(std::make_unique<Signal>());
     const Signal& signal = *background_signals.back();
-    io.spawn_watch(signal.handle(), background,
-                   [&signal, &background_wakes]() noexcept {
-                     signal.reset();
-                     ++background_wakes;
-                   });
+    io.spawn_watch(
+        signal.handle(), background,
+        [&signal, &background_wakes]() noexcept {
+          signal.reset();
+          ++background_wakes;
+        },
+        fail_watch);
   }
   std::atomic<bool> done = false;
   std::thread background_setter([&] {
@@ -728,7 +796,8 @@ TEST(IoContext, StressRacesWatchesAgainstStops) {
                                      }
                                    }),
                           ex::prop{ex::get_stop_token, source.get_token()}) |
-                ex::then([&]() noexcept { record(Outcome::ready); }) |
+                ex::upon_error(
+                    [&](std::error_code) noexcept { record(Outcome::error); }) |
                 ex::upon_stopped([&]() noexcept { record(Outcome::stopped); }),
             scope.get_token());
         for (int e = 0; e < events; ++e) {

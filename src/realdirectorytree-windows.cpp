@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <expected>
 #include <functional>
 #include <list>
@@ -16,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <print>
 #include <set>
 #include <string>
 #include <string_view>
@@ -490,14 +492,25 @@ void RealDirectoryTree::Impl::start_watcher() const {
     throw_last_error("ReadDirectoryChangesW");
   }
 
-  m_io.spawn_watch(m_change_event, m_watching, [this]() noexcept {
-    // Best-effort: a change dropped for want of memory is lost, as one the
-    // buffer overflows on is.
-    try {
-      on_change();
-    } catch (...) {  // NOLINT(bugprone-empty-catch)
-    }
-  });
+  m_io.spawn_watch(
+      m_change_event, m_watching,
+      [this]() noexcept {
+        // Best-effort: a change dropped for want of memory is lost, as one
+        // the buffer overflows on is.
+        try {
+          on_change();
+        } catch (...) {  // NOLINT(bugprone-empty-catch)
+        }
+      },
+      [](std::error_code error) noexcept {
+        // Best-effort, as this runs on the IoContext's thread.
+        try {
+          std::println(stderr,
+                       "makebelieve: stopped watching the source directory: {}",
+                       error.message());
+        } catch (...) {  // NOLINT(bugprone-empty-catch)
+        }
+      });
   m_watching_started = true;
 }
 

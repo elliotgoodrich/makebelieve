@@ -10,9 +10,11 @@
 #include <atomic>
 #include <cerrno>
 #include <csignal>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <print>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -187,14 +189,25 @@ class ConsoleInterruptHandler::Impl {
     // Started before the handlers are installed so a byte from an immediate
     // signal always has a reader - though the pipe would buffer it regardless.
     // Idempotent, so repeated interrupts are harmless.
-    io.spawn_watch(g_read_fd, m_watching, []() noexcept {
-      if (drain_pipe()) {
-        if (std::stop_source* source = g_source.load(std::memory_order_acquire);
-            source != nullptr) {
-          source->request_stop();
-        }
-      }
-    });
+    io.spawn_watch(
+        g_read_fd, m_watching,
+        []() noexcept {
+          if (drain_pipe()) {
+            if (std::stop_source* source =
+                    g_source.load(std::memory_order_acquire);
+                source != nullptr) {
+              source->request_stop();
+            }
+          }
+        },
+        [](std::error_code error) noexcept {
+          // Best-effort, as this runs on the IoContext's thread.
+          try {
+            std::println(stderr, "makebelieve: stopped watching for Ctrl+C: {}",
+                         error.message());
+          } catch (...) {  // NOLINT(bugprone-empty-catch)
+          }
+        });
 
     struct sigaction action {};
     action.sa_handler = &handle_signal;

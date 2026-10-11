@@ -11,6 +11,7 @@
 #include <concepts>
 #include <functional>
 #include <optional>
+#include <stop_token>
 #include <system_error>
 #include <thread>
 #include <type_traits>
@@ -120,7 +121,7 @@ using IoContextWaitSignatures =
 
 // How the sender `IoContext::watch` returns completes.
 using IoContextWatchSignatures =
-    stdexec::completion_signatures<stdexec::set_value_t(),
+    stdexec::completion_signatures<stdexec::set_error_t(std::error_code),
                                    stdexec::set_stopped_t()>;
 
 template <stdexec::receiver_of<detail::IoContextScheduleSignatures> Receiver>
@@ -185,26 +186,36 @@ class IoContext {
 
   /// A sender that waits on @a handle and calls @a on_ready, on the context's
   /// thread, each time it is ready - completing stopped once a stop is
-  /// requested, or with no value once waiting on @a handle fails. @a on_ready
-  /// consumes the readiness (reads the descriptor, resets the event), or it is
-  /// called again at once. The handle stays registered with the context from
-  /// start to completion, rather than once for each time it is ready. Spawned
-  /// into a `counting_scope`, it is stopped by stopping the scope.
+  /// requested, or with the `error_code` once waiting on @a handle fails, and
+  /// never with a value. @a on_ready consumes the readiness (reads the
+  /// descriptor, resets the event), or it is called again at once. The handle
+  /// stays registered with the context from start to completion, rather than
+  /// once for each time it is ready. Spawned into a `counting_scope`, it is
+  /// stopped by stopping the scope.
   /// @pre Nothing else waits on @a handle through this context at the same
   /// time, and @a handle stays open until the sender completes.
   template <detail::IoContextOnReady OnReady>
-  [[nodiscard]] stdexec::sender_of<stdexec::set_value_t(), stdexec::env<>> auto
+  [[nodiscard]] stdexec::sender_of<stdexec::set_error_t(std::error_code),
+                                   stdexec::env<>> auto
   watch(NativeHandle handle, OnReady on_ready);
 
   /// Spawns `watch(handle, on_ready)` into @a scope, so that stopping the
-  /// scope ends it. Defined out of line, so its callers instantiate none of
-  /// the sender.
-  /// @pre As for `watch`, and @a on_ready is not empty. The owner of @a scope
-  /// stops and joins it before @a handle is closed, and not from the
-  /// context's thread.
-  void spawn_watch(NativeHandle handle,
-                   stdexec::counting_scope& scope,
-                   std::move_only_function<void() noexcept> on_ready);
+  /// scope ends it. If waiting on @a handle fails, the watch ends: no more
+  /// events will be reported, so @a on_error is called on the context's
+  /// thread with why, and then a stop is requested on
+  /// `watch_failure_token()`.
+  /// @pre As for `watch`, and neither @a on_ready nor @a on_error is empty.
+  /// The owner of @a scope stops and joins it before @a handle is closed,
+  /// and not from the context's thread.
+  void spawn_watch(
+      NativeHandle handle,
+      stdexec::counting_scope& scope,
+      std::move_only_function<void() noexcept> on_ready,
+      std::move_only_function<void(std::error_code) noexcept> on_error);
+
+  /// A token whose stop is requested once any watch spawned by `spawn_watch`
+  /// has failed, for the program to end on.
+  [[nodiscard]] std::stop_token watch_failure_token() const noexcept;
 
  private:
   NativeHandlePoller m_poller;
@@ -217,6 +228,9 @@ class IoContext {
   std::atomic<detail::IoContextWait*> m_cancels = nullptr;
 
   std::atomic<bool> m_stopping = false;
+
+  // Requested once a watch spawned by `spawn_watch` has failed.
+  std::stop_source m_watch_failed;
 
   // The heads of the lists of waits that have their handles with the poller:
   // those not cancelled, and those taken from `m_cancels` to be stopped. A
@@ -389,8 +403,7 @@ class IoContextWaitOperation final
 };
 
 // `IoContext::watch`: calls @a OnReady each time the handle is ready, and so
-// stays registered until it is stopped. Completes with no value if the handle
-// cannot be registered, dropping the error.
+// stays registered until it is stopped or the handle cannot be waited on.
 template <stdexec::receiver_of<detail::IoContextWatchSignatures> Receiver,
           IoContextOnReady OnReady>
 class IoContextWatchOperation final
@@ -402,13 +415,14 @@ class IoContextWatchOperation final
     return false;
   }
 
+  // Only a stop or a failure ends a watch, never the handle being ready.
   void complete(const IoThreadPasskey& /*passkey*/,
-                std::error_code /*error*/,
+                std::error_code error,
                 bool stopped) noexcept override {
     if (stopped) {
       stdexec::set_stopped(std::move(this->m_receiver));
     } else {
-      stdexec::set_value(std::move(this->m_receiver));
+      stdexec::set_error(std::move(this->m_receiver), error);
     }
   }
 
@@ -535,7 +549,7 @@ inline IoContext::WaitSender IoContext::async_wait(
 }
 
 template <detail::IoContextOnReady OnReady>
-stdexec::sender_of<stdexec::set_value_t(), stdexec::env<>> auto
+stdexec::sender_of<stdexec::set_error_t(std::error_code), stdexec::env<>> auto
 IoContext::watch(NativeHandle handle, OnReady on_ready) {
   return detail::IoContextWatchSender<OnReady>(*this, handle,
                                                std::move(on_ready));
