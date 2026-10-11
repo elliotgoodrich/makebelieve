@@ -130,6 +130,36 @@ TEST(NativeHandlePoller, AKeyAddedAgainAfterARemovalIsReportedOnce) {
   poller.remove(second);
 }
 
+TEST(NativeHandlePoller, ARearmedWatchIsReportedAgain) {
+  NativeHandlePoller poller;
+  const Signal signal;
+  int context = 0;
+  signal.set();
+  const auto registration = poller.add(signal.handle(), &context);
+  for (int i = 0; i < 100; ++i) {
+    wait_for(poller, &context);
+    poller.rearm(registration);
+  }
+  poller.remove(registration);
+}
+
+TEST(NativeHandlePoller, AWatchRemovedOnceRearmedAndReadyIsNotReported) {
+  NativeHandlePoller poller;
+  const Signal signal;
+  int context = 0;
+  signal.set();
+  const auto registration = poller.add(signal.handle(), &context);
+  wait_for(poller, &context);
+  poller.rearm(registration);
+  // Long enough for Windows to have posted the readiness to the port again.
+  std::this_thread::sleep_for(50ms);
+  poller.remove(registration);
+
+  poller.wake();
+  Buffer buffer{};
+  EXPECT_EQ(count_of(poller.wait(buffer), &context), 0);
+}
+
 TEST(NativeHandlePoller, IsDestroyedWithAReadinessStillUnread) {
   const Signal signal;
   int context = 0;

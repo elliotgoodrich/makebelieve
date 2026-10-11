@@ -34,9 +34,16 @@ class NativeHandlePoller {
   enum class Token : std::uintptr_t {};
 
   /// Starts watching @a handle, with an associated @a context, until the
-  /// registration returned is passed to `remove`.
+  /// registration returned is passed to `remove`. Once `wait` has reported
+  /// it, a watch might not be reported again until it is passed to `rearm`.
   /// @throws std::system_error if @a handle cannot be watched.
   [[nodiscard]] Token add(NativeHandle handle, void* context);
+
+  /// Lets `wait` report the watch @a token identifies again, once its handle
+  /// is ready - at once if it still is.
+  /// @pre @a token came from `add`, has not been removed, and `wait` has
+  /// reported it since it was added or last rearmed.
+  void rearm(Token token) noexcept;
 
   /// Stops the watch @a token identifies, after which it is not
   /// reported again.

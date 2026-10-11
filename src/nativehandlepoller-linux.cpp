@@ -76,6 +76,12 @@ NativeHandlePoller::Token NativeHandlePoller::add(NativeHandle handle,
   return static_cast<Token>(handle);
 }
 
+// Nothing to do: a level-triggered descriptor stays watched, and is reported
+// by every wait while it is ready. `EPOLLONESHOT`, re-armed here with
+// `EPOLL_CTL_MOD`, would cost a system call per readiness and change nothing,
+// as re-arming a descriptor that is still ready reports it again at once.
+void NativeHandlePoller::rearm(Token /*token*/) noexcept {}
+
 void NativeHandlePoller::remove(Token token) noexcept {
   ::epoll_ctl(m_impl->epoll, EPOLL_CTL_DEL, static_cast<int>(token), nullptr);
 }
