@@ -179,3 +179,17 @@ if(BUILD_TESTING)
   )
   gtest_discover_tests(consoleinterrupthandler_test PROPERTIES TIMEOUT 30)
 endif()
+
+if(MAKEBELIEVE_BUILD_BENCHMARKS)
+  # Not registered with ctest: a benchmark is run by hand, from an optimized
+  # build.
+  function(makebelieve_add_benchmark name)
+    add_executable(${name}_benchmark ${name}.b.cpp)
+    target_link_libraries(${name}_benchmark PRIVATE
+      makebelieve_core
+      benchmark::benchmark_main
+    )
+  endfunction()
+
+  makebelieve_add_benchmark(iocontext)
+endif()

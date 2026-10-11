@@ -59,6 +59,30 @@ if(BUILD_TESTING)
   include(GoogleTest)
 endif()
 
+# Off by default, so that ordinary builds and CI neither download nor build
+# Google Benchmark. Measure with a Release or RelWithDebInfo build: Debug
+# builds here turn on the sanitizers too.
+option(MAKEBELIEVE_BUILD_BENCHMARKS "Build the benchmarks." OFF)
+if(MAKEBELIEVE_BUILD_BENCHMARKS)
+  FetchContent_Declare(
+    benchmark
+    GIT_REPOSITORY https://github.com/google/benchmark.git
+    GIT_TAG v1.9.1
+    GIT_SHALLOW TRUE
+  )
+  # Its own tests, and the GoogleTest-based ones, are not ours to run.
+  set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_INSTALL_DOCS OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(benchmark)
+  # As for GoogleTest above: link the dynamic CRT this project builds with
+  # (/MDd, /MD). Benchmark has no switch like gtest_force_shared_crt, so its
+  # targets are pinned to it directly.
+  set_property(TARGET benchmark benchmark_main PROPERTY
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
+
 add_compile_options(
   $<$<CXX_COMPILER_ID:MSVC>:/W4>
   # MSVC's traditional preprocessor does not implement __VA_OPT__, which the
