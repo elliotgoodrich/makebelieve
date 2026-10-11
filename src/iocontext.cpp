@@ -49,10 +49,24 @@ IoContext::~IoContext() {
   m_poller.wake();
 }
 
-void IoContext::spawn_watch(NativeHandle handle,
-                            stdexec::counting_scope& scope,
-                            std::move_only_function<void() noexcept> on_ready) {
-  stdexec::spawn(watch(handle, std::move(on_ready)), scope.get_token());
+// Defined out of line, so its callers instantiate none of the sender.
+void IoContext::spawn_watch(
+    NativeHandle handle,
+    stdexec::counting_scope& scope,
+    std::move_only_function<void() noexcept> on_ready,
+    std::move_only_function<void(std::error_code) noexcept> on_error) {
+  stdexec::spawn(
+      watch(handle, std::move(on_ready)) |
+          stdexec::upon_error([this, on_error = std::move(on_error)](
+                                  std::error_code error) mutable noexcept {
+            on_error(error);
+            m_watch_failed.request_stop();
+          }),
+      scope.get_token());
+}
+
+std::stop_token IoContext::watch_failure_token() const noexcept {
+  return m_watch_failed.get_token();
 }
 
 // The context's thread takes the whole stack at once, so only a push onto an
@@ -151,14 +165,21 @@ void IoContext::run(const detail::IoThreadPasskey& passkey) noexcept {
     // one may have moved another into `m_cancelled`. A watch stays registered
     // once its callback returns, and is rearmed even if a stop has been
     // requested meanwhile - perhaps by the callback itself, which only pushes
-    // the watch onto `m_cancels` - as the next pass unregisters it.
+    // the watch onto `m_cancels` - as the next pass unregisters it. A watch
+    // that cannot be rearmed has failed, and is finished as one that could not
+    // be registered is.
     for (void* const context : m_poller.wait(ready)) {
       auto* const wait = static_cast<detail::IoContextWait*>(context);
       if (wait->handle_ready(passkey)) {
         unregister(passkey, *wait);
         finish(passkey, *wait, {}, false);
       } else {
-        m_poller.rearm(wait->registration);
+        try {
+          m_poller.rearm(wait->registration);
+        } catch (const std::system_error& e) {
+          unregister(passkey, *wait);
+          finish(passkey, *wait, e.code(), false);
+        }
       }
     }
   }

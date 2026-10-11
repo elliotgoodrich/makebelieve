@@ -190,8 +190,18 @@ class UnmountChannel::Impl {
       throw std::system_error(last_error_code(), "listen");
     }
 
-    io.spawn_watch(m_listen.get(), m_listening,
-                   [this]() noexcept { accept_pokes(); });
+    io.spawn_watch(
+        m_listen.get(), m_listening, [this]() noexcept { accept_pokes(); },
+        [](std::error_code error) noexcept {
+          // Best-effort, as this runs on the IoContext's thread.
+          try {
+            std::println(
+                stderr,
+                "makebelieve: stopped watching for unmount requests: {}",
+                error.message());
+          } catch (...) {  // NOLINT(bugprone-empty-catch)
+          }
+        });
     m_serving = true;
   }
 

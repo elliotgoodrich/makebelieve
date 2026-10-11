@@ -2,7 +2,6 @@
 #include "nativehandlepoller.hpp"
 
 #include <array>
-#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -18,51 +17,92 @@ std::error_code last_error_code() {
   return {static_cast<int>(GetLastError()), std::system_category()};
 }
 
-// One handle's watch: a thread pool wait, which posts the watch to the port,
-// as the completion key, once the handle is signalled. Its address is the
-// registration `add` hands out. A thread pool wait is armed for one signal at
-// a time, which suits a handle that stays signalled - a manual-reset event -
-// as it is reported once rather than over and over, and setting it again is
-// all `rearm` needs. A packet cannot be taken back out of the port, so one
-// posted just before the watch was removed keeps it alive until wait()
-// dequeues it.
+// The wait completion packet routines, which have no import library or
+// header, so they are found in ntdll at run time. See
+// https://learn.microsoft.com/windows/win32/devnotes/ntassociatewaitcompletionpacket
+using NtStatus = LONG;
+constexpr NtStatus k_status_success = 0;
+
+using NtCreateWaitCompletionPacketFn = NtStatus(NTAPI*)(HANDLE* packet,
+                                                        ACCESS_MASK access,
+                                                        void* attributes);
+using NtAssociateWaitCompletionPacketFn =
+    NtStatus(NTAPI*)(HANDLE packet,
+                     HANDLE port,
+                     HANDLE target,
+                     void* key,
+                     void* apc_context,
+                     NtStatus status,
+                     ULONG_PTR information,
+                     BOOLEAN* already_signalled);
+using NtCancelWaitCompletionPacketFn =
+    NtStatus(NTAPI*)(HANDLE packet, BOOLEAN remove_signalled_packet);
+using RtlNtStatusToDosErrorFn = ULONG(NTAPI*)(NtStatus status);
+
+// Looks up @a name in ntdll, which every process has loaded.
+template <class Fn>
+Fn ntdll_function(const char* name) {
+  const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  const auto function = reinterpret_cast<Fn>(
+      ntdll == nullptr ? nullptr : GetProcAddress(ntdll, name));
+  if (function == nullptr) {
+    throw std::system_error(last_error_code(), name);
+  }
+  return function;
+}
+
+// One handle's watch: a wait completion packet, which the kernel queues to
+// the port, with the watch as its key, once the handle is signalled. Its
+// address is the registration `add` hands out. An association fires once,
+// which suits a handle that stays signalled - a manual-reset event - as it is
+// reported once rather than over and over, and associating it again is all
+// `rearm` needs.
 struct RegisteredWait {
-  HANDLE port;
   HANDLE handle;
   void* context;
-  PTP_WAIT wait = nullptr;
+  HANDLE packet = nullptr;
 
-  // Set on a thread pool thread just before posting, which happens at most
-  // once per arming.
-  std::atomic<bool> posted = false;
-
-  // On the context's thread: whether wait() has dequeued the packet, and
-  // whether remove() has left the watch for wait() to free.
-  bool consumed = false;
+  // On the context's thread: whether the packet is associated and not yet
+  // dequeued - waiting on the handle, on its way to the port, or there - and
+  // whether remove() has left the watch for wait() to free, as its packet
+  // could not be taken back out of the port. Closing the packet takes back
+  // one that is queued, so a watch left for wait() keeps it open.
+  bool associated = false;
   bool removed = false;
 
-  RegisteredWait(HANDLE port, HANDLE handle, void* context) noexcept
-      : port(port), handle(handle), context(context) {}
-};
+  RegisteredWait(HANDLE handle, void* context) noexcept
+      : handle(handle), context(context) {}
 
-// Runs on a thread pool thread, so it only posts.
-void CALLBACK on_signalled(PTP_CALLBACK_INSTANCE /*instance*/,
-                           void* context,
-                           PTP_WAIT /*wait*/,
-                           TP_WAIT_RESULT /*result*/) {
-  auto* const registered = static_cast<RegisteredWait*>(context);
-  registered->posted.store(true, std::memory_order_release);
-  PostQueuedCompletionStatus(registered->port, 0,
-                             reinterpret_cast<ULONG_PTR>(registered), nullptr);
-}
+  ~RegisteredWait() {
+    if (packet != nullptr) {
+      CloseHandle(packet);
+    }
+  }
+
+  RegisteredWait(const RegisteredWait&) = delete;
+  RegisteredWait& operator=(const RegisteredWait&) = delete;
+  RegisteredWait(RegisteredWait&&) = delete;
+  RegisteredWait& operator=(RegisteredWait&&) = delete;
+};
 
 }  // namespace
 
 // An I/O completion port, which is what the context's thread blocks on, and
-// the thread pool waits posting to it: the thread pool watches the handles
-// itself, so there is no limit on how many are watched at once. A completion
-// with a null key is wake().
+// that the kernel queues each watch's packet to once its handle is signalled,
+// with no thread in between, so there is no limit on how many are watched at
+// once. A completion with a null key is wake().
 struct NativeHandlePoller::Impl {
+  NtCreateWaitCompletionPacketFn create_packet =
+      ntdll_function<NtCreateWaitCompletionPacketFn>(
+          "NtCreateWaitCompletionPacket");
+  NtAssociateWaitCompletionPacketFn associate_packet =
+      ntdll_function<NtAssociateWaitCompletionPacketFn>(
+          "NtAssociateWaitCompletionPacket");
+  NtCancelWaitCompletionPacketFn cancel_packet =
+      ntdll_function<NtCancelWaitCompletionPacketFn>(
+          "NtCancelWaitCompletionPacket");
+  RtlNtStatusToDosErrorFn status_to_error =
+      ntdll_function<RtlNtStatusToDosErrorFn>("RtlNtStatusToDosError");
   HANDLE port = nullptr;
 
   Impl() : port(CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1)) {
@@ -91,6 +131,23 @@ struct NativeHandlePoller::Impl {
   Impl& operator=(const Impl&) = delete;
   Impl(Impl&&) = delete;
   Impl& operator=(Impl&&) = delete;
+
+  [[nodiscard]] std::error_code error_code(NtStatus status) const {
+    return {static_cast<int>(status_to_error(status)), std::system_category()};
+  }
+
+  // Asks the kernel to queue @a registered's packet once its handle is
+  // signalled - at once if it already is.
+  void associate(RegisteredWait& registered) const {
+    const NtStatus status =
+        associate_packet(registered.packet, port, registered.handle,
+                         &registered, nullptr, k_status_success, 0, nullptr);
+    if (status != k_status_success) {
+      throw std::system_error(error_code(status),
+                              "NtAssociateWaitCompletionPacket");
+    }
+    registered.associated = true;
+  }
 };
 
 NativeHandlePoller::NativeHandlePoller() : m_impl(std::make_unique<Impl>()) {}
@@ -99,48 +156,38 @@ NativeHandlePoller::~NativeHandlePoller() = default;
 
 NativeHandlePoller::Token NativeHandlePoller::add(NativeHandle handle,
                                                   void* context) {
-  // A thread pool wait takes any handle without complaint - and a null one as
-  // a request to stop waiting - so a bad one is caught here instead. This
-  // reads nothing of the handle's state, so it consumes no signal.
-  DWORD flags = 0;
-  if (!GetHandleInformation(handle, &flags)) {
-    throw std::system_error(last_error_code(), "GetHandleInformation");
+  auto registered = std::make_unique<RegisteredWait>(handle, context);
+  const NtStatus status =
+      m_impl->create_packet(&registered->packet, GENERIC_ALL, nullptr);
+  if (status != k_status_success) {
+    registered->packet = nullptr;
+    throw std::system_error(m_impl->error_code(status),
+                            "NtCreateWaitCompletionPacket");
   }
-  auto registered =
-      std::make_unique<RegisteredWait>(m_impl->port, handle, context);
-  registered->wait =
-      CreateThreadpoolWait(&on_signalled, registered.get(), nullptr);
-  if (registered->wait == nullptr) {
-    throw std::system_error(last_error_code(), "CreateThreadpoolWait");
-  }
-  SetThreadpoolWait(registered->wait, handle, nullptr);
+  m_impl->associate(*registered);
   return static_cast<Token>(
       reinterpret_cast<std::uintptr_t>(registered.release()));
 }
 
-// The packet has been dequeued, so the callback that posted it touches the
-// watch no more, and no other is armed to: nothing races these writes, and
-// arming publishes them to the next callback.
-void NativeHandlePoller::rearm(Token token) noexcept {
-  auto* const registered =
-      reinterpret_cast<RegisteredWait*>(static_cast<std::uintptr_t>(token));
-  registered->posted.store(false, std::memory_order_relaxed);
-  registered->consumed = false;
-  SetThreadpoolWait(registered->wait, registered->handle, nullptr);
+// wait() has dequeued the packet, so it is free to associate again. If that
+// fails, the watch is left unassociated, for remove() to free at once.
+void NativeHandlePoller::rearm(Token token) {
+  m_impl->associate(
+      *reinterpret_cast<RegisteredWait*>(static_cast<std::uintptr_t>(token)));
 }
 
+// Success means that nothing reaches the port: the wait is cancelled before
+// it was satisfied, or its packet is taken back out of the port. Otherwise a
+// packet still associated is on its way to the port, or there and not taken
+// back - the kernel reports "pending" or "already completed" - so the watch is
+// left for wait() to dequeue and free. One not associated - never, or not
+// since wait() dequeued its packet - has nothing to come.
 void NativeHandlePoller::remove(Token token) noexcept {
   auto* const registered =
       reinterpret_cast<RegisteredWait*>(static_cast<std::uintptr_t>(token));
-  // Stops the wait, cancels a callback queued but not yet started, and blocks
-  // until one already running has posted, so nothing touches the watch from
-  // the thread pool's side once the wait is closed.
-  SetThreadpoolWait(registered->wait, nullptr, nullptr);
-  WaitForThreadpoolWaitCallbacks(registered->wait, TRUE);
-  CloseThreadpoolWait(registered->wait);
-  if (registered->posted.load(std::memory_order_acquire) &&
-      !registered->consumed) {
-    registered->removed = true;  // wait() frees it with its packet.
+  if (m_impl->cancel_packet(registered->packet, TRUE) != k_status_success &&
+      registered->associated) {
+    registered->removed = true;
   } else {
     delete registered;
   }
@@ -162,10 +209,10 @@ std::span<void*> NativeHandlePoller::wait(
     if (registered == nullptr) {
       continue;  // wake()
     }
+    registered->associated = false;
     if (registered->removed) {
       delete registered;
     } else {
-      registered->consumed = true;
       buffer[written++] = registered->context;
     }
   }

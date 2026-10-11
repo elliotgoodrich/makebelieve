@@ -160,6 +160,47 @@ TEST(NativeHandlePoller, AWatchRemovedOnceRearmedAndReadyIsNotReported) {
   EXPECT_EQ(count_of(poller.wait(buffer), &context), 0);
 }
 
+// Rearming a watch on a handle that is still ready races its readiness
+// reaching the port against the removal straight after, so that removal finds
+// it at every stage. None may be reported after it is removed, and on Windows
+// none may be dequeued after its watch is freed, which a sanitizer catches.
+TEST(NativeHandlePoller, RemovalsRaceReadinessArrivingAfterARearm) {
+  NativeHandlePoller poller;
+  const Signal signal;
+  int context = 0;
+  signal.set();
+  for (int i = 0; i < 2000; ++i) {
+    const auto registration = poller.add(signal.handle(), &context);
+    wait_for(poller, &context);
+    poller.rearm(registration);
+    if (i % 2 == 0) {
+      std::this_thread::yield();
+    }
+    poller.remove(registration);
+  }
+
+  int reported = 0;
+  for (int i = 0; i < 4; ++i) {
+    poller.wake();
+    Buffer buffer{};
+    reported += count_of(poller.wait(buffer), &context);
+  }
+  EXPECT_EQ(reported, 0);
+}
+
+#ifdef _WIN32
+TEST(NativeHandlePoller, RearmingAClosedHandleThrows) {
+  NativeHandlePoller poller;
+  int context = 0;
+  const HANDLE event = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+  const auto registration = poller.add(event, &context);
+  wait_for(poller, &context);
+  CloseHandle(event);
+  EXPECT_THROW(poller.rearm(registration), std::system_error);
+  poller.remove(registration);
+}
+#endif
+
 TEST(NativeHandlePoller, IsDestroyedWithAReadinessStillUnread) {
   const Signal signal;
   int context = 0;

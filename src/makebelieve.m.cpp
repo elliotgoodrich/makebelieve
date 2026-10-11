@@ -44,16 +44,27 @@ int usage(const char* program) {
   return 1;
 }
 
-// Blocks until any of @a tokens has a stop requested, returning at once if one
-// is already stopped. One semaphore permit per token, so however many callbacks
-// fire, the count reaches at most sizeof...(Tokens) - the semaphore's capacity.
-template <std::same_as<std::stop_token>... Tokens>
-void block_until_any(const Tokens&... tokens) {
-  static_assert(sizeof...(Tokens) > 0, "block_until_any needs a token");
-  std::counting_semaphore<sizeof...(Tokens)> stopped{0};
+// A reason to stop: a token, and the exit status to end with once a stop is
+// requested on it.
+struct StopReason {
+  std::stop_token token;
+  int exit_status;
+};
+
+// Blocks until any of @a reasons has a stop requested, returning at once if one
+// is already stopped, and returns the highest exit status among those stopped
+// by then, so a failure stopping at the same time as a request is not lost.
+// One semaphore permit per reason, so however many callbacks fire, the count
+// reaches at most sizeof...(Reasons) - the semaphore's capacity.
+template <std::same_as<StopReason>... Reasons>
+int wait_for_stop(const Reasons&... reasons) {
+  static_assert(sizeof...(Reasons) > 0, "wait_for_stop needs a reason");
+  std::counting_semaphore<sizeof...(Reasons)> stopped{0};
   auto on_stop = [&stopped] { stopped.release(); };
-  const std::array callbacks{std::stop_callback{tokens, on_stop}...};
+  const std::array callbacks{std::stop_callback{reasons.token, on_stop}...};
   stopped.acquire();
+  return std::max(
+      {(reasons.token.stop_requested() ? reasons.exit_status : 0)...});
 }
 
 // Serves the manifest's outputs at `mountpoint`, with at most @a jobs builds
@@ -133,8 +144,13 @@ int mount(const char* mountpoint_arg, unsigned jobs) {
                "`makebelieve unmount {}` to stop",
                mountpoint_arg, mountpoint_arg);
 
-  block_until_any(interrupt.token(), unmount_channel.token());
-  return 0;
+  // A failed watch has already said why on stderr. It leaves the mount unable
+  // to keep up with the source, or to be stopped as asked, so it is torn down
+  // like any other stop, but ends with a failing exit status.
+  return wait_for_stop(
+      StopReason{.token = interrupt.token(), .exit_status = 0},
+      StopReason{.token = unmount_channel.token(), .exit_status = 0},
+      StopReason{.token = io.watch_failure_token(), .exit_status = 1});
 }
 
 // Signals the daemon serving `mountpoint` to shut down and waits for it to go.

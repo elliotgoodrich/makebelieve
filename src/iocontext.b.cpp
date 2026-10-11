@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -95,6 +96,12 @@ class OtherWaits {
   OtherWaits& operator=(OtherWaits&&) = delete;
 };
 
+// What a spawned watch is given to call if it fails, which would leave the
+// benchmark waiting forever.
+void abort_watch(std::error_code /*error*/) noexcept {
+  std::abort();
+}
+
 // Counts the events a watch has handled, for the benchmark's thread to wait
 // on.
 class Handled {
@@ -123,10 +130,13 @@ void watch_round_trip(benchmark::State& state) {
   const Signal signal;
   Handled handled;
   stdexec::counting_scope scope;
-  io.spawn_watch(signal.handle(), scope, [&]() noexcept {
-    signal.reset();
-    handled.add();
-  });
+  io.spawn_watch(
+      signal.handle(), scope,
+      [&]() noexcept {
+        signal.reset();
+        handled.add();
+      },
+      abort_watch);
 
   std::uint64_t seen = 0;
   for (auto _ : state) {
@@ -168,6 +178,30 @@ BENCHMARK(async_wait_round_trip)
     ->Arg(100)
     ->UseRealTime();
 
+// What `async_wait_round_trip` costs with no handle involved: queueing work on
+// the context's thread, waking it, and `sync_wait` waking this thread again.
+void schedule_round_trip(benchmark::State& state) {
+  IoContext io;
+  for (auto _ : state) {
+    stdexec::sync_wait(stdexec::schedule(io.get_scheduler()));
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(schedule_round_trip)->UseRealTime();
+
+// What registering a handle with the poller, and removing it, costs on its
+// own, on one thread.
+void poller_add_remove(benchmark::State& state) {
+  NativeHandlePoller poller;
+  const Signal signal;
+  int context = 0;
+  for (auto _ : state) {
+    poller.remove(poller.add(signal.handle(), &context));
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(poller_add_remove);
+
 // range(0) events per iteration, all but the first raised from inside the
 // watch's callback, so the context's thread handles them back to back with no
 // other thread involved.
@@ -178,14 +212,17 @@ void watch_burst(benchmark::State& state) {
   std::int64_t remaining = 0;  // Touched only by the callback.
   Handled handled;
   stdexec::counting_scope scope;
-  io.spawn_watch(signal.handle(), scope, [&]() noexcept {
-    signal.reset();
-    if (--remaining > 0) {
-      signal.set();
-    } else {
-      handled.add();
-    }
-  });
+  io.spawn_watch(
+      signal.handle(), scope,
+      [&]() noexcept {
+        signal.reset();
+        if (--remaining > 0) {
+          signal.set();
+        } else {
+          handled.add();
+        }
+      },
+      abort_watch);
 
   std::uint64_t seen = 0;
   for (auto _ : state) {

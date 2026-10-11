@@ -5,7 +5,9 @@
 
 #include <stdexec/execution.hpp>
 
+#include <cstdio>
 #include <filesystem>
+#include <print>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -134,8 +136,19 @@ class UnmountChannel::Impl {
     }
 
     // The poke is idempotent, so the watch keeps going to the end.
-    io.spawn_watch(m_poke.get(), m_listening,
-                   [this]() noexcept { m_source.request_stop(); });
+    io.spawn_watch(
+        m_poke.get(), m_listening,
+        [this]() noexcept { m_source.request_stop(); },
+        [](std::error_code error) noexcept {
+          // Best-effort, as this runs on the IoContext's thread.
+          try {
+            std::println(
+                stderr,
+                "makebelieve: stopped watching for unmount requests: {}",
+                error.message());
+          } catch (...) {  // NOLINT(bugprone-empty-catch)
+          }
+        });
   }
 
   ~Impl() {
