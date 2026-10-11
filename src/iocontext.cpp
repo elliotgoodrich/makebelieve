@@ -146,12 +146,20 @@ void IoContext::run(const detail::IoThreadPasskey& passkey) noexcept {
     }
 
     // Each wait is reported at most once, and none can be freed by another's
-    // completion before it has completed itself, so each is still registered -
-    // though finishing one may have moved another into `m_cancelled`.
+    // completion before it has completed itself, nor by a watch's callback,
+    // which completes nothing, so each is still registered - though finishing
+    // one may have moved another into `m_cancelled`. A watch stays registered
+    // once its callback returns, and is rearmed even if a stop has been
+    // requested meanwhile - perhaps by the callback itself, which only pushes
+    // the watch onto `m_cancels` - as the next pass unregisters it.
     for (void* const context : m_poller.wait(ready)) {
       auto* const wait = static_cast<detail::IoContextWait*>(context);
-      unregister(passkey, *wait);
-      finish(passkey, *wait, {}, false);
+      if (wait->handle_ready()) {
+        unregister(passkey, *wait);
+        finish(passkey, *wait, {}, false);
+      } else {
+        m_poller.rearm(wait->registration);
+      }
     }
   }
 }
