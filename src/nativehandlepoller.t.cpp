@@ -4,11 +4,12 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
+#include <span>
 #include <system_error>
 #include <thread>
-#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -59,15 +60,16 @@ class Signal {
   }
 };
 
-int count_of(const std::vector<void*>& ready, void* context) {
+using Buffer = std::array<void*, NativeHandlePoller::max_ready>;
+
+int count_of(std::span<void* const> ready, void* context) {
   return static_cast<int>(std::ranges::count(ready, context));
 }
 
 // Waits until @a context is reported, as a wait may return with nothing.
 void wait_for(NativeHandlePoller& poller, void* context) {
-  std::vector<void*> ready;
-  while (count_of(ready, context) == 0) {
-    poller.wait(ready);
+  Buffer buffer{};
+  while (count_of(poller.wait(buffer), context) == 0) {
   }
 }
 
@@ -87,9 +89,8 @@ TEST(NativeHandlePoller, WakeReturnsAWaitWithNothingReady) {
   int context = 0;
   const auto registration = poller.add(signal.handle(), &context);
   poller.wake();
-  std::vector<void*> ready;
-  poller.wait(ready);
-  EXPECT_TRUE(ready.empty());
+  Buffer buffer{};
+  EXPECT_TRUE(poller.wait(buffer).empty());
   poller.remove(registration);
 }
 
@@ -104,9 +105,8 @@ TEST(NativeHandlePoller, AHandleRemovedOnceReadyIsNotReported) {
   poller.remove(registration);
 
   poller.wake();
-  std::vector<void*> ready;
-  poller.wait(ready);
-  EXPECT_EQ(count_of(ready, &context), 0);
+  Buffer buffer{};
+  EXPECT_EQ(count_of(poller.wait(buffer), &context), 0);
 }
 
 TEST(NativeHandlePoller, AKeyAddedAgainAfterARemovalIsReportedOnce) {
@@ -121,11 +121,12 @@ TEST(NativeHandlePoller, AKeyAddedAgainAfterARemovalIsReportedOnce) {
   // What the first registration posted must not count for the second.
   const auto second = poller.add(signal.handle(), &context);
   std::this_thread::sleep_for(50ms);
-  std::vector<void*> ready;
-  while (count_of(ready, &context) == 0) {
-    poller.wait(ready);
+  Buffer buffer{};
+  int reported = 0;
+  while (reported == 0) {
+    reported += count_of(poller.wait(buffer), &context);
   }
-  EXPECT_EQ(count_of(ready, &context), 1);
+  EXPECT_EQ(reported, 1);
   poller.remove(second);
 }
 

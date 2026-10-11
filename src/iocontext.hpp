@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include "linkednode.hpp"
 #include "nativehandle.hpp"
 #include "nativehandlepoller.hpp"
 
 #include <exec/repeat_until.hpp>
 #include <stdexec/execution.hpp>
 
+#include <atomic>
 #include <concepts>
-#include <cstddef>
 #include <functional>
-#include <mutex>
 #include <optional>
 #include <system_error>
 #include <thread>
@@ -23,15 +23,34 @@ class IoContext;
 
 namespace detail {
 
+// Functions that run on the context's thread will be passed an instance of
+// `IoThreadPasskey` as proof that they are running there.  This will be
+// used to guarantee that these functions are never called from another
+// thread.
+class IoThreadPasskey;
+
 // Work queued to run on an `IoContext`'s thread. An operation state derives
 // from it, so the queue needs no allocation and queueing cannot fail.
 class IoContextTask {
  public:
-  // The next task in the context's queue, guarded by the context's lock.
+#ifdef NDEBUG
+  // The next task in the context's queue. Written before the task is
+  // published to the queue, and read only by the context's thread.
   IoContextTask* next = nullptr;
+#else
+  // What `next` holds while the task is not queued, so that `submit` can
+  // catch a task queued twice - in Debug builds only, as the check costs a
+  // store per task.
+  static IoContextTask* not_queued() noexcept;
+
+  // The next task in the context's queue, or `not_queued()`. Written before
+  // the task is published to the queue, and read only by the context's
+  // thread.
+  IoContextTask* next = not_queued();
+#endif
 
   // Runs the task on the context's thread. May destroy it.
-  virtual void execute() noexcept = 0;
+  virtual void execute(const IoThreadPasskey& passkey) noexcept = 0;
 
   IoContextTask(const IoContextTask&) = delete;
   IoContextTask& operator=(const IoContextTask&) = delete;
@@ -47,7 +66,7 @@ class IoContextTask {
 // the handle, the links the context lists it by, and the part that depends on
 // who is waiting - installing and removing the stop callback, and completing
 // the sender - which the operation state that derives from it supplies.
-class IoContextWait {
+class IoContextWait : public LinkedNode<IoContextWait> {
  public:
   // What is waited on.
   NativeHandle handle;
@@ -55,10 +74,10 @@ class IoContextWait {
   // Identifies the handle's watch with the poller while it is registered.
   NativeHandlePoller::Token registration{};
 
-  // Links the wait into the context's list of cancellations, guarded by the
-  // context's lock.
+  // The next wait in the context's stack of cancellations. Written by the
+  // stop callback before it pushes the wait, and read only by the context's
+  // thread. The `LinkedNode` links are touched only by the context's thread.
   IoContextWait* next_cancel = nullptr;
-  bool cancel_queued = false;
 
   // Installs the stop callback. May run the callback inline.
   virtual void arm() noexcept = 0;
@@ -171,16 +190,21 @@ class IoContext {
  private:
   NativeHandlePoller m_poller;
 
-  // Guards the queues below, which any thread may add to.
-  std::mutex m_mutex;
-  detail::IoContextTask* m_first_task = nullptr;
-  detail::IoContextTask* m_last_task = nullptr;
-  detail::IoContextWait* m_cancels = nullptr;
-  bool m_stopping = false;
+  // The tasks queued to run, newest first, which any thread may push to.
+  std::atomic<detail::IoContextTask*> m_tasks = nullptr;
 
-  // How many waits have their handles with the poller, to check that none is
-  // left when the context stops. Touched only by the context's thread.
-  std::size_t m_registered = 0;
+  // The waits whose stop callbacks have fired, newest first, which any thread
+  // may push to.
+  std::atomic<detail::IoContextWait*> m_cancels = nullptr;
+
+  std::atomic<bool> m_stopping = false;
+
+  // The heads of the lists of waits that have their handles with the poller:
+  // those not cancelled, and those taken from `m_cancels` to be stopped. A
+  // wait being finished may briefly be in `m_cancelled` while unregistered.
+  // Touched only by the context's thread.
+  LinkedNode<detail::IoContextWait> m_registered;
+  LinkedNode<detail::IoContextWait> m_cancelled;
 
   // Declared last so that everything it uses exists before it starts.
   std::jthread m_thread;
@@ -192,17 +216,24 @@ class IoContext {
   void cancel(detail::IoContextWait& wait) noexcept;
 
   // On the context's thread: arm @a wait and register its handle.
-  void begin_wait(detail::IoContextWait& wait) noexcept;
+  void begin_wait(const detail::IoThreadPasskey& passkey,
+                  detail::IoContextWait& wait) noexcept;
 
   // The context's thread.
-  void run();
+  void run(const detail::IoThreadPasskey& passkey) noexcept;
 
-  // On the context's thread: take @a wait, which is registered, back from the
-  // poller.
-  void unregister(detail::IoContextWait& wait) noexcept;
+  // On the context's thread: move each wait on `m_cancels` into
+  // `m_cancelled`.
+  void take_cancels(const detail::IoThreadPasskey& passkey) noexcept;
 
-  // On the context's thread: resolves @a wait, which is no longer registered.
-  void finish(detail::IoContextWait& wait,
+  // On the context's thread: take @a wait's handle back from the poller.
+  void unregister(const detail::IoThreadPasskey& passkey,
+                  detail::IoContextWait& wait) noexcept;
+
+  // On the context's thread: resolves @a wait, which is no longer registered,
+  // taking it out of whichever list holds it.
+  void finish(const detail::IoThreadPasskey& passkey,
+              detail::IoContextWait& wait,
               std::error_code error,
               bool stopped) noexcept;
 };
@@ -215,7 +246,7 @@ class IoContextScheduleOperation final : IoContextTask {
   Receiver m_receiver;
 
   // Run on the context's thread once queued.
-  void execute() noexcept override {
+  void execute(const IoThreadPasskey& /*passkey*/) noexcept override {
     if (stdexec::get_stop_token(stdexec::get_env(m_receiver))
             .stop_requested()) {
       stdexec::set_stopped(std::move(m_receiver));
@@ -240,9 +271,10 @@ class IoContextScheduleOperation final : IoContextTask {
   void start() & noexcept { m_context->submit(*this); }
 };
 
-// Started by queueing itself as a task that, on the context's thread, arms the
-// stop callback and registers the handle; the context then resolves the wait
-// exactly once, by disarming and completing it.
+// Started by queueing itself as a task that, on the context's thread, completes
+// stopped if a stop is already requested, and otherwise arms the stop callback
+// and registers the handle; the context then resolves the wait exactly once,
+// by disarming and completing it.
 template <stdexec::receiver_of<detail::IoContextWaitSignatures> Receiver>
 class IoContextWaitOperation final : IoContextTask, IoContextWait {
   struct OnStop {
@@ -255,8 +287,17 @@ class IoContextWaitOperation final : IoContextTask, IoContextWait {
   Receiver m_receiver;
   std::optional<stdexec::stop_callback_for_t<Token, OnStop>> m_on_stop;
 
-  // Run on the context's thread once queued: arms and registers the wait.
-  void execute() noexcept override { m_context->begin_wait(*this); }
+  // Run on the context's thread once queued. A wait already stopped is never
+  // armed or registered, so it completes here with nothing to undo; a stop
+  // requested after this check is handled by the stop callback.
+  void execute(const IoThreadPasskey& passkey) noexcept override {
+    if (stdexec::get_stop_token(stdexec::get_env(m_receiver))
+            .stop_requested()) {
+      stdexec::set_stopped(std::move(m_receiver));
+    } else {
+      m_context->begin_wait(passkey, *this);
+    }
+  }
 
   void arm() noexcept override {
     m_on_stop.emplace(stdexec::get_stop_token(stdexec::get_env(m_receiver)),

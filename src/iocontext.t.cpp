@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <system_error>
 #include <thread>
 #include <tuple>
@@ -193,7 +194,10 @@ TEST(IoContext, AWaitStoppedBeforeItStartsCompletesStopped) {
   const Signal signal;
   ex::inplace_stop_source stop;
   stop.request_stop();
-  EXPECT_EQ(wait_on(io, signal, stop.get_token()), Outcome::stopped);
+  std::thread::id completed_on;
+  EXPECT_EQ(wait_on(io, signal, stop.get_token(), &completed_on),
+            Outcome::stopped);
+  EXPECT_EQ(completed_on, context_thread(io));
 }
 
 TEST(IoContext, ScopeStopEndsASpawnedWaitLoop) {
@@ -305,6 +309,53 @@ TEST(IoContext, WaitsOnManyHandlesAtOnce) {
   ex::sync_wait(scope.join());
 }
 
+TEST(IoContext, StoppingSomeWaitsLeavesTheOthersWaiting) {
+  IoContext io;
+  constexpr int k_waits = 20;
+  std::vector<std::unique_ptr<Signal>> signals;
+  std::vector<std::unique_ptr<ex::inplace_stop_source>> stops;
+  for (int i = 0; i < k_waits; ++i) {
+    signals.push_back(std::make_unique<Signal>());
+    stops.push_back(std::make_unique<ex::inplace_stop_source>());
+  }
+
+  std::atomic<int> ready = 0;
+  std::atomic<int> stopped = 0;
+  ex::counting_scope scope;
+  for (int i = 0; i < k_waits; ++i) {
+    ex::spawn(
+        ex::write_env(io.async_wait(signals[i]->handle()),
+                      ex::prop{ex::get_stop_token, stops[i]->get_token()}) |
+            ex::then([&ready]() noexcept { ++ready; }) |
+            ex::upon_error([](std::error_code) noexcept {}) |
+            ex::upon_stopped([&stopped]() noexcept { ++stopped; }),
+        scope.get_token());
+  }
+  std::this_thread::sleep_for(50ms);
+
+  const auto wait_for = [](const std::atomic<int>& count, int expected) {
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (count < expected && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(10ms);
+    }
+  };
+
+  for (int i = 0; i < k_waits; i += 2) {
+    stops[i]->request_stop();
+  }
+  wait_for(stopped, k_waits / 2);
+  EXPECT_EQ(stopped.load(), k_waits / 2);
+  EXPECT_EQ(ready.load(), 0);
+
+  for (int i = 1; i < k_waits; i += 2) {
+    signals[i]->set();
+  }
+  wait_for(ready, k_waits / 2);
+  EXPECT_EQ(ready.load(), k_waits / 2);
+  EXPECT_EQ(stopped.load(), k_waits / 2);
+  ex::sync_wait(scope.join());
+}
+
 TEST(IoContext, AnUnwaitableHandleFailsTheWait) {
   IoContext io;
 #ifdef _WIN32
@@ -319,6 +370,126 @@ TEST(IoContext, AnUnwaitableHandleFailsTheWait) {
       }));
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(std::get<0>(*result));
+}
+
+// Waits a random, short while - not at all, a yield, or a spin of up to 20us
+// - to vary how the caller's next step interleaves with the context's thread.
+void jitter(std::mt19937& rng) {
+  switch (rng() % 3) {
+    case 0:
+      return;
+    case 1:
+      std::this_thread::yield();
+      return;
+    default: {
+      const auto until = std::chrono::steady_clock::now() +
+                         std::chrono::microseconds(rng() % 20);
+      while (std::chrono::steady_clock::now() < until) {
+      }
+    }
+  }
+}
+
+// Races handles becoming ready, stops being requested and waits starting
+// against each other from many threads at once, alongside waits that stay
+// registered throughout, for the sanitizers to catch a race or a wait touched
+// after it completes. Each wait must complete exactly once, in a way its
+// readiness and stop allow.
+TEST(IoContext, StressRacesReadinessAgainstStops) {
+  IoContext io;
+
+  constexpr int k_background = 50;
+  std::vector<std::unique_ptr<Signal>> background_signals;
+  ex::inplace_stop_source background_stop;
+  std::atomic<int> background_stopped = 0;
+  ex::counting_scope background;
+  for (int i = 0; i < k_background; ++i) {
+    background_signals.push_back(std::make_unique<Signal>());
+    ex::spawn(ex::write_env(
+                  io.async_wait(background_signals.back()->handle()),
+                  ex::prop{ex::get_stop_token, background_stop.get_token()}) |
+                  ex::then([]() noexcept {}) |
+                  ex::upon_error([](std::error_code) noexcept {}) |
+                  ex::upon_stopped([&background_stopped]() noexcept {
+                    ++background_stopped;
+                  }),
+              background.get_token());
+  }
+
+  constexpr int k_threads = 8;
+  constexpr int k_iterations = 500;
+  std::atomic<int> wrong = 0;
+  std::vector<std::thread> workers;
+  for (int t = 0; t < k_threads; ++t) {
+    workers.emplace_back([&io, &wrong, t] {
+      std::mt19937 rng(t);
+      for (int i = 0; i < k_iterations; ++i) {
+        // At least one of the two, so that every wait ends.
+        const bool set = rng() % 4 != 0;
+        const bool stop = !set || rng() % 2 == 0;
+        const bool before_start = rng() % 4 == 0;
+
+        const Signal signal;
+        ex::inplace_stop_source source;
+        const auto act = [&] {
+          if (set && stop && rng() % 2 == 0) {
+            source.request_stop();
+            jitter(rng);
+            signal.set();
+            return;
+          }
+          if (set) {
+            signal.set();
+          }
+          if (set && stop) {
+            jitter(rng);
+          }
+          if (stop) {
+            source.request_stop();
+          }
+        };
+
+        std::atomic<int> completions = 0;
+        std::atomic<Outcome> outcome = Outcome::error;
+        const auto record = [&](Outcome result) noexcept {
+          outcome = result;
+          ++completions;
+        };
+
+        if (before_start) {
+          act();
+        }
+        ex::counting_scope scope;
+        ex::spawn(
+            ex::write_env(io.async_wait(signal.handle()),
+                          ex::prop{ex::get_stop_token, source.get_token()}) |
+                ex::then([&]() noexcept { record(Outcome::ready); }) |
+                ex::upon_error(
+                    [&](std::error_code) noexcept { record(Outcome::error); }) |
+                ex::upon_stopped([&]() noexcept { record(Outcome::stopped); }),
+            scope.get_token());
+        if (!before_start) {
+          jitter(rng);
+          act();
+        }
+        ex::sync_wait(scope.join());
+
+        const bool allowed = (outcome == Outcome::ready && set) ||
+                             (outcome == Outcome::stopped && stop);
+        if (completions != 1 || !allowed) {
+          ++wrong;
+        }
+      }
+    });
+  }
+  for (std::thread& worker : workers) {
+    worker.join();
+  }
+  EXPECT_EQ(wrong.load(), 0);
+
+  background_stop.request_stop();
+  ex::sync_wait(background.join());
+  EXPECT_EQ(background_stopped.load(), k_background);
 }
 
 }  // namespace
