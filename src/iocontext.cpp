@@ -151,14 +151,21 @@ void IoContext::run(const detail::IoThreadPasskey& passkey) noexcept {
     // one may have moved another into `m_cancelled`. A watch stays registered
     // once its callback returns, and is rearmed even if a stop has been
     // requested meanwhile - perhaps by the callback itself, which only pushes
-    // the watch onto `m_cancels` - as the next pass unregisters it.
+    // the watch onto `m_cancels` - as the next pass unregisters it. A watch
+    // that cannot be rearmed has failed, and is finished as one that could not
+    // be registered is.
     for (void* const context : m_poller.wait(ready)) {
       auto* const wait = static_cast<detail::IoContextWait*>(context);
       if (wait->handle_ready()) {
         unregister(passkey, *wait);
         finish(passkey, *wait, {}, false);
       } else {
-        m_poller.rearm(wait->registration);
+        try {
+          m_poller.rearm(wait->registration);
+        } catch (const std::system_error& e) {
+          unregister(passkey, *wait);
+          finish(passkey, *wait, e.code(), false);
+        }
       }
     }
   }

@@ -440,6 +440,28 @@ TEST(IoContext, AnUnwaitableHandleCompletesAWatch) {
   EXPECT_EQ(wakes, 0);
 }
 
+#ifdef _WIN32
+// Breaks the @pre that the handle stays open, as the only way to make a watch
+// fail once it is registered: closing the handle from the callback makes
+// rearming it fail.
+TEST(IoContext, AWatchThatCannotBeRearmedCompletes) {
+  IoContext io;
+  const HANDLE event = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+  int wakes = 0;
+  std::thread::id completed_on;
+  EXPECT_EQ(watch_on(
+                io, event,
+                [&]() noexcept {
+                  ++wakes;
+                  CloseHandle(event);
+                },
+                {}, &completed_on),
+            Outcome::ready);
+  EXPECT_EQ(completed_on, context_thread(io));
+  EXPECT_EQ(wakes, 1);
+}
+#endif
+
 // Far more than the 63 handles one WaitForMultipleObjects can watch.
 TEST(IoContext, WaitsOnManyHandlesAtOnce) {
   IoContext io;

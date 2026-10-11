@@ -43,7 +43,9 @@ class NativeHandlePoller {
   /// is ready - at once if it still is.
   /// @pre @a token came from `add`, has not been removed, and `wait` has
   /// reported it since it was added or last rearmed.
-  void rearm(Token token) noexcept;
+  /// @throws std::system_error if the handle can no longer be watched, after
+  /// which @a token must still be removed.
+  void rearm(Token token);
 
   /// Stops the watch @a token identifies, after which it is not
   /// reported again.

@@ -170,6 +170,30 @@ BENCHMARK(async_wait_round_trip)
     ->Arg(100)
     ->UseRealTime();
 
+// What `async_wait_round_trip` costs with no handle involved: queueing work on
+// the context's thread, waking it, and `sync_wait` waking this thread again.
+void schedule_round_trip(benchmark::State& state) {
+  IoContext io;
+  for (auto _ : state) {
+    ex::sync_wait(ex::schedule(io.get_scheduler()));
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(schedule_round_trip)->UseRealTime();
+
+// What registering a handle with the poller, and removing it, costs on its
+// own, on one thread.
+void poller_add_remove(benchmark::State& state) {
+  NativeHandlePoller poller;
+  const Signal signal;
+  int context = 0;
+  for (auto _ : state) {
+    poller.remove(poller.add(signal.handle(), &context));
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(poller_add_remove);
+
 // range(0) events per iteration, all but the first raised from inside the
 // watch's callback, so the context's thread handles them back to back with no
 // other thread involved.
