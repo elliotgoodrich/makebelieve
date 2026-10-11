@@ -3,10 +3,11 @@
 
 #include <array>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <system_error>
-#include <vector>
 
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -79,8 +80,10 @@ void NativeHandlePoller::remove(Token token) noexcept {
   ::epoll_ctl(m_impl->epoll, EPOLL_CTL_DEL, static_cast<int>(token), nullptr);
 }
 
-void NativeHandlePoller::wait(std::vector<void*>& ready) {
-  std::array<epoll_event, 64> events{};
+std::span<void*> NativeHandlePoller::wait(
+    std::span<void*, max_ready> buffer) noexcept {
+  std::array<epoll_event, max_ready> events{};
+  std::size_t written = 0;
   const int count = ::epoll_wait(m_impl->epoll, events.data(),
                                  static_cast<int>(events.size()), -1);
   // EINTR, or a failure there is nothing to do about but try again.
@@ -95,9 +98,10 @@ void NativeHandlePoller::wait(std::vector<void*>& ready) {
       static_cast<void>(drained);
     } else {
       // A hang-up or error counts as ready: the caller's read reports it.
-      ready.push_back(context);
+      buffer[written++] = context;
     }
   }
+  return buffer.first(written);
 }
 
 void NativeHandlePoller::wake() noexcept {

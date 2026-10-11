@@ -3,9 +3,10 @@
 
 #include "nativehandle.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <vector>
+#include <span>
 
 namespace makebelieve {
 
@@ -42,11 +43,16 @@ class NativeHandlePoller {
   /// @pre @a token came from `add` and has not been removed.
   void remove(Token token) noexcept;
 
-  /// Blocks until a watched handle is ready or `wake` is called, appending
-  /// the context of each ready handle to @a ready. A handle that hangs up or
-  /// fails counts as ready, leaving its owner's I/O on it to report why. May
-  /// return having appended nothing.
-  void wait(std::vector<void*>& ready);
+  /// The most handles one `wait` reports.
+  static constexpr std::size_t max_ready = 64;
+
+  /// Blocks until a watched handle is ready or `wake` is called, writing the
+  /// context of each ready handle to the front of @a buffer and returning
+  /// those written. A handle that hangs up or fails counts as ready, leaving
+  /// its owner's I/O on it to report why. May return none. Reports any more
+  /// ready handles than fit on a later call.
+  [[nodiscard]] std::span<void*> wait(
+      std::span<void*, max_ready> buffer) noexcept;
 
   /// Makes a `wait` in progress, or the next one, return. Thread-safe.
   void wake() noexcept;

@@ -5,8 +5,8 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <system_error>
-#include <vector>
 
 #include <windows.h>
 
@@ -116,13 +116,15 @@ void NativeHandlePoller::remove(Token token) noexcept {
   }
 }
 
-void NativeHandlePoller::wait(std::vector<void*>& ready) {
-  std::array<OVERLAPPED_ENTRY, 64> entries{};
+std::span<void*> NativeHandlePoller::wait(
+    std::span<void*, max_ready> buffer) noexcept {
+  std::array<OVERLAPPED_ENTRY, max_ready> entries{};
+  std::size_t written = 0;
   ULONG count = 0;
   if (!GetQueuedCompletionStatusEx(m_impl->port, entries.data(),
                                    static_cast<ULONG>(entries.size()), &count,
                                    INFINITE, FALSE)) {
-    return;  // Nothing there is to be done about but try again.
+    return {};  // Nothing there is to be done about but try again.
   }
   for (ULONG i = 0; i < count; ++i) {
     auto* const registered =
@@ -134,9 +136,10 @@ void NativeHandlePoller::wait(std::vector<void*>& ready) {
       delete registered;
     } else {
       registered->consumed = true;
-      ready.push_back(registered->context);
+      buffer[written++] = registered->context;
     }
   }
+  return buffer.first(written);
 }
 
 void NativeHandlePoller::wake() noexcept {
