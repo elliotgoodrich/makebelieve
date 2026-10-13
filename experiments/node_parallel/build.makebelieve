@@ -1,0 +1,80 @@
+# Ten slow outputs per way of loading them: each waits a second, then copies
+# module.mjs (or module.js for require), so loading all ten takes about 1s if
+# their builds overlap and about 10s if they run one at a time.
+
+@/static0.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/static1.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/static2.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/static3.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/static4.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/static5.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/static6.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/static7.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/static8.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/static9.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+
+@/dynamic0.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/dynamic1.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/dynamic2.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/dynamic3.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/dynamic4.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/dynamic5.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/dynamic6.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/dynamic7.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/dynamic8.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/dynamic9.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+
+@/require0.js = run cmake -E sleep 1 && cmake -E copy module.js %out
+@/require1.js = run cmake -E sleep 1 && cmake -E copy module.js %out
+@/require2.js = run cmake -E sleep 1 && cmake -E copy module.js %out
+@/require3.js = run cmake -E sleep 1 && cmake -E copy module.js %out
+@/require4.js = run cmake -E sleep 1 && cmake -E copy module.js %out
+@/require5.js = run cmake -E sleep 1 && cmake -E copy module.js %out
+@/require6.js = run cmake -E sleep 1 && cmake -E copy module.js %out
+@/require7.js = run cmake -E sleep 1 && cmake -E copy module.js %out
+@/require8.js = run cmake -E sleep 1 && cmake -E copy module.js %out
+@/require9.js = run cmake -E sleep 1 && cmake -E copy module.js %out
+
+@/promises0.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/promises1.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/promises2.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/promises3.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/promises4.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/promises5.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/promises6.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/promises7.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/promises8.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/promises9.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+
+@/callback0.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/callback1.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/callback2.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/callback3.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/callback4.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/callback5.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/callback6.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/callback7.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/callback8.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/callback9.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+
+@/pool160.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/pool161.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/pool162.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/pool163.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/pool164.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/pool165.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/pool166.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/pool167.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/pool168.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/pool169.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+
+@/prefetch0.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/prefetch1.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/prefetch2.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/prefetch3.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/prefetch4.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/prefetch5.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/prefetch6.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/prefetch7.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/prefetch8.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out
+@/prefetch9.mjs = run cmake -E sleep 1 && cmake -E copy module.mjs %out

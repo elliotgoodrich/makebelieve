@@ -56,7 +56,7 @@ ones that ship with Git for Windows.
 | `git` | `hash-object --no-filters` | Yes |
 | `md5sum` | none | Yes |
 | `more` (`cmd`) | file on standard input | Yes |
-| `node` | `fs.readFileSync`; `fs.createReadStream`; run a `.js` script; run a `.mjs` script; `require()`; `import()` | Yes |
+| `node` | `fs.readFileSync`; `fs.createReadStream`; run a `.js` script; run a `.mjs` script; `require()`; `import()` | Yes, but see [below](#node) |
 | `python` | `open().read()`; `mmap` (read-only) | Yes |
 | `robocopy` | `/R:0 /W:0`; `/R:1 /W:1` | Yes, but see [below](#robocopy) |
 | `Select-String` | `-Pattern` | Yes |
@@ -80,6 +80,16 @@ files have never been built renders blank.
 `fc` upper-cases the paths it is given before opening them. The mount is
 case-sensitive, so the upper-cased name is not found, and `fc` fails with
 "cannot open" even for an output that has been built.
+
+### `node`
+
+`node` reads the files it is given in full, but it loads modules one at a
+time, so importing several unbuilt outputs builds them one after another, even
+with every `import()` started at once. Asynchronous reads such as
+`fs.promises.readFile` build up to 4 at once, the size of libuv's thread pool,
+which `UV_THREADPOOL_SIZE` raises. Reading modules asynchronously before
+importing them is a way to build them in parallel. See
+[`experiments/node_parallel`](experiments/node_parallel).
 
 ### `robocopy`
 
