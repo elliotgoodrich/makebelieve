@@ -41,7 +41,7 @@ add_library(makebelieve_core STATIC
   iocontext.cpp
   nativehandlepoller-${MAKEBELIEVE_PLATFORM}.cpp
   manifest.cpp
-  processattribution-${MAKEBELIEVE_PLATFORM}.cpp
+  osbuildprocesstracker-${MAKEBELIEVE_PLATFORM}.cpp
   processinfo-${MAKEBELIEVE_PLATFORM}.cpp
   processutil-${MAKEBELIEVE_PLATFORM}.cpp
   processutil-common.cpp
@@ -156,7 +156,7 @@ if(BUILD_TESTING)
   makebelieve_add_test(builddirectorytree)
   makebelieve_add_test(filesystemutil)
   makebelieve_add_test(manifest)
-  makebelieve_add_test(processattribution)
+  makebelieve_add_test(osbuildprocesstracker)
   makebelieve_add_test(processutil)
   makebelieve_add_test(realdirectorytree)
   makebelieve_add_test(shellrunner)

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "processutil.hpp"
 
+#include "buildprocesstracker.hpp"
 #include "iocontext.hpp"
 
 #include <gtest/gtest.h>
@@ -9,10 +10,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -70,9 +73,9 @@ class ProcessUtil : public ::testing::Test {
 
   makebelieve::IoContext io;
 
-  // For the runs that nothing needs to attribute.
-  const makebelieve::LaunchRegistrar none =
-      makebelieve::LaunchRegistrar::none();
+  // For the runs that no build owns.
+  const makebelieve::BuildProcessOwner none =
+      makebelieve::BuildProcessOwner::none();
 
   // Runs @a command in @a working_directory and returns what it completes
   // with.
@@ -202,63 +205,97 @@ std::filesystem::path marker_file() {
               ::testing::UnitTest::GetInstance()->current_test_info()->name()));
 }
 
-// Records each process it is told about, checking that the command had not yet
-// run - it creates @a marker - when it was told.
-struct RecordingRegistrar {
+// A build process tracker that records each process added to it, checking that
+// the command had not yet run - it creates @a marker - when it was added. It
+// finds nothing.
+struct RecordingBuildProcessTracker final : makebelieve::BuildProcessTracker {
   std::filesystem::path marker;
-  int registered = 0;
-  bool ran_before_registration = false;
+  int added = 0;
+  bool ran_before_adding = false;
   bool undone = false;
-  makebelieve::LaunchedProcess process;
+  std::filesystem::path output;
+  makebelieve::ProcessHandle process;
 
-  std::expected<makebelieve::LaunchRegistration, std::error_code> operator()(
-      const makebelieve::LaunchedProcess& launched) {
-    ++registered;
-    ran_before_registration = std::filesystem::exists(marker);
+  explicit RecordingBuildProcessTracker(std::filesystem::path created)
+      : marker(std::move(created)) {}
+
+  std::expected<Token, std::error_code> add(
+      const std::filesystem::path& built,
+      const makebelieve::ProcessHandle& launched) override {
+    ++added;
+    ran_before_adding = std::filesystem::exists(marker);
+    output = built;
     process = launched;
-    return makebelieve::LaunchRegistration([this] { undone = true; });
+    return Token{1};
+  }
+
+  void remove(Token /*token*/) noexcept override { undone = true; }
+
+  std::optional<std::filesystem::path> find(
+      std::uint32_t /*requester_pid*/) override {
+    return std::nullopt;
   }
 };
 
-TEST_F(ProcessUtil, RegistersTheCommandBeforeItRunsAndUndoesItAfter) {
+// A build process tracker that refuses to add anything, with @a refusal.
+struct RefusingBuildProcessTracker final : makebelieve::BuildProcessTracker {
+  std::error_code refusal;
+
+  explicit RefusingBuildProcessTracker(std::error_code error)
+      : refusal(error) {}
+
+  std::expected<Token, std::error_code> add(
+      const std::filesystem::path& /*output*/,
+      const makebelieve::ProcessHandle& /*process*/) override {
+    return std::unexpected(refusal);
+  }
+
+  void remove(Token /*token*/) noexcept override {}
+
+  std::optional<std::filesystem::path> find(
+      std::uint32_t /*requester_pid*/) override {
+    return std::nullopt;
+  }
+};
+
+TEST_F(ProcessUtil, AddsTheCommandBeforeItRunsAndRemovesItAfter) {
   const std::filesystem::path marker = marker_file();
   std::filesystem::remove(marker);
-  RecordingRegistrar registrar{.marker = marker};
+  RecordingBuildProcessTracker recording(marker);
+  const std::filesystem::path k_output = "out/built.txt";
   const makebelieve::ProcessUtil::Result result = std::get<0>(
-      stdexec::sync_wait(makebelieve::ProcessUtil::run(
-                             io, work,
-                             "cmake -E touch \"" + marker.string() + "\"",
-                             makebelieve::LaunchRegistrar(registrar)))
+      stdexec::sync_wait(
+          makebelieve::ProcessUtil::run(
+              io, work, "cmake -E touch \"" + marker.string() + "\"",
+              makebelieve::BuildProcessOwner(recording, k_output)))
           .value());
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(result->exit_status, 0);
   EXPECT_TRUE(std::filesystem::exists(marker));
   std::filesystem::remove(marker);
-  EXPECT_EQ(registrar.registered, 1);
-  EXPECT_FALSE(registrar.ran_before_registration);
-  EXPECT_NE(registrar.process.pid, 0U);
+  EXPECT_EQ(recording.added, 1);
+  EXPECT_FALSE(recording.ran_before_adding);
+  EXPECT_EQ(recording.output, k_output);
+  EXPECT_NE(recording.process.pid, 0U);
 #ifdef _WIN32
-  EXPECT_NE(registrar.process.job, nullptr);
+  EXPECT_NE(recording.process.job, nullptr);
 #else
-  EXPECT_GE(registrar.process.pidfd, 0);
+  EXPECT_GE(recording.process.pidfd, 0);
 #endif
-  EXPECT_TRUE(registrar.undone);
+  EXPECT_TRUE(recording.undone);
 }
 
-TEST_F(ProcessUtil, ACommandItsRegistrarRefusesNeverRuns) {
+TEST_F(ProcessUtil, ACommandThatCannotBeAddedNeverRuns) {
   const std::error_code refusal =
       std::make_error_code(std::errc::permission_denied);
-  auto refuse = [&](const makebelieve::LaunchedProcess&)
-      -> std::expected<makebelieve::LaunchRegistration, std::error_code> {
-    return std::unexpected(refusal);
-  };
+  RefusingBuildProcessTracker refusing(refusal);
   const std::filesystem::path marker = marker_file();
   std::filesystem::remove(marker);
   const makebelieve::ProcessUtil::Result result = std::get<0>(
-      stdexec::sync_wait(makebelieve::ProcessUtil::run(
-                             io, work,
-                             "cmake -E touch \"" + marker.string() + "\"",
-                             makebelieve::LaunchRegistrar(refuse)))
+      stdexec::sync_wait(
+          makebelieve::ProcessUtil::run(
+              io, work, "cmake -E touch \"" + marker.string() + "\"",
+              makebelieve::BuildProcessOwner(refusing, "out/built.txt")))
           .value());
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error(), refusal);

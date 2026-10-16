@@ -26,15 +26,15 @@ class IoContext;
 namespace detail {
 
 // Carries out @a command as `ShellRunner` describes, waiting on a command it
-// runs through @a io and registering it with @a registrar before it runs. Its
-// synchronous steps run wherever the task is started, and it resumes there
-// after each wait. @a stop cancels a command still running.
+// runs through @a io and adding it to the tracker under @a owner before it
+// runs. Its synchronous steps run wherever the task is started, and it resumes
+// there after each wait. @a stop cancels a command still running.
 exec::task<BuildResult> run_shell_command(
     IoContext& io,
     std::filesystem::path working_directory,
     std::filesystem::path mountpoint,
     Command command,
-    LaunchRegistrar registrar,
+    BuildProcessOwner owner,
     stdexec::inplace_stop_token stop);
 
 }  // namespace detail
@@ -59,8 +59,8 @@ exec::task<BuildResult> run_shell_command(
 /// `Copy` rule runs no command at all: it produces the bytes of the file it
 /// names, read from under the working directory, and reports that file as its
 /// one input. (`BuildDirectoryTree` serves a copy of an output itself.)
-/// Each command it runs is registered, before it runs, with the
-/// @link LaunchRegistrar its receiver's environment names.
+/// Each command it runs is added to the build process tracker, before it runs,
+/// under the @link BuildProcessOwner its receiver's environment names.
 /// Traced inputs are reported relative to the working directory, so for
 /// dependency tracking to line up it should be the filesystem root that the
 /// tree's source mirrors.
@@ -105,17 +105,16 @@ class ShellRunner {
                                working_directory = m_working_directory,
                                mountpoint = m_mountpoint,
                                command = std::move(command)]() mutable {
-             return stdexec::read_env(get_launch_registrar) |
-                    stdexec::let_value([&](LaunchRegistrar registrar) {
+             return stdexec::read_env(get_build_process_owner) |
+                    stdexec::let_value([&](BuildProcessOwner owner) {
                       // By value: this call's parameter is gone by the time
                       // the stop token is read.
                       return stdexec::read_env(stdexec::get_stop_token) |
                              stdexec::let_value(
-                                 [&,
-                                  registrar](stdexec::inplace_stop_token stop) {
+                                 [&, owner](stdexec::inplace_stop_token stop) {
                                    return detail::run_shell_command(
                                        *io, working_directory, mountpoint,
-                                       std::move(command), registrar, stop);
+                                       std::move(command), owner, stop);
                                  });
                     });
            });

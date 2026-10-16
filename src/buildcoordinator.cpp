@@ -6,10 +6,12 @@
 #include <stdexec/execution.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <expected>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -54,7 +56,7 @@ class BuildCoordinator::Impl {
   struct Effects;
 
   PermitProvider m_permits;
-  Attribution m_attribution;
+  BuildProcessTracker* m_tracker;
 
   // Guards every attempt's and wait's state, and everything below.
   mutable std::mutex m_mutex;
@@ -62,22 +64,25 @@ class BuildCoordinator::Impl {
   // Defers completions off stop callbacks before resuming the awaiting task.
   Scheduler m_completions;
 
-  // Attempts whose command is running, by id, for attribution.
-  std::unordered_map<AttemptId, Attempt*> m_running;
+  // Attempts whose command is running, by the output each builds, for
+  // looking requesters up. At most one attempt at an output runs at a time.
+  std::unordered_map<std::filesystem::path, Attempt*> m_running;
 
   // Active waits, for diagnostics.
   std::vector<Wait*> m_waits;
 
-  AttemptId m_last_id = 0;
-
-  Impl(PermitProvider permits, Attribution attribution, Scheduler completions);
+  Impl(PermitProvider permits,
+       BuildProcessTracker& tracker,
+       Scheduler completions);
 
   // The coordinator's own operations, as it describes them.
-  AttemptPtr create_attempt(AttemptPtr predecessor);
+  AttemptPtr create_attempt(std::filesystem::path output,
+                            AttemptPtr predecessor);
   AttemptSender run(AttemptPtr attempt, BuildSender work);
   void complete(const AttemptPtr& attempt, std::error_code result);
-  exec::task<std::error_code> wait(AttemptPtr target,
-                                   std::optional<AttemptId> requester_id);
+  exec::task<std::error_code> wait(
+      AttemptPtr target,
+      std::optional<std::filesystem::path> requester);
   void cancel_wait(Wait& wait) noexcept;
   [[nodiscard]] Stats stats() const;
   [[nodiscard]] std::size_t edge_count(const AttemptPtr& from,
@@ -122,16 +127,6 @@ class BuildCoordinator::Attempt
   };
   enum class Permit : std::uint8_t { none, held, released, reacquiring };
 
-  // Registers what the attempt launches under its id.
-  struct Registrar {
-    Attempt* self;
-    std::expected<LaunchRegistration, std::error_code> operator()(
-        const LaunchedProcess& process) const {
-      return self->coordinator->m_attribution.register_process(self->id,
-                                                               process);
-    }
-  };
-
   // Stops the attempt, through the coordinator, when whatever runs it is
   // stopped.
   struct ForwardStop {
@@ -142,7 +137,9 @@ class BuildCoordinator::Attempt
   };
 
   Impl* coordinator;
-  AttemptId id;
+
+  // What it builds, which names it in the build process tracker.
+  std::filesystem::path output;
 
   // Everything below is guarded by the coordinator's m_mutex, except where
   // said.
@@ -192,10 +189,10 @@ class BuildCoordinator::Attempt
   // own chain, never under the lock.
   std::optional<stdexec::inplace_stop_callback<ForwardStop>> outer_stop;
 
-  Registrar registrar{this};
-
-  Attempt(Impl& owner, AttemptId attempt_id, AttemptPtr before)
-      : coordinator(&owner), id(attempt_id), predecessor(std::move(before)) {}
+  Attempt(Impl& owner, std::filesystem::path built, AttemptPtr before)
+      : coordinator(&owner),
+        output(std::move(built)),
+        predecessor(std::move(before)) {}
 
   Attempt(const Attempt&) = delete;
   Attempt& operator=(const Attempt&) = delete;
@@ -214,7 +211,7 @@ class BuildCoordinator::Impl::Wait {
   };
 
   AttemptPtr target;
-  AttemptPtr requester;  // null if unattributed
+  AttemptPtr requester;  // null if from no running attempt
   State state = State::blocked;
   std::error_code result;
   AsyncEvent completed;
@@ -271,24 +268,25 @@ struct BuildCoordinator::Impl::Effects {
 };
 
 BuildCoordinator::Impl::Impl(PermitProvider permits,
-                             Attribution attribution,
+                             BuildProcessTracker& tracker,
                              Scheduler completions)
     : m_permits(std::move(permits)),
-      m_attribution(attribution),
+      m_tracker(&tracker),
       m_completions(std::move(completions)) {}
 
 BuildCoordinator::BuildCoordinator(PermitProvider permits,
-                                   Attribution attribution,
+                                   BuildProcessTracker& tracker,
                                    Scheduler completions)
     : m_impl(std::make_unique<Impl>(std::move(permits),
-                                    attribution,
+                                    tracker,
                                     std::move(completions))) {}
 
 BuildCoordinator::~BuildCoordinator() = default;
 
 BuildCoordinator::AttemptPtr BuildCoordinator::create_attempt(
+    std::filesystem::path output,
     AttemptPtr predecessor) {
-  return m_impl->create_attempt(std::move(predecessor));
+  return m_impl->create_attempt(std::move(output), std::move(predecessor));
 }
 
 AttemptSender BuildCoordinator::run(AttemptPtr attempt, BuildSender work) {
@@ -304,20 +302,20 @@ exec::task<std::error_code> BuildCoordinator::wait(
     AttemptPtr target,
     std::uint32_t requester_pid) {
   // Outside the lock: it may read /proc.
-  const std::optional<AttemptId> requester_id = resolve(requester_pid);
-  co_return co_await m_impl->wait(std::move(target), requester_id);
+  std::optional<std::filesystem::path> requester = resolve(requester_pid);
+  co_return co_await m_impl->wait(std::move(target), std::move(requester));
 }
 
-std::optional<AttemptId> BuildCoordinator::resolve(
+std::optional<std::filesystem::path> BuildCoordinator::resolve(
     std::uint32_t requester_pid) const {
-  return requester_pid != 0 ? m_impl->m_attribution.resolve(requester_pid)
+  return requester_pid != 0 ? m_impl->m_tracker->find(requester_pid)
                             : std::nullopt;
 }
 
 exec::task<std::error_code> BuildCoordinator::wait_as(
     AttemptPtr target,
-    std::optional<AttemptId> requester) {
-  co_return co_await m_impl->wait(std::move(target), requester);
+    std::optional<std::filesystem::path> requester) {
+  co_return co_await m_impl->wait(std::move(target), std::move(requester));
 }
 
 BuildCoordinator::Stats BuildCoordinator::stats() const {
@@ -329,18 +327,21 @@ std::size_t BuildCoordinator::edge_count(const AttemptPtr& from,
   return m_impl->edge_count(from, to);
 }
 
-AttemptId BuildCoordinator::id_of(const AttemptPtr& attempt) {
-  return attempt->id;
+const std::filesystem::path& BuildCoordinator::output_of(
+    const AttemptPtr& attempt) {
+  return attempt->output;
 }
 
 BuildCoordinator::AttemptPtr BuildCoordinator::Impl::create_attempt(
+    std::filesystem::path output,
     AttemptPtr predecessor) {
   const std::lock_guard lock(m_mutex);
   // A predecessor already over cannot hold this one up.
   if (predecessor != nullptr && predecessor->phase == Attempt::Phase::ended) {
     predecessor.reset();
   }
-  return std::make_shared<Attempt>(*this, ++m_last_id, std::move(predecessor));
+  return std::make_shared<Attempt>(*this, std::move(output),
+                                   std::move(predecessor));
 }
 
 void BuildCoordinator::Impl::remove_edge(Attempt& from, Attempt& to) {
@@ -541,7 +542,7 @@ std::vector<BuildCoordinator::Attempt*> BuildCoordinator::Impl::path_to(
 
 exec::task<std::error_code> BuildCoordinator::Impl::wait(
     AttemptPtr target,
-    std::optional<AttemptId> requester_id) {
+    std::optional<std::filesystem::path> requester) {
   const auto stop = co_await stdexec::get_stop_token();
 
   Wait wait;
@@ -553,8 +554,8 @@ exec::task<std::error_code> BuildCoordinator::Impl::wait(
   if (const std::optional<std::error_code> result = target->result) {
     co_return *result;
   }
-  if (requester_id.has_value()) {
-    if (const auto it = m_running.find(*requester_id); it != m_running.end()) {
+  if (requester.has_value()) {
+    if (const auto it = m_running.find(*requester); it != m_running.end()) {
       wait.requester = it->second->shared_from_this();
     }
   }
@@ -650,17 +651,21 @@ void BuildCoordinator::Impl::on_permit(Attempt& attempt, PermitLease lease) {
   attempt.phase = Attempt::Phase::running;
   attempt.permit = Attempt::Permit::held;
   attempt.lease.emplace(lease);
-  m_running.emplace(attempt.id, &attempt);
+  // Attempts at the same output run one after another, so none can already
+  // be running at this one's output: see run().
+  [[maybe_unused]] const bool inserted =
+      m_running.emplace(attempt.output, &attempt).second;
+  assert(inserted && "two attempts at the same output running at once");
 }
 
 void BuildCoordinator::Impl::finish(Attempt& attempt, Drain& drain) {
   Effects effects;
   {
     const std::lock_guard lock(m_mutex);
-    // From here it can be neither doomed nor attributed to.
+    // From here it can be neither doomed nor found as a requester.
     attempt.phase = Attempt::Phase::ended;
     attempt.stopping = true;
-    m_running.erase(attempt.id);
+    m_running.erase(attempt.output);
     cancel_waits_of(attempt, effects);
     if (attempt.reacquire_outstanding) {
       // Its lease must outlive the take-back, which is stopped and waited
@@ -686,7 +691,7 @@ BuildCoordinator::Stats BuildCoordinator::Impl::stats() const {
       }
     }
   }
-  for (const auto& [id, attempt] : m_running) {
+  for (const auto& [output, attempt] : m_running) {
     if (seen.insert(attempt).second) {
       stats.edges += attempt->edges_out.size();
     }
@@ -771,11 +776,12 @@ AttemptSender BuildCoordinator::Impl::run(AttemptPtr attempt,
                                          Attempt::ForwardStop{attempt.get()});
              return stdexec::write_env(
                         std::move(work),
-                        stdexec::env{stdexec::prop{stdexec::get_stop_token,
-                                                   attempt->stop.get_token()},
-                                     stdexec::prop{get_launch_registrar,
-                                                   LaunchRegistrar(
-                                                       attempt->registrar)}}) |
+                        stdexec::env{
+                            stdexec::prop{stdexec::get_stop_token,
+                                          attempt->stop.get_token()},
+                            stdexec::prop{get_build_process_owner,
+                                          BuildProcessOwner(
+                                              *m_tracker, attempt->output)}}) |
                     stdexec::upon_error(
                         [](const std::exception_ptr& error) noexcept {
                           return BuildResult(

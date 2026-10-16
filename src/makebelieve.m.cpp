@@ -6,7 +6,7 @@
 #include "consoleinterrupthandler.hpp"
 #include "filesystemutil.hpp"
 #include "iocontext.hpp"
-#include "processattribution.hpp"
+#include "osbuildprocesstracker.hpp"
 #include "realdirectorytree.hpp"
 #include "shellrunner.hpp"
 #include "tracer.hpp"
@@ -116,8 +116,8 @@ int mount(const char* mountpoint_arg, unsigned jobs) {
   // Tells the processes each build launches apart from everyone else's, so
   // the coordinator can see which build an open comes from. Both outlive the
   // tree and the mount, which use them until they are torn down.
-  ProcessAttribution attribution;
-  BuildCoordinator coordinator(permits_from(builds), Attribution(attribution),
+  OsBuildProcessTracker tracker;
+  BuildCoordinator coordinator(permits_from(builds), tracker,
                                workers.get_scheduler());
 
   // Presents the manifest's declared outputs, building each lazily.

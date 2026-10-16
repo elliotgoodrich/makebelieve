@@ -290,9 +290,11 @@ class BuildDirectoryTree::Impl {
   };
   std::map<std::filesystem::path, Attempts> m_attempts;
 
-  // The outputs each build under way has opened through us, added to its
-  // inputs when it finishes. Tracing sees only the source, so not these.
-  std::unordered_map<AttemptId, std::set<std::filesystem::path>> m_reads;
+  // The outputs each build under way has opened through us, by the output
+  // it builds, added to its inputs when it finishes. Tracing sees only the
+  // source, so not these.
+  std::unordered_map<std::filesystem::path, std::set<std::filesystem::path>>
+      m_reads;
 
   // Outputs opened at least once, which an input change rebuilds eagerly.
   std::set<std::filesystem::path> m_materialized;
@@ -324,7 +326,7 @@ class BuildDirectoryTree::Impl {
   CommandRunner m_runner;
 
   // Used when the tree is given no coordinator: no limit on builds, and no
-  // request attributed to any.
+  // request found to come from any.
   std::optional<exec::static_thread_pool> m_own_workers;
   std::optional<BuildCoordinator> m_own_coordinator;
 
@@ -362,9 +364,9 @@ class BuildDirectoryTree::Impl {
         m_coordinator(coordinator),
         m_on_manifest_error(std::move(on_manifest_error)) {
     if (m_coordinator == nullptr) {
-      m_coordinator =
-          &m_own_coordinator.emplace(unlimited_permits(), Attribution::none(),
-                                     m_own_workers.emplace(1).get_scheduler());
+      m_coordinator = &m_own_coordinator.emplace(
+          unlimited_permits(), BuildProcessTracker::none(),
+          m_own_workers.emplace(1).get_scheduler());
     }
     auto rules = read_rules(m_source);
     if (!rules.has_value()) {
@@ -427,7 +429,7 @@ class BuildDirectoryTree::Impl {
       std::filesystem::path path,
       OpenContext context) {
     const std::filesystem::path output = path.lexically_normal();
-    std::optional<AttemptId> requester;
+    std::optional<std::filesystem::path> requester;
     if (context.requester_pid != 0 && is_declared(output)) {
       // Unlocked: it may read /proc.
       requester = m_coordinator->resolve(context.requester_pid);
@@ -537,7 +539,8 @@ class BuildDirectoryTree::Impl {
           target = attempts.current;
         } else {
           if (attempts.next == nullptr) {
-            attempts.next = m_coordinator->create_attempt(attempts.current);
+            attempts.next =
+                m_coordinator->create_attempt(output, attempts.current);
           }
           target = attempts.next;
         }
@@ -561,7 +564,7 @@ class BuildDirectoryTree::Impl {
                                       BuildCoordinator::AttemptPtr self) {
     if (const BuildCoordinator::AttemptPtr target = bring_up_to_date(source)) {
       if (const std::error_code error = co_await m_coordinator->wait_as(
-              target, BuildCoordinator::id_of(self))) {
+              target, BuildCoordinator::output_of(self))) {
         co_return std::unexpected(error);
       }
     }
@@ -579,10 +582,13 @@ class BuildDirectoryTree::Impl {
     return m_commands.contains(output);
   }
 
-  // Records that @a attempt opened @a output, if it is one of ours under way.
-  void record_read(AttemptId attempt, const std::filesystem::path& output) {
+  // Records that the build of @a reader opened @a output, if that build is one
+  // of ours under way.
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): named by the comment
+  void record_read(const std::filesystem::path& reader,
+                   const std::filesystem::path& output) {
     const std::lock_guard lock(m_mutex);
-    if (const auto reads = m_reads.find(attempt); reads != m_reads.end()) {
+    if (const auto reads = m_reads.find(reader); reads != m_reads.end()) {
       reads->second.insert(as_input(output));
     }
   }
@@ -594,11 +600,11 @@ class BuildDirectoryTree::Impl {
     Attempts& attempts = m_attempts[output];
     BuildCoordinator::AttemptPtr attempt =
         attempts.next != nullptr ? std::exchange(attempts.next, nullptr)
-                                 : m_coordinator->create_attempt();
+                                 : m_coordinator->create_attempt(output);
     attempts.current = attempt;
     m_stale.erase(output);
     m_in_flight.insert(output);
-    m_reads.try_emplace(BuildCoordinator::id_of(attempt));
+    m_reads.try_emplace(output);
     Launch launch{.output = output,
                   .attempt = std::move(attempt),
                   .command = m_commands.at(output)};
@@ -749,8 +755,7 @@ class BuildDirectoryTree::Impl {
         // Its rule may have left the manifest mid-build.
         declared = m_commands.contains(output);
         if (declared) {
-          if (const auto reads = m_reads.find(BuildCoordinator::id_of(attempt));
-              reads != m_reads.end()) {
+          if (const auto reads = m_reads.find(output); reads != m_reads.end()) {
             result->inputs.insert(result->inputs.end(), reads->second.begin(),
                                   reads->second.end());
           }
@@ -769,7 +774,7 @@ class BuildDirectoryTree::Impl {
     {
       const std::lock_guard lock(m_mutex);
       m_in_flight.erase(output);
-      m_reads.erase(BuildCoordinator::id_of(attempt));
+      m_reads.erase(output);
       const auto attempts = m_attempts.find(output);
       const bool waited_on =
           attempts != m_attempts.end() && attempts->second.next != nullptr;

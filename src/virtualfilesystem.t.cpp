@@ -785,10 +785,10 @@ class ParkingTree : public makebelieve::DirectoryTree {
   mutable std::size_t m_parked = 0;
   mutable exec::static_thread_pool m_completions{1};
   mutable makebelieve::BuildCoordinator m_coordinator{
-      makebelieve::unlimited_permits(), makebelieve::Attribution::none(),
-      m_completions.get_scheduler()};
+      makebelieve::unlimited_permits(),
+      makebelieve::BuildProcessTracker::none(), m_completions.get_scheduler()};
   makebelieve::BuildCoordinator::AttemptPtr m_attempt =
-      m_coordinator.create_attempt();
+      m_coordinator.create_attempt("parked");
 
  public:
   explicit ParkingTree(const makebelieve::DirectoryTree& inner)
@@ -968,10 +968,10 @@ class GatedOpenTree : public makebelieve::DirectoryTree {
   mutable bool m_waiting = false;
   mutable exec::static_thread_pool m_completions{1};
   mutable makebelieve::BuildCoordinator m_coordinator{
-      makebelieve::unlimited_permits(), makebelieve::Attribution::none(),
-      m_completions.get_scheduler()};
+      makebelieve::unlimited_permits(),
+      makebelieve::BuildProcessTracker::none(), m_completions.get_scheduler()};
   makebelieve::BuildCoordinator::AttemptPtr m_attempt =
-      m_coordinator.create_attempt();
+      m_coordinator.create_attempt("parked");
 
  public:
   GatedOpenTree(const makebelieve::DirectoryTree& inner,

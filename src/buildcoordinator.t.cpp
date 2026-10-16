@@ -3,11 +3,11 @@
 
 #include "builddirectorytree.hpp"
 #include "buildpermits.hpp"
+#include "buildprocesstracker.hpp"
 #include "buildqueue.hpp"
 #include "commandrunner.hpp"
 #include "directorytreeutil.hpp"
 #include "inmemorydirectorytree.hpp"
-#include "launchregistrar.hpp"
 
 #include <gtest/gtest.h>
 #include <exec/static_thread_pool.hpp>
@@ -66,33 +66,38 @@ std::vector<std::string> split(std::string_view text, std::string_view by) {
   }
 }
 
-// Tells attempts apart by the fake pids their fake commands register, the way
-// ProcessAttribution does by real ones. Registration can be made to fail.
-class FakeAttribution {
+// Tells attempts apart by the fake pids their fake commands add, the way
+// OsBuildProcessTracker does by real ones. Adding can be made to fail.
+class FakeBuildProcessTracker final : public BuildProcessTracker {
   std::mutex m_mutex;
-  std::map<std::uint32_t, AttemptId> m_attempts;
+  std::map<std::uint32_t, std::filesystem::path> m_outputs;
   bool m_fail_next = false;
 
  public:
-  std::expected<LaunchRegistration, std::error_code> register_process(
-      AttemptId attempt,
-      const LaunchedProcess& process) {
+  std::expected<Token, std::error_code> add(
+      const std::filesystem::path& output,
+      const ProcessHandle& process) override {
     const std::lock_guard lock(m_mutex);
     if (std::exchange(m_fail_next, false)) {
       return std::unexpected(std::make_error_code(std::errc::no_such_process));
     }
-    m_attempts.emplace(process.pid, attempt);
-    return LaunchRegistration([this, pid = process.pid] {
-      const std::lock_guard lock(m_mutex);
-      m_attempts.erase(pid);
-    });
+    m_outputs.emplace(process.pid, output);
+    // Fake pids are unique, so each serves as its own token.
+    return Token{process.pid};
   }
 
-  std::optional<AttemptId> resolve(std::uint32_t requester) {
+  void remove(Token token) noexcept override {
     const std::lock_guard lock(m_mutex);
-    const auto it = m_attempts.find(requester);
-    return it == m_attempts.end() ? std::nullopt
-                                  : std::optional<AttemptId>(it->second);
+    m_outputs.erase(static_cast<std::uint32_t>(token));
+  }
+
+  std::optional<std::filesystem::path> find(
+      std::uint32_t requester_pid) override {
+    const std::lock_guard lock(m_mutex);
+    const auto it = m_outputs.find(requester_pid);
+    return it == m_outputs.end()
+               ? std::nullopt
+               : std::optional<std::filesystem::path>(it->second);
   }
 
   void fail_next() {
@@ -161,7 +166,7 @@ class FakeCommands {
   std::atomic<std::uint32_t> m_last_pid = 1000;
 
  public:
-  FakeAttribution attribution;
+  FakeBuildProcessTracker tracker;
   const BuildDirectoryTree* tree = nullptr;
   BuildCoordinator* coordinator = nullptr;
   std::size_t concurrency = 0;
@@ -273,15 +278,15 @@ class FakeCommands {
     activity(run, -1);
   }
 
-  // Runs @a script as @a run's command, registering it first, and returns
-  // what it built.
+  // Runs @a script as @a run's command, adding it to the tracker first, and
+  // returns what it built.
   BuildResult execute(Run& run,
                       const std::string& script,
-                      LaunchRegistrar registrar) {
-    std::expected<LaunchRegistration, std::error_code> registration =
-        registrar(LaunchedProcess{.pid = run.pid});
-    if (!registration.has_value()) {
-      return std::unexpected(registration.error());
+                      BuildProcessOwner owner) {
+    std::expected<ProcessRemoveGuard, std::error_code> guard =
+        owner.add(ProcessHandle{.pid = run.pid});
+    if (!guard.has_value()) {
+      return std::unexpected(guard.error());
     }
     std::vector<std::thread> threads;
     for (const std::string& steps : split(script, "|")) {
@@ -341,7 +346,8 @@ class FakeCommands {
           const ex::inplace_stop_callback<OnStop> on_stop(
               ex::get_stop_token(ex::get_env(m_receiver)), OnStop{this});
           return m_run.commands->execute(
-              m_run, m_script, get_launch_registrar(ex::get_env(m_receiver)));
+              m_run, m_script,
+              get_build_process_owner(ex::get_env(m_receiver)));
         }();
         ex::set_value(std::move(m_receiver), std::move(result));
       }).detach();
@@ -420,7 +426,7 @@ class Fixture {
   explicit Fixture(std::size_t concurrency)
       : queue(concurrency, pool.get_scheduler()),
         coordinator(permits_from(counting),
-                    Attribution(commands.attribution),
+                    commands.tracker,
                     pool.get_scheduler()) {
     commands.coordinator = &coordinator;
     commands.concurrency = concurrency;
@@ -809,7 +815,7 @@ TEST(BuildCoordinator, AThreeAttemptCycleStopsAllOfThem) {
   }
 }
 
-TEST(BuildCoordinator, AnUnattributedOpenWaitsWithoutHoldingAPermit) {
+TEST(BuildCoordinator, AnOpenFromNoBuildWaitsWithoutHoldingAPermit) {
   Fixture fixture(1);
   fixture.declare("@/b = run wait go\n");
   Fixture::Opening b(fixture, "b");
@@ -830,10 +836,10 @@ TEST(BuildCoordinator, AnOpenSeesItsDependencysFailure) {
   EXPECT_EQ(fixture.content("a"), "b=" + error_of(std::errc::io_error) + " ");
 }
 
-TEST(BuildCoordinator, ACommandThatCannotBeRegisteredNeverRunsAndFails) {
+TEST(BuildCoordinator, ACommandThatCannotBeAddedNeverRunsAndFails) {
   Fixture fixture(1);
   fixture.declare("@/a = run signal ran\n");
-  fixture.commands.attribution.fail_next();
+  fixture.commands.tracker.fail_next();
   EXPECT_EQ(outcome(fixture.open("a")), error_of(std::errc::no_such_process));
   EXPECT_EQ(fixture.content("a"), std::string(1, '\0'));
 }
@@ -916,7 +922,7 @@ TEST(BuildCoordinator, StoppingAnAttemptEndsItsWaitsButNotItsDependencies) {
   Fixture fixture(2);
   fixture.declare("@/b = run wait go\n");
   const BuildCoordinator::AttemptPtr attempt =
-      fixture.coordinator.create_attempt();
+      fixture.coordinator.create_attempt("stopped");
   ex::inplace_stop_source stop;
   std::promise<void> ended;
   const std::future<void> ending = ended.get_future();
@@ -956,12 +962,11 @@ TEST(BuildCoordinator, InterruptedRequestRestoresItsCommandsPermit) {
   fixture.check_active = false;
   fixture.declare("@/a = run wait finish_a\n@/b = run wait finish_b\n");
   Fixture::Opening a(fixture, "a");
-  // The first fake command registers pid 1001 before executing its script.
+  // The first fake command adds pid 1001 before executing its script.
   EXPECT_TRUE(fixture.until([&](const auto& stats) {
-    return stats.held == 1 &&
-           fixture.commands.attribution.resolve(1001).has_value();
+    return stats.held == 1 && fixture.commands.tracker.find(1001).has_value();
   }));
-  auto target = fixture.coordinator.create_attempt();
+  auto target = fixture.coordinator.create_attempt("target");
   ex::inplace_stop_source stop;
   std::promise<std::error_code> result;
   auto canceled = result.get_future();
@@ -1001,9 +1006,9 @@ TEST(BuildCoordinator, InterruptedRequestRestoresItsCommandsPermit) {
 // Canceling one suspended request leaves other consumers and the target intact.
 TEST(BuildCoordinator, CancelingARequestDetachesOnlyThatWaiter) {
   exec::static_thread_pool pool(1);
-  BuildCoordinator coordinator(unlimited_permits(), Attribution::none(),
+  BuildCoordinator coordinator(unlimited_permits(), BuildProcessTracker::none(),
                                pool.get_scheduler());
-  auto target = coordinator.create_attempt();
+  auto target = coordinator.create_attempt("target");
   stdexec::counting_scope scope;
   stdexec::inplace_stop_source stop;
   std::error_code first;

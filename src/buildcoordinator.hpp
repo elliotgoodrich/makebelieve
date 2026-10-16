@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-#include "attribution.hpp"
 #include "buildpermits.hpp"
+#include "buildprocesstracker.hpp"
 #include "commandrunner.hpp"
 
 #include <exec/any_sender_of.hpp>
 #include <exec/task.hpp>
 
 #include <cstddef>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <system_error>
@@ -20,10 +21,11 @@ namespace makebelieve {
 /// the permits that cap how many run at once.
 ///
 /// A build attempt is one generation of one output's build. It holds a permit
-/// while its command runs, but a request from that command - one resolved to
-/// the attempt through the @link Attribution its processes were registered
-/// with before they ran - that has to wait for another output gives the
-/// permit back while it waits, and takes one again before it is answered. So
+/// while its command runs, but a request from that command - one found to
+/// come from the attempt by looking its process up in the
+/// @link BuildProcessTracker the command was added to before it ran - that has
+/// to wait for another output gives the permit back while it waits, and takes
+/// one again before it is answered. So
 /// N attempts each waiting on an unbuilt output leave N permits for those
 /// outputs' builds, where holding on to them would deadlock.
 ///
@@ -67,7 +69,7 @@ namespace makebelieve {
 /// is stopped, fails with that error whatever its command did, and never
 /// publishes a result.
 ///
-/// A request its attribution misses - on Linux, from a process that has left
+/// A request whose process the tracker misses - on Linux, one that has left
 /// its command's process tree - waits holding no permit and giving none back,
 /// and can deadlock on permits as before; there is no timeout.
 ///
@@ -102,12 +104,13 @@ class BuildCoordinator {
   std::unique_ptr<Impl> m_impl;
 
  public:
-  /// Coordinates attempts that take their permits from @a permits and are
-  /// told apart by @a attribution. Completion work uses @a completions, which
-  /// must defer execution off the calling thread (never an inline scheduler).
-  /// @pre The permit provider, attribution service and executor outlive this.
+  /// Coordinates attempts that take their permits from @a permits, and whose
+  /// processes are added to and looked up in @a tracker. Completion
+  /// work uses @a completions, which must defer execution off the calling
+  /// thread (never an inline scheduler).
+  /// @pre The permit provider, build process tracker and executor outlive this.
   BuildCoordinator(PermitProvider permits,
-                   Attribution attribution,
+                   BuildProcessTracker& tracker,
                    Scheduler completions);
 
   /// @pre No attempt is running and no request is waiting.
@@ -118,19 +121,30 @@ class BuildCoordinator {
   BuildCoordinator(BuildCoordinator&&) = delete;
   BuildCoordinator& operator=(BuildCoordinator&&) = delete;
 
-  /// A new attempt, not started. If @a predecessor is given - the attempt of
-  /// the same output under way - this one cannot start until it has ended,
-  /// which a request waiting on this one waits on too.
-  [[nodiscard]] AttemptPtr create_attempt(AttemptPtr predecessor = nullptr);
+  /// A new attempt at building @a output, not started. If @a predecessor is
+  /// given - the attempt of the same output under way - this one cannot start
+  /// until it has ended, which a request waiting on this one waits on too.
+  ///
+  /// @a output names the attempt in the build process tracker: the processes
+  /// it launches are added under @a output, and a request found to come from
+  /// @a output's build is taken to come from the attempt at it that is
+  /// running. So at most one
+  /// attempt at each output may run at a time (see `run`).
+  [[nodiscard]] AttemptPtr create_attempt(std::filesystem::path output,
+                                          AttemptPtr predecessor = nullptr);
 
   /// Runs @a work as @a attempt once it has a permit: in an environment that
   /// stops it when @a attempt is stopped (or the receiver's own stop token
-  /// is) and registers the processes it launches as @a attempt's. Completes
-  /// with its result - with `std::errc::resource_deadlock_would_occur`
-  /// instead, whatever it produced, if the attempt was on a cycle - once
-  /// nothing of the attempt remains under way; an exception it throws is
-  /// reported as the result of @link to_error_code.
+  /// is) and adds the processes it launches to the tracker as @a attempt's.
+  /// Completes with its result - with
+  /// `std::errc::resource_deadlock_would_occur` instead, whatever it produced,
+  /// if the attempt was on a cycle - once nothing of the attempt remains under
+  /// way; an exception it throws is reported as the result of @link
+  /// to_error_code.
   /// @pre @a attempt has not been run, nor completed.
+  /// @pre No other attempt at @a attempt's output is running, nor will start
+  /// running before this one has ended - as giving each attempt the one
+  /// before it as its predecessor ensures.
   [[nodiscard]] AttemptSender run(AttemptPtr attempt, BuildSender work);
 
   /// Hands @a result to every request waiting on @a attempt, which then no
@@ -144,16 +158,18 @@ class BuildCoordinator {
       AttemptPtr target,
       std::uint32_t requester_pid = 0);
 
-  /// The attempt @a requester_pid belongs to, if any. May read /proc, so call
-  /// it holding no lock.
-  [[nodiscard]] std::optional<AttemptId> resolve(
+  /// The output whose running attempt @a requester_pid belongs to, if any,
+  /// as the build process tracker finds it. May read /proc, so call it holding
+  /// no lock.
+  [[nodiscard]] std::optional<std::filesystem::path> resolve(
       std::uint32_t requester_pid) const;
 
-  /// As @link wait, for a request already resolved to @a requester (or to
-  /// none), such as an in-process copy waiting as its own attempt.
+  /// As @link wait, for a request already found to come from the attempt
+  /// running at @a requester (or from none), such as an in-process copy waiting
+  /// as its own attempt.
   [[nodiscard]] exec::task<std::error_code> wait_as(
       AttemptPtr target,
-      std::optional<AttemptId> requester);
+      std::optional<std::filesystem::path> requester);
 
   /// What is being tracked right now.
   [[nodiscard]] Stats stats() const;
@@ -162,8 +178,9 @@ class BuildCoordinator {
   [[nodiscard]] std::size_t edge_count(const AttemptPtr& from,
                                        const AttemptPtr& to) const;
 
-  /// The id @a attempt's processes are registered under.
-  [[nodiscard]] static AttemptId id_of(const AttemptPtr& attempt);
+  /// The output @a attempt builds, which its processes are added under.
+  [[nodiscard]] static const std::filesystem::path& output_of(
+      const AttemptPtr& attempt);
 };
 
 }  // namespace makebelieve

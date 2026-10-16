@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
-#include "processattribution.hpp"
+#include "osbuildprocesstracker.hpp"
 
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -14,10 +15,23 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <vector>
 
 #include <sys/syscall.h>
 #include <unistd.h>
+
+// A record holds the command's pid and start time, read while it is parked
+// before exec as our unreaped child. A requester - a thread, as FUSE reports
+// it - is mapped to its process and followed up its parents to a command in
+// the tracker, matched on pid and start time both, so a recycled pid is never
+// found to belong to a build that has ended. A process that has been
+// re-parented away from its command (to init, say) is missed, and its request
+// is taken to come from no build. makebelieve is not made a child subreaper; a
+// cgroup per command could close that gap later.
+//
+// /proc is read outside the lock; only comparing against the records holds
+// it.
 
 namespace makebelieve {
 
@@ -72,7 +86,7 @@ std::optional<std::uint32_t> process_of(std::uint32_t thread) {
 }
 
 struct Record {
-  AttemptId attempt;
+  std::filesystem::path output;
   std::uint32_t pid;
   std::uint64_t start_time;
 };
@@ -83,19 +97,21 @@ constexpr int k_max_depth = 4096;
 
 }  // namespace
 
-class ProcessAttribution::Impl {
+class OsBuildProcessTracker::Impl {
  public:
   std::mutex mutex;
-  std::vector<Record> records;
+  BuildProcessTracker::Token last_token = 0;
+  std::unordered_map<BuildProcessTracker::Token, Record> records;
 };
 
-ProcessAttribution::ProcessAttribution() : m_impl(std::make_unique<Impl>()) {}
+OsBuildProcessTracker::OsBuildProcessTracker()
+    : m_impl(std::make_unique<Impl>()) {}
 
-ProcessAttribution::~ProcessAttribution() = default;
+OsBuildProcessTracker::~OsBuildProcessTracker() = default;
 
-std::expected<LaunchRegistration, std::error_code>
-ProcessAttribution::register_process(AttemptId attempt,
-                                     const LaunchedProcess& process) {
+std::expected<BuildProcessTracker::Token, std::error_code>
+OsBuildProcessTracker::add(const std::filesystem::path& output,
+                           const ProcessHandle& process) {
   // The process is parked before exec as our unreaped child, so its pid is
   // still its own while this reads it; the pidfd confirms it has not gone.
   const std::optional<Stat> stat = stat_of(process.pid);
@@ -106,22 +122,21 @@ ProcessAttribution::register_process(AttemptId attempt,
       ::syscall(SYS_pidfd_send_signal, process.pidfd, 0, nullptr, 0) != 0) {
     return std::unexpected(std::error_code(errno, std::system_category()));
   }
-  const Record record{
-      .attempt = attempt, .pid = process.pid, .start_time = stat->start_time};
-  {
-    const std::lock_guard lock(m_impl->mutex);
-    m_impl->records.push_back(record);
-  }
-  return LaunchRegistration([impl = m_impl.get(), record] {
-    const std::lock_guard lock(impl->mutex);
-    std::erase_if(impl->records, [&](const Record& it) {
-      return it.attempt == record.attempt && it.pid == record.pid &&
-             it.start_time == record.start_time;
-    });
-  });
+  Record record{
+      .output = output, .pid = process.pid, .start_time = stat->start_time};
+  const std::lock_guard lock(m_impl->mutex);
+  const Token token = ++m_impl->last_token;
+  m_impl->records.emplace(token, std::move(record));
+  return token;
 }
 
-std::optional<AttemptId> ProcessAttribution::resolve(std::uint32_t requester) {
+void OsBuildProcessTracker::remove(Token token) noexcept {
+  const std::lock_guard lock(m_impl->mutex);
+  m_impl->records.erase(token);
+}
+
+std::optional<std::filesystem::path> OsBuildProcessTracker::find(
+    std::uint32_t requester_pid) {
   {
     const std::lock_guard lock(m_impl->mutex);
     if (m_impl->records.empty()) {
@@ -129,7 +144,7 @@ std::optional<AttemptId> ProcessAttribution::resolve(std::uint32_t requester) {
     }
   }
   // FUSE names the thread; its process is where the walk starts.
-  std::optional<std::uint32_t> pid = process_of(requester);
+  std::optional<std::uint32_t> pid = process_of(requester_pid);
   const auto self = static_cast<std::uint32_t>(::getpid());
   for (int depth = 0;
        pid.has_value() && *pid > 1 && *pid != self && depth < k_max_depth;
@@ -140,9 +155,9 @@ std::optional<AttemptId> ProcessAttribution::resolve(std::uint32_t requester) {
     }
     {
       const std::lock_guard lock(m_impl->mutex);
-      for (const Record& record : m_impl->records) {
+      for (const auto& [token, record] : m_impl->records) {
         if (record.pid == *pid && record.start_time == stat->start_time) {
-          return record.attempt;
+          return record.output;
         }
       }
     }
