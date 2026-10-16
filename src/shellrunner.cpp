@@ -241,7 +241,7 @@ exec::task<BuildResult> detail::run_shell_command(
     std::filesystem::path working_directory,
     std::filesystem::path mountpoint,
     Command command,
-    LaunchRegistrar registrar,
+    BuildProcessOwner owner,
     stdexec::inplace_stop_token stop) {
   MB_TRACE_THREAD_NAME("build worker");
 
@@ -286,7 +286,7 @@ exec::task<BuildResult> detail::run_shell_command(
     text = substitute_out(text, out_path);
   }
   ProcessUtil::Result result =
-      co_await ProcessUtil::run(io, working_directory, text, registrar, stop);
+      co_await ProcessUtil::run(io, working_directory, text, owner, stop);
   if (!result.has_value()) {
     co_return std::unexpected(result.error());
   }

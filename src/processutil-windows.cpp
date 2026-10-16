@@ -604,14 +604,14 @@ class ChildProcess {
     const std::string& hook;     // the DLL to inject, as Detours wants it
     const std::filesystem::path& working_directory;
     HANDLE standard_output;
-    LaunchRegistrar registrar;         // told about the command before it runs
-    LaunchRegistration& registration;  // where what it recorded is kept
+    BuildProcessOwner owner;  // adds the command to the tracker before it runs
+    ProcessRemoveGuard& remove_guard;  // takes it out of the tracker again
   };
 
   // Starts the command @a spec describes, with the hook it names injected,
   // or says why it could not. A command that cannot be enrolled in a job never
   // runs: without one, what it started could be neither ended nor waited for.
-  // Nor does one its registrar refuses.
+  // Nor does one that cannot be added to the build process tracker.
   static std::expected<std::unique_ptr<ChildProcess>, std::error_code> launch(
       const Launch& spec) {
     // Created before the suspended launch so the command is enrolled before it
@@ -657,18 +657,17 @@ class ChildProcess {
     if (!AssignProcessToJobObject(job->get(), process.get())) {
       return abandon(last_error_code());
     }
-    // In the job, so the registration covers everything the command will
+    // In the job, so the record covers everything the command will
     // start, and still suspended, so the command has done nothing yet.
-    std::expected<LaunchRegistration, std::error_code> registered =
-        spec.registrar(
-            LaunchedProcess{.pid = info.dwProcessId, .job = job->get()});
-    if (!registered.has_value()) {
-      return abandon(registered.error());
+    std::expected<ProcessRemoveGuard, std::error_code> added = spec.owner.add(
+        ProcessHandle{.pid = info.dwProcessId, .job = job->get()});
+    if (!added.has_value()) {
+      return abandon(added.error());
     }
     if (ResumeThread(thread.get()) == static_cast<DWORD>(-1)) {
       return abandon(last_error_code());
     }
-    spec.registration = std::move(*registered);
+    spec.remove_guard = std::move(*added);
     return std::unique_ptr<ChildProcess>(new ChildProcess(
         std::move(*job), std::move(process), std::move(thread)));
   }
@@ -767,7 +766,7 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     IoContext& io,
     std::filesystem::path working_directory,
     std::string command,
-    LaunchRegistrar registrar,
+    BuildProcessOwner owner,
     stdexec::inplace_stop_token stop) {
   if (stop.stop_requested()) {
     co_return std::unexpected(
@@ -800,7 +799,7 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
 
   // Held until the command, and everything it started, has gone - declared
   // before the child so it is undone only after that.
-  LaunchRegistration registration;
+  ProcessRemoveGuard remove_guard;
 
   std::expected<std::unique_ptr<ChildProcess>, std::error_code> child =
       ChildProcess::launch({.command_line = command_line,
@@ -808,8 +807,8 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
                             .hook = (*tracing)->hook(),
                             .working_directory = working_directory,
                             .standard_output = write_end.get(),
-                            .registrar = registrar,
-                            .registration = registration});
+                            .owner = owner,
+                            .remove_guard = remove_guard});
   // Close our copy of the command's end, so only it can write to the pipe and
   // the pipe closes once it has gone.
   write_end.reset(nullptr);

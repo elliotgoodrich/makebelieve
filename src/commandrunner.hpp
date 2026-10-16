@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-#include "launchregistrar.hpp"
+#include "buildprocesstracker.hpp"
 #include "manifest.hpp"
 
 #include <exec/any_sender_of.hpp>
@@ -66,18 +66,18 @@ struct Command {
 /// while that request is still walking them. Completing from another thread
 /// is fine.
 ///
-/// The receiver's environment also names the @link LaunchRegistrar every
-/// process the build launches must be registered with before it runs
-/// (`get_launch_registrar`). A build that launches nothing may ignore it; one
-/// that does must pass it on, so the processes a build runs can be told apart
-/// from anyone else's.
+/// The receiver's environment also names the @link BuildProcessOwner every
+/// process the build launches must be added under before it runs
+/// (`get_build_process_owner`). A build that launches nothing may ignore it;
+/// one that does must pass it on, so the processes a build runs can be told
+/// apart from anyone else's.
 using BuildSender = exec::any_sender<exec::any_receiver<
     stdexec::completion_signatures<stdexec::set_value_t(BuildResult),
                                    stdexec::set_error_t(std::exception_ptr),
                                    stdexec::set_stopped_t()>,
     exec::queries<stdexec::inplace_stop_token(
                       stdexec::get_stop_token_t) noexcept,
-                  LaunchRegistrar(get_launch_registrar_t) noexcept>>>;
+                  BuildProcessOwner(get_build_process_owner_t) noexcept>>>;
 
 /// The error a build that completed with the exception @a error is recorded
 /// as.
