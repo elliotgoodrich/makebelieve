@@ -333,10 +333,11 @@ void Tracer::end(TraceLane lane,
   }
 }
 
-void Tracer::flow_out(std::string_view category,
+void Tracer::flow_out(TraceLane lane,
+                      std::string_view category,
                       std::string_view name,
                       std::uint64_t id) noexcept {
-  flow('s', here(), category, name, id);
+  flow('s', lane, category, name, id);
 }
 
 void Tracer::flow_in(TraceLane lane,
@@ -346,8 +347,9 @@ void Tracer::flow_in(TraceLane lane,
   flow('f', lane, category, name, id);
 }
 
-// `bp` binds each end of the flow to the span its thread or lane is inside,
-// which is what the arrow is drawn between.
+// `bp` binds each end of the flow to the span its lane is inside, which is
+// what the arrow is drawn between. An end outside every span has nothing to
+// bind to, which Perfetto reports as `flow_no_enclosing_slice`.
 void Tracer::flow(char phase,
                   TraceLane row,
                   std::string_view category,

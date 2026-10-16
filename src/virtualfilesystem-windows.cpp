@@ -753,7 +753,8 @@ class VirtualFileSystem::Impl {
     }
     try {
       auto result = co_await stdexec::write_env(
-          m_tree.open(path, OpenContext{.requester_pid = caller}),
+          m_tree.open(path, OpenContext{.requester_pid = caller,
+                                        .trace_lane = trace.lane()}),
           stdexec::prop{stdexec::get_stop_token, m_request_stop.get_token()});
       if (!result) {
         pending->send(to_ntstatus(result.error()));

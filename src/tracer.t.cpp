@@ -216,17 +216,18 @@ TEST(TracerTest, RunsSeveralValuesTogetherIntoOne) {
 
 // A lane is a row of its own, and a flow is the pair of events an arrow is
 // drawn between: out of the span the calling thread is in, into the span on
-// the lane.
+// the lane. Each end lies within its span, or a viewer has nothing to bind it
+// to.
 TEST(TracerTest, RecordsALaneWithAFlowIntoIt) {
   Tracer tracer;
   const TraceLane lane = tracer.lane(ProcessInfo::self(), "out.txt");
   const Tracer::Clock::time_point start = Tracer::Clock::now();
 
-  tracer.complete("vfs", "open out.txt", start, Tracer::Clock::now());
-  tracer.flow_out("build", "build", 7);
+  tracer.flow_out(tracer.here(), "build", "build", 7);
   tracer.begin(lane, "build", "out.txt");
   tracer.flow_in(lane, "build", "build", 7);
   tracer.end(lane, "build", "out.txt");
+  tracer.complete("vfs", "open out.txt", start, Tracer::Clock::now());
 
   const std::string trace = tracer.snapshot();
   EXPECT_TRUE(JsonChecker::is_valid(trace)) << trace;
