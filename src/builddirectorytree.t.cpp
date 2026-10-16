@@ -1225,15 +1225,78 @@ TEST_F(BuildDirectoryTreeTracingTest, ATracingOutputServesTheTrace) {
   EXPECT_TRUE(trace.contains(R"("ph":"E","cat":"build","name":"output.txt")"))
       << trace;
   EXPECT_TRUE(trace.contains(R"("command":"build %out")")) << trace;
-  // The build runs on a row of its own, with an arrow from whatever asked for
-  // it.
+  // The build runs on a row of its own.
   EXPECT_TRUE(trace.contains(R"("args":{"name":"build"})")) << trace;
-  EXPECT_TRUE(trace.contains(R"("ph":"s","cat":"build","name":"build")"))
-      << trace;
-  EXPECT_TRUE(trace.contains(R"("ph":"f","cat":"build","name":"build")"))
-      << trace;
   // Its own build is left out, as its snapshot could only ever show it begun.
   EXPECT_FALSE(trace.contains(R"("name":"trace.json")")) << trace;
+}
+
+// The lines of @a trace recording one end of a flow, `s` or `f`.
+std::vector<std::string> flow_ends(const std::string& trace, char phase) {
+  const std::string marker = std::string(R"("ph":")") + phase + '"';
+  std::vector<std::string> ends;
+  std::size_t start = 0;
+  while (start < trace.size()) {
+    std::size_t end = trace.find('\n', start);
+    if (end == std::string::npos) {
+      end = trace.size();
+    }
+    std::string line = trace.substr(start, end - start);
+    if (line.contains(marker)) {
+      ends.push_back(std::move(line));
+    }
+    start = end + 1;
+  }
+  return ends;
+}
+
+// A build's arrow leaves the span of whatever asked for it, and is left out
+// when nothing traced did: an end outside every span has nothing for a viewer
+// to bind it to.
+TEST_F(BuildDirectoryTreeTracingTest, ABuildsArrowLeavesTheSpanThatAskedForIt) {
+  source.write_file("input.txt", "v1");
+  write_manifest(
+      "@/asked.txt = run build input.txt %out\n"
+      "@/unasked.txt = run build %out\n");
+
+  int runs = 0;
+  const BuildDirectoryTree tree(source,
+                                counting_with_inputs(runs, {"input.txt"}));
+
+  // An open on a reader's row, as the filesystem makes, draws an arrow from
+  // the reader's span.
+  const TraceLane reader = tracer.lane(1234, "reader");
+  tracer.begin(reader, "vfs", "asked.txt");
+  EXPECT_TRUE(makebelieve::DirectoryTreeUtil::open(
+                  tree, "asked.txt", OpenContext{.trace_lane = reader})
+                  .has_value());
+  tracer.end(reader, "vfs", "asked.txt");
+
+  // One with no row draws none.
+  read_output(tree, "unasked.txt");
+
+  std::string trace = tracer.snapshot();
+  std::vector<std::string> outs = flow_ends(trace, 's');
+  ASSERT_EQ(outs.size(), 1U) << trace;
+  EXPECT_TRUE(
+      outs[0].contains(R"("pid":1234,"tid":)" + std::to_string(reader.row)))
+      << trace;
+  EXPECT_EQ(flow_ends(trace, 'f').size(), 1U) << trace;
+
+  // Eager rebuilds - both read input.txt - draw theirs from the source change
+  // that dirtied them, traced on the thread that reported the change.
+  source.write_file("input.txt", "v2");
+  ASSERT_EQ(runs, 4);
+  trace = tracer.snapshot();
+  outs = flow_ends(trace, 's');
+  ASSERT_EQ(outs.size(), 3U) << trace;
+  const TraceLane here = tracer.here();
+  const std::string here_row = R"("pid":)" + std::to_string(here.process) +
+                               R"(,"tid":)" + std::to_string(here.row);
+  EXPECT_TRUE(outs[1].contains(here_row)) << trace;
+  EXPECT_TRUE(outs[2].contains(here_row)) << trace;
+  EXPECT_TRUE(trace.contains(R"("name":"source change")")) << trace;
+  EXPECT_EQ(flow_ends(trace, 'f').size(), 3U) << trace;
 }
 
 // Every open takes a fresh snapshot, so the trace includes whatever happened
