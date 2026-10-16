@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include "tracer.hpp"
+
 #include <exec/any_sender_of.hpp>
 #include <stdexec/execution.hpp>
 
@@ -11,6 +13,7 @@
 #include <expected>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -117,6 +120,10 @@ class Subscription {
 struct OpenContext {
   /// Native process id of the requester; zero means no attributed process.
   std::uint32_t requester_pid = 0;
+
+  /// The trace row the request is recorded on, if any, which a build the open
+  /// starts draws its arrow from.
+  std::optional<TraceLane> trace_lane;
 };
 
 /// A file operation yielding a value or filesystem error, an exception, or

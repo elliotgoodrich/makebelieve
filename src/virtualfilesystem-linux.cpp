@@ -597,7 +597,8 @@ class VirtualFileSystem::Impl {
     try {
       auto handle = std::make_unique<FileHandle>(FileHandle{.path = name});
       auto opened = co_await stdexec::write_env(
-          m_tree.open(name, OpenContext{.requester_pid = caller}),
+          m_tree.open(name, OpenContext{.requester_pid = caller,
+                                        .trace_lane = trace.lane()}),
           stdexec::prop{stdexec::get_stop_token, request->stop.get_token()});
       if (!opened) {
         request->reply_error(to_errno(opened.error()));

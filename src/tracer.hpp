@@ -201,9 +201,11 @@ class Tracer {
            const std::filesystem::path& name,
            const TraceArgs& args = {}) noexcept;
 
-  /// Records the start of a flow, drawn as an arrow out of the span the
-  /// calling thread is inside, to wherever @link flow_in picks @a id up.
-  void flow_out(std::string_view category,
+  /// Records the start of a flow, drawn as an arrow out of the span @a lane
+  /// is inside, to wherever @link flow_in picks @a id up.
+  /// @pre @a lane is inside a span, or a viewer has nothing to draw it from.
+  void flow_out(TraceLane lane,
+                std::string_view category,
                 std::string_view name,
                 std::uint64_t id) noexcept;
 
@@ -218,15 +220,15 @@ class Tracer {
   /// so the name outlives the oldest events being dropped.
   void name_thread(std::string_view name) noexcept;
 
+  /// The row the calling thread records on: the one it has been lent, else its
+  /// own thread's row in makebelieve's group.
+  [[nodiscard]] TraceLane here() const noexcept;
+
   /// Renders everything held as a JSON array of events: the process and thread
   /// names first, then the events, oldest first.
   [[nodiscard]] std::string snapshot() const;
 
  private:
-  // The row the calling thread records on: the one it has been lent, else its
-  // own thread's row in makebelieve's group.
-  [[nodiscard]] TraceLane here() const noexcept;
-
   // Appends the start of an event - the part every phase shares - to @a out,
   // against @a row.
   void begin_event(std::string& out,
@@ -395,6 +397,12 @@ class TraceAsyncScope {
     m_lane = pool.take(*m_tracer, process.id);
     m_tracer->begin(m_lane, "vfs", m_name);
   }
+  /// The row the span is on, once opened. Since the calling thread is not put
+  /// on it, work the span asks for is handed it to record against.
+  [[nodiscard]] std::optional<TraceLane> lane() const noexcept {
+    return m_tracer != nullptr ? std::optional(m_lane) : std::nullopt;
+  }
+
   /// Ends an open span and returns its borrowed lane to the pool.
   ~TraceAsyncScope() {
     if (m_tracer) {

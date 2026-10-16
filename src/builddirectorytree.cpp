@@ -435,7 +435,8 @@ class BuildDirectoryTree::Impl {
         record_read(*requester, output);
       }
     }
-    const BuildCoordinator::AttemptPtr target = bring_up_to_date(output);
+    const BuildCoordinator::AttemptPtr target =
+        bring_up_to_date(output, context.trace_lane);
     if (target == nullptr) {
       co_return std::error_code{};
     }
@@ -507,13 +508,20 @@ class BuildDirectoryTree::Impl {
     BuildCoordinator::AttemptPtr attempt;
     Command command;
     std::uint64_t build_id = 0;
+
+    // The trace row whose span asked for the build, which its arrow is drawn
+    // from. Without one there is no arrow, since there is no span to bind it
+    // to.
+    std::optional<TraceLane> origin;
   };
 
   // The build that brings @a output up to date, as build_now describes, or
-  // nullptr if it is up to date already or not declared.
+  // nullptr if it is up to date already or not declared. A build started here
+  // is traced as asked for by @a origin's span.
   // NOLINTNEXTLINE(misc-no-recursion): see launch_build.
   BuildCoordinator::AttemptPtr bring_up_to_date(
-      const std::filesystem::path& output) {
+      const std::filesystem::path& output,
+      std::optional<TraceLane> origin) {
     BuildCoordinator::AttemptPtr target;
     std::optional<Launch> launch;
     {
@@ -543,6 +551,7 @@ class BuildDirectoryTree::Impl {
         }
       } else if (m_stale.contains(output)) {
         launch = claim_build(output);
+        launch->origin = origin;
         target = launch->attempt;
       } else {
         return nullptr;
@@ -558,8 +567,10 @@ class BuildDirectoryTree::Impl {
   // The build, as @a self, of a copy of the output @a source.
   // NOLINTNEXTLINE(misc-no-recursion): see launch_build.
   exec::task<BuildResult> copy_output(std::filesystem::path source,
-                                      BuildCoordinator::AttemptPtr self) {
-    if (const BuildCoordinator::AttemptPtr target = bring_up_to_date(source)) {
+                                      BuildCoordinator::AttemptPtr self,
+                                      std::optional<TraceLane> lane) {
+    if (const BuildCoordinator::AttemptPtr target =
+            bring_up_to_date(source, lane)) {
       if (const std::error_code error = co_await m_coordinator->wait_as(
               target, BuildCoordinator::id_of(self))) {
         co_return std::unexpected(error);
@@ -610,9 +621,11 @@ class BuildDirectoryTree::Impl {
     return launch;
   }
 
-  // Starts @a output's build if it is declared, stale and idle.
+  // Starts @a output's build if it is declared, stale and idle, traced as
+  // asked for by @a origin's span.
   // NOLINTNEXTLINE(misc-no-recursion): see launch_build.
-  void start_build(const std::filesystem::path& output) {
+  void start_build(const std::filesystem::path& output,
+                   std::optional<TraceLane> origin) {
     std::optional<Launch> launch;
     {
       const std::lock_guard lock(m_mutex);
@@ -622,6 +635,7 @@ class BuildDirectoryTree::Impl {
       }
       launch = claim_build(output);
     }
+    launch->origin = origin;
     launch_build(std::move(*launch));
   }
 
@@ -641,17 +655,22 @@ class BuildDirectoryTree::Impl {
       return;
     }
 
+    std::optional<TraceLane> lane;
     if (Tracer* const tracer = g_tracer) {
-      // The arrow leaves whatever we are inside - the open that asked for this
-      // output, or the source change that dirtied it - and arrives at the
+      // The arrow leaves whatever asked for this output - an open, a source
+      // change that dirtied it, a build copying it - and arrives at the
       // build's own row.
-      const TraceLane lane = take_lane(output);
-      tracer->flow_out("build", "build", build_id);
+      lane = take_lane(output);
+      if (launch.origin.has_value()) {
+        tracer->flow_out(*launch.origin, "build", "build", build_id);
+      }
       TraceArgs args;
       args.add("action", to_string(launch.command.action));
       args.add("command", launch.command.text);
-      tracer->begin(lane, "build", output, args);
-      tracer->flow_in(lane, "build", "build", build_id);
+      tracer->begin(*lane, "build", output, args);
+      if (launch.origin.has_value()) {
+        tracer->flow_in(*lane, "build", "build", build_id);
+      }
     }
 
     std::optional<AttemptSender> build;
@@ -665,7 +684,7 @@ class BuildDirectoryTree::Impl {
               ? BuildSender(stdexec::write_env(
                     copy_output(
                         launch.command.text.substr(k_generated_prefix.size()),
-                        launch.attempt),
+                        launch.attempt, lane),
                     stdexec::prop{stdexec::get_start_scheduler,
                                   stdexec::inline_scheduler{}}))
               : m_runner(std::move(launch.command));
@@ -1015,8 +1034,12 @@ class BuildDirectoryTree::Impl {
         }
       }
     }
+    // Called only from within on_source_change, whose span is what the
+    // rebuilds' arrows leave.
+    const std::optional<TraceLane> origin =
+        g_tracer != nullptr ? std::optional(g_tracer->here()) : std::nullopt;
     for (const std::filesystem::path& output : eager) {
-      start_build(output);
+      start_build(output, origin);
     }
   }
 };
