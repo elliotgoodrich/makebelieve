@@ -3,6 +3,7 @@
 
 #include "directorytreeutil.hpp"
 #include "iocontext.hpp"
+#include "scopeguard.hpp"
 
 #include <stdexec/execution.hpp>
 
@@ -45,33 +46,6 @@ constexpr DWORD k_watch_buffer_bytes = 64 * 1024;
 // across several calls. Capping well below the DWORD limit also keeps a
 // single call from pinning an unreasonable span of the output buffer.
 constexpr std::uint64_t k_read_chunk_bytes = 32ULL * 1024 * 1024;
-
-// Closes a HANDLE on scope exit.
-template <BOOL(WINAPI* Close)(HANDLE)>
-class ScopedHandle {
- public:
-  explicit ScopedHandle(HANDLE handle) : m_handle(handle) {}
-
-  ~ScopedHandle() {
-    if (valid()) {
-      Close(m_handle);
-    }
-  }
-
-  ScopedHandle(const ScopedHandle&) = delete;
-  ScopedHandle& operator=(const ScopedHandle&) = delete;
-  ScopedHandle(ScopedHandle&&) = delete;
-  ScopedHandle& operator=(ScopedHandle&&) = delete;
-
-  [[nodiscard]] HANDLE get() const { return m_handle; }
-  [[nodiscard]] bool valid() const { return m_handle != INVALID_HANDLE_VALUE; }
-
- private:
-  HANDLE m_handle;
-};
-
-using UniqueHandle = ScopedHandle<&CloseHandle>;
-using UniqueFindHandle = ScopedHandle<&FindClose>;
 
 [[noreturn]] void throw_last_error(const char* what) {
   throw std::system_error(static_cast<int>(GetLastError()),
@@ -340,10 +314,10 @@ RealDirectoryTree::Impl::ls(const std::filesystem::path& path) const {
   // build tree tends to have.
   WIN32_FIND_DATAW data{};
   const std::filesystem::path pattern = *resolved / L"*";
-  const UniqueFindHandle find(FindFirstFileExW(
-      pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr,
-      FIND_FIRST_EX_LARGE_FETCH));
-  if (!find.valid()) {
+  const HANDLE find = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data,
+                                       FindExSearchNameMatch, nullptr,
+                                       FIND_FIRST_EX_LARGE_FETCH);
+  if (find == INVALID_HANDLE_VALUE) {
     // Only a volume's root has no "." to find, and so reports an empty listing
     // this way.
     if (GetLastError() == ERROR_FILE_NOT_FOUND) {
@@ -351,6 +325,7 @@ RealDirectoryTree::Impl::ls(const std::filesystem::path& path) const {
     }
     return std::unexpected(last_error_code());
   }
+  const ScopeGuard close_find([find] { FindClose(find); });
 
   std::vector<TreeEntry> entries;
   do {
@@ -361,7 +336,7 @@ RealDirectoryTree::Impl::ls(const std::filesystem::path& path) const {
     entries.emplace_back(std::filesystem::path(name),
                          make_info(data.dwFileAttributes, data.nFileSizeHigh,
                                    data.nFileSizeLow, data.ftLastWriteTime));
-  } while (FindNextFileW(find.get(), &data));
+  } while (FindNextFileW(find, &data));
   // FindNextFileW reports the end and a failure the same way.
   if (GetLastError() != ERROR_NO_MORE_FILES) {
     return std::unexpected(last_error_code());
@@ -394,13 +369,14 @@ std::expected<std::string, std::error_code> RealDirectoryTree::Impl::read(
   // an open and a close; a small handle cache keyed on the resolved path is
   // the natural fix, and it needs to be one, given every method here is
   // callable concurrently.
-  const UniqueHandle file(
+  const HANDLE file =
       CreateFileW(resolved->c_str(), GENERIC_READ,
                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-  if (!file.valid()) {
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
     return std::unexpected(last_error_code());
   }
+  const ScopeGuard close_file([file] { CloseHandle(file); });
 
   std::string contents;
   std::optional<std::error_code> failure;
@@ -420,8 +396,7 @@ std::expected<std::string, std::error_code> RealDirectoryTree::Impl::read(
       const DWORD chunk = static_cast<DWORD>(
           std::min<std::uint64_t>(capacity - total, k_read_chunk_bytes));
       DWORD read_bytes = 0;
-      if (!ReadFile(file.get(), data + total, chunk, &read_bytes,
-                    &overlapped)) {
+      if (!ReadFile(file, data + total, chunk, &read_bytes, &overlapped)) {
         // A positioned read that starts at or past the end reports itself
         // this way rather than as a zero-byte success.
         if (GetLastError() != ERROR_HANDLE_EOF) {

@@ -4,10 +4,11 @@
 // Windows only: shared by ProcessUtil and the tracing hook, which cannot link
 // against the rest of makebelieve.
 
+#include "scopeguard.hpp"
+
 #include <windows.h>
 
 #include <algorithm>
-#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -73,13 +74,13 @@ struct TracingEnvironment {
 
   /// The entries of this process's own environment.
   [[nodiscard]] static std::vector<std::wstring> own_entries() {
-    // Freed however this returns, including by entries_of() throwing.
-    const std::unique_ptr<wchar_t, decltype(&FreeEnvironmentStringsW)> env(
-        GetEnvironmentStringsW(), &FreeEnvironmentStringsW);
+    wchar_t* const env = GetEnvironmentStringsW();
     if (env == nullptr) {
       return {};
     }
-    return entries_of(env.get());
+    // Freed however this returns, including by entries_of() throwing.
+    const ScopeGuard free_env([env] { FreeEnvironmentStringsW(env); });
+    return entries_of(env);
   }
 
   /// The entries of the UTF-16 environment block @a block.
