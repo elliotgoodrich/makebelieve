@@ -2,6 +2,7 @@
 #include "consoleinterrupthandler.hpp"
 
 #include "iocontext.hpp"
+#include "scopeguard.hpp"
 
 #include <gtest/gtest.h>
 
@@ -20,6 +21,8 @@
 #include <filesystem>
 #include <iterator>
 #endif
+
+using namespace makebelieve;
 
 namespace {
 
@@ -111,6 +114,7 @@ TEST(ConsoleInterruptHandler, InterruptRequestsStop) {
   const HANDLE ready =
       ::CreateEventW(nullptr, FALSE, FALSE, k_ready_event_name);
   ASSERT_NE(ready, nullptr);
+  const ScopeGuard close_ready([ready] { ::CloseHandle(ready); });
 
   std::wstring command = L"\"";
   command += exe_path;
@@ -126,6 +130,10 @@ TEST(ConsoleInterruptHandler, InterruptRequestsStop) {
                                         nullptr, TRUE, CREATE_NEW_PROCESS_GROUP,
                                         nullptr, nullptr, &startup, &process);
   ASSERT_TRUE(created) << "CreateProcessW failed: " << ::GetLastError();
+  const ScopeGuard close_process([&process] {
+    ::CloseHandle(process.hProcess);
+    ::CloseHandle(process.hThread);
+  });
 
   // Wait for the child to install its handler before signalling. A timeout
   // here is a real failure - the child never got ready.
@@ -144,10 +152,6 @@ TEST(ConsoleInterruptHandler, InterruptRequestsStop) {
   DWORD exit_code = 1;
   EXPECT_TRUE(::GetExitCodeProcess(process.hProcess, &exit_code));
   EXPECT_EQ(exit_code, 0u) << "child exited uncleanly after the interrupt";
-
-  ::CloseHandle(process.hProcess);
-  ::CloseHandle(process.hThread);
-  ::CloseHandle(ready);
 }
 
 // Runs in the child spawned by InterruptRequestsStop: install the handler,

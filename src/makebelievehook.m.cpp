@@ -38,6 +38,7 @@
 
 #include <detours.h>
 
+#include "scopeguard.hpp"
 #include "stringutil.hpp"
 #include "tracestatus.hpp"
 #include "tracingenvironment.hpp"
@@ -54,11 +55,9 @@
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #endif
 
-namespace {
+using namespace makebelieve;
 
-using makebelieve::StringUtil;
-using makebelieve::TraceStatus;
-using makebelieve::TracingEnvironment;
+namespace {
 
 // The run's status block, mapped for the life of the process; null if it
 // could not be opened, in which case this process cannot report at all - and
@@ -152,6 +151,7 @@ void append_log_line(std::wstring_view path) {
     report_failure();
     return;
   }
+  const ScopeGuard close_log([h] { ::CloseHandle(h); });
   std::string line = StringUtil::to_utf8(path);
   line.push_back('\n');
   DWORD written = 0;
@@ -160,7 +160,6 @@ void append_log_line(std::wstring_view path) {
       written != line.size()) {
     report_failure();
   }
-  ::CloseHandle(h);
 }
 
 /// Records the file behind @a handle if it was opened with read (data) access,

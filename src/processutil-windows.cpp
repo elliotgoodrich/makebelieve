@@ -3,6 +3,7 @@
 
 #include "iocontext.hpp"
 #include "processutilinternal.hpp"
+#include "scopeguard.hpp"
 #include "stringutil.hpp"
 #include "tracestatus.hpp"
 #include "tracingenvironment.hpp"
@@ -128,7 +129,7 @@ std::filesystem::path canonical_directory(
   if (handle == INVALID_HANDLE_VALUE) {
     return directory;
   }
-  const ScopedHandle guard(handle);
+  const ScopeGuard close_handle([handle] { CloseHandle(handle); });
   std::array<wchar_t, 32768> buffer{};
   const DWORD len = GetFinalPathNameByHandleW(
       handle, buffer.data(), static_cast<DWORD>(buffer.size()),

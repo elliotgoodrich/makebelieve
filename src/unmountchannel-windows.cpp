@@ -2,6 +2,7 @@
 #include "unmountchannel.hpp"
 
 #include "iocontext.hpp"
+#include "scopeguard.hpp"
 
 #include <stdexec/execution.hpp>
 
@@ -37,6 +38,7 @@ std::wstring canonical_key(const std::filesystem::path& mountpoint) {
   if (handle == INVALID_HANDLE_VALUE) {
     resolved = std::filesystem::absolute(mountpoint).lexically_normal();
   } else {
+    const ScopeGuard close_handle([handle] { CloseHandle(handle); });
     // A null buffer asks for the length including the terminator; fill in place
     // at that size. The fill returns the chars written excluding the
     // terminator, or 0 to fall back - on an error or a path that grew between
@@ -51,7 +53,6 @@ std::wstring canonical_key(const std::filesystem::path& mountpoint) {
                           handle, buffer, static_cast<DWORD>(size), flags);
       return len >= size ? std::size_t{0} : std::size_t{len};
     });
-    CloseHandle(handle);
     if (text.empty()) {
       resolved = std::filesystem::absolute(mountpoint).lexically_normal();
     } else {
@@ -174,7 +175,7 @@ UnmountChannel::Result UnmountChannel::request_unmount(
   if (handle == nullptr) {
     return Result::not_mounted;  // No endpoint of that name.
   }
-  const ScopedHandle guard(handle);
+  const ScopeGuard close_handle([handle] { CloseHandle(handle); });
 
   if (!SetEvent(handle)) {
     throw std::system_error(last_error_code(),

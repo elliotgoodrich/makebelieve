@@ -6,6 +6,7 @@
 #include "directorytreeutil.hpp"
 #include "filetask.hpp"
 #include "inmemorydirectorytree.hpp"
+#include "scopeguard.hpp"
 
 #include <gtest/gtest.h>
 
@@ -44,6 +45,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+
+using namespace makebelieve;
 
 namespace {
 
@@ -377,6 +380,7 @@ std::expected<std::string, std::error_code> FileMapper::map(
   if (file == INVALID_HANDLE_VALUE) {
     return last_error();
   }
+  const ScopeGuard close_file([file] { ::CloseHandle(file); });
   std::expected<std::string, std::error_code> result;
   LARGE_INTEGER size{};
   if (::GetFileSizeEx(file, &size) == 0) {
@@ -387,18 +391,17 @@ std::expected<std::string, std::error_code> FileMapper::map(
              mapping == nullptr) {
     result = last_error();
   } else {
+    const ScopeGuard close_mapping([mapping] { ::CloseHandle(mapping); });
     if (const LPVOID view = ::MapViewOfFile(
             mapping, shared ? FILE_MAP_READ : FILE_MAP_COPY, 0, 0, 0);
         view == nullptr) {
       result = last_error();
     } else {
+      const ScopeGuard unmap_view([view] { ::UnmapViewOfFile(view); });
       result = std::string(static_cast<const char*>(view),
                            static_cast<std::size_t>(size.QuadPart));
-      ::UnmapViewOfFile(view);
     }
-    ::CloseHandle(mapping);
   }
-  ::CloseHandle(file);
   return result;
 }
 

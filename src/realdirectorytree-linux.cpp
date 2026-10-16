@@ -3,6 +3,7 @@
 
 #include "directorytreeutil.hpp"
 #include "iocontext.hpp"
+#include "scopeguard.hpp"
 
 #include <stdexec/execution.hpp>
 
@@ -297,10 +298,7 @@ std::expected<std::string, std::error_code> RealDirectoryTree::Impl::read(
   // pread throughout, never read/lseek, so the shared descriptor carries no
   // position and concurrent reads of the same path do not race - the same
   // property the Windows backend gets from a positioned OVERLAPPED.
-  struct FdCloser {
-    int fd;
-    ~FdCloser() { ::close(fd); }
-  } const closer{fd};
+  const ScopeGuard closer([fd] { ::close(fd); });
 
   std::string contents;
   std::optional<std::error_code> failure;

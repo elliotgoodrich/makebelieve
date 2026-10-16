@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "osbuildprocesstracker.hpp"
 
+#include "scopeguard.hpp"
+
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -93,6 +95,7 @@ std::optional<std::filesystem::path> OsBuildProcessTracker::find(
   if (process == nullptr) {
     return std::nullopt;
   }
+  const ScopeGuard close_process([process] { CloseHandle(process); });
   std::optional<std::filesystem::path> found;
   {
     const std::shared_lock lock(m_impl->mutex);
@@ -104,7 +107,6 @@ std::optional<std::filesystem::path> OsBuildProcessTracker::find(
       }
     }
   }
-  CloseHandle(process);
   return found;
 }
 
