@@ -60,8 +60,7 @@ TEST(OsBuildProcessTracker, FindsACommandsBuildOnlyWhileItIsTracked) {
     return std::get<0>(
         stdexec::sync_wait(
             ProcessUtil::run(io, std::filesystem::temp_directory_path(),
-                             "cmake -E sleep 2",
-                             BuildProcessOwner(forwarding, k_output)))
+                             "cmake -E sleep 2", forwarding, k_output))
             .value());
   });
 

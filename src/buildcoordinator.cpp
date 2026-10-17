@@ -776,12 +776,8 @@ AttemptSender BuildCoordinator::Impl::run(AttemptPtr attempt,
                                          Attempt::ForwardStop{attempt.get()});
              return stdexec::write_env(
                         std::move(work),
-                        stdexec::env{
-                            stdexec::prop{stdexec::get_stop_token,
-                                          attempt->stop.get_token()},
-                            stdexec::prop{get_build_process_owner,
-                                          BuildProcessOwner(
-                                              *m_tracker, attempt->output)}}) |
+                        stdexec::prop{stdexec::get_stop_token,
+                                      attempt->stop.get_token()}) |
                     stdexec::upon_error(
                         [](const std::exception_ptr& error) noexcept {
                           return BuildResult(

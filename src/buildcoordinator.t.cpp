@@ -8,6 +8,7 @@
 #include "commandrunner.hpp"
 #include "directorytreeutil.hpp"
 #include "inmemorydirectorytree.hpp"
+#include "scopeguard.hpp"
 
 #include <gtest/gtest.h>
 #include <exec/static_thread_pool.hpp>
@@ -177,6 +178,9 @@ class FakeCommands {
   struct Run {
     FakeCommands* commands;
     std::string output;
+    // What the command builds, as the tree handed it over: what it is added
+    // to the tracker under, as ShellRunner adds a real command.
+    std::filesystem::path built;
     std::uint32_t pid;
     int active_threads = 0;
     bool stopped = false;
@@ -280,14 +284,14 @@ class FakeCommands {
 
   // Runs @a script as @a run's command, adding it to the tracker first, and
   // returns what it built.
-  BuildResult execute(Run& run,
-                      const std::string& script,
-                      BuildProcessOwner owner) {
-    std::expected<ProcessRemoveGuard, std::error_code> guard =
-        owner.add(ProcessHandle{.pid = run.pid});
-    if (!guard.has_value()) {
-      return std::unexpected(guard.error());
+  BuildResult execute(Run& run, const std::string& script) {
+    const std::expected<BuildProcessTracker::Token, std::error_code> added =
+        tracker.add(run.built, ProcessHandle{.pid = run.pid});
+    if (!added.has_value()) {
+      return std::unexpected(added.error());
     }
+    const ScopeGuard remove_from_tracker(
+        [this, token = *added] { tracker.remove(token); });
     std::vector<std::thread> threads;
     for (const std::string& steps : split(script, "|")) {
       threads.emplace_back([this, &run, steps] { run_thread(run, steps); });
@@ -320,11 +324,12 @@ class FakeCommands {
 
     Operation(Receiver receiver,
               FakeCommands& commands,
-              std::string output,
+              std::filesystem::path built,
               std::string script)
         : m_receiver(std::move(receiver)),
           m_run{.commands = &commands,
-                .output = std::move(output),
+                .output = built.generic_string(),
+                .built = std::move(built),
                 .pid = ++commands.m_last_pid},
           m_script(std::move(script)) {}
 
@@ -345,9 +350,7 @@ class FakeCommands {
         BuildResult result = [&] {
           const ex::inplace_stop_callback<OnStop> on_stop(
               ex::get_stop_token(ex::get_env(m_receiver)), OnStop{this});
-          return m_run.commands->execute(
-              m_run, m_script,
-              get_build_process_owner(ex::get_env(m_receiver)));
+          return m_run.commands->execute(m_run, m_script);
         }();
         ex::set_value(std::move(m_receiver), std::move(result));
       }).detach();
@@ -360,21 +363,19 @@ class FakeCommands {
         ex::completion_signatures<ex::set_value_t(BuildResult)>;
 
     FakeCommands* commands;
-    std::string output;
+    std::filesystem::path built;
     std::string script;
 
     template <class Receiver>
     [[nodiscard]] Operation<Receiver> connect(Receiver receiver) const {
-      return Operation<Receiver>(std::move(receiver), *commands, output,
-                                 script);
+      return Operation<Receiver>(std::move(receiver), *commands, built, script);
     }
   };
 
   CommandRunner runner() {
     return [this](const Command& command) -> BuildSender {
-      return Sender{.commands = this,
-                    .output = command.output.generic_string(),
-                    .script = command.text};
+      return Sender{
+          .commands = this, .built = command.output, .script = command.text};
     };
   }
 
@@ -571,6 +572,27 @@ TEST(BuildCoordinator, AnOutputACommandOpenedIsAnInputOfItsBuild) {
   EXPECT_EQ(outcome(fixture.open("a")), "ok");
   EXPECT_EQ(fixture.commands.runs("b"), 2);
   EXPECT_EQ(fixture.commands.runs("a"), 2);
+}
+
+// The same, for outputs in subdirectories. The runner adds its command under
+// the output the tree hands it (`Command::output`), as ShellRunner does, and
+// the coordinator finds the reader's build only if that is the very path the
+// tree named the attempt by.
+TEST(BuildCoordinator, AnOutputACommandOpenedIsAnInputOfItsBuildAtAnyDepth) {
+  Fixture fixture(1);
+  fixture.declare(
+      "@/out/a.txt = run open gen/deep/b.txt\n"
+      "@/gen/deep/b.txt = run signal one\n");
+  ASSERT_EQ(outcome(fixture.open("out/a.txt")), "ok");
+  ASSERT_EQ(fixture.commands.runs("out/a.txt"), 1);
+
+  // Changing b's command rebuilds b, and with it a, which read it.
+  fixture.redeclare(
+      "@/out/a.txt = run open gen/deep/b.txt\n"
+      "@/gen/deep/b.txt = run signal two\n");
+  EXPECT_EQ(outcome(fixture.open("out/a.txt")), "ok");
+  EXPECT_EQ(fixture.commands.runs("gen/deep/b.txt"), 2);
+  EXPECT_EQ(fixture.commands.runs("out/a.txt"), 2);
 }
 
 // An open from outside any build is no build's input.
@@ -922,7 +944,7 @@ TEST(BuildCoordinator, StoppingAnAttemptEndsItsWaitsButNotItsDependencies) {
   Fixture fixture(2);
   fixture.declare("@/b = run wait go\n");
   const BuildCoordinator::AttemptPtr attempt =
-      fixture.coordinator.create_attempt("stopped");
+      fixture.coordinator.create_attempt("a");
   ex::inplace_stop_source stop;
   std::promise<void> ended;
   const std::future<void> ending = ended.get_future();

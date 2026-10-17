@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include "buildprocesstracker.hpp"
 #include "commandrunner.hpp"
 
 #include <exec/task.hpp>
@@ -26,15 +27,15 @@ class IoContext;
 namespace detail {
 
 // Carries out @a command as `ShellRunner` describes, waiting on a command it
-// runs through @a io and adding it to the tracker under @a owner before it
-// runs. Its synchronous steps run wherever the task is started, and it resumes
-// there after each wait. @a stop cancels a command still running.
+// runs through @a io and adding it to @a tracker, under `command.output`,
+// before it runs. Its synchronous steps run wherever the task is started, and
+// it resumes there after each wait. @a stop cancels a command still running.
 exec::task<BuildResult> run_shell_command(
     IoContext& io,
     std::filesystem::path working_directory,
     std::filesystem::path mountpoint,
     Command command,
-    BuildProcessOwner owner,
+    BuildProcessTracker& tracker,
     stdexec::inplace_stop_token stop);
 
 }  // namespace detail
@@ -59,8 +60,9 @@ exec::task<BuildResult> run_shell_command(
 /// `Copy` rule runs no command at all: it produces the bytes of the file it
 /// names, read from under the working directory, and reports that file as its
 /// one input. (`BuildDirectoryTree` serves a copy of an output itself.)
-/// Each command it runs is added to the build process tracker, before it runs,
-/// under the @link BuildProcessOwner its receiver's environment names.
+/// Each command it runs is added to the @link BuildProcessTracker given at
+/// construction, before it runs, under the output it builds
+/// (`Command::output`).
 /// Traced inputs are reported relative to the working directory, so for
 /// dependency tracking to line up it should be the filesystem root that the
 /// tree's source mirrors.
@@ -78,21 +80,26 @@ class ShellRunner {
   std::filesystem::path m_working_directory;
   std::filesystem::path m_mountpoint;
   IoContext* m_io;
+  BuildProcessTracker* m_tracker;
   Scheduler m_scheduler;
 
  public:
   /// Creates a runner working in @a working_directory, with outputs mounted
-  /// at the absolute path @a mountpoint, running its
-  /// synchronous steps on @a scheduler and waiting through @a io.
-  /// @pre @a io, and whatever runs @a scheduler's work, outlive every build it
-  /// starts.
+  /// at the absolute path @a mountpoint, running its synchronous steps on
+  /// @a scheduler, waiting through @a io, and adding the commands it runs to
+  /// @a tracker - `BuildProcessTracker::none()` if nothing needs to tell them
+  /// apart.
+  /// @pre @a io, @a tracker, and whatever runs @a scheduler's work, outlive
+  /// every build it starts.
   ShellRunner(std::filesystem::path working_directory,
               std::filesystem::path mountpoint,
               IoContext& io,
+              BuildProcessTracker& tracker,
               Scheduler scheduler)
       : m_working_directory(std::move(working_directory)),
         m_mountpoint(std::move(mountpoint)),
         m_io(&io),
+        m_tracker(&tracker),
         m_scheduler(std::move(scheduler)) {}
 
   /// The build of @a command, as this class describes.
@@ -101,21 +108,15 @@ class ShellRunner {
     // Spelled as schedule-then-let_value because stdexec cannot type-erase a
     // starts_on onto some schedulers, a static_thread_pool's among them.
     return stdexec::schedule(m_scheduler) |
-           stdexec::let_value([io = m_io,
+           stdexec::let_value([io = m_io, tracker = m_tracker,
                                working_directory = m_working_directory,
                                mountpoint = m_mountpoint,
                                command = std::move(command)]() mutable {
-             return stdexec::read_env(get_build_process_owner) |
-                    stdexec::let_value([&](BuildProcessOwner owner) {
-                      // By value: this call's parameter is gone by the time
-                      // the stop token is read.
-                      return stdexec::read_env(stdexec::get_stop_token) |
-                             stdexec::let_value(
-                                 [&, owner](stdexec::inplace_stop_token stop) {
-                                   return detail::run_shell_command(
-                                       *io, working_directory, mountpoint,
-                                       std::move(command), owner, stop);
-                                 });
+             return stdexec::read_env(stdexec::get_stop_token) |
+                    stdexec::let_value([&](stdexec::inplace_stop_token stop) {
+                      return detail::run_shell_command(
+                          *io, working_directory, mountpoint,
+                          std::move(command), *tracker, stop);
                     });
            });
   }

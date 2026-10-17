@@ -62,11 +62,11 @@ struct ProcessUtil {
   /// killed. Waiting for every descendant there would take making this
   /// process a child subreaper, which has not been done.
   ///
-  /// The command's process is created paused, added to the build process
-  /// tracker through @a owner, and only let run once added - so nothing it does
-  /// can come before it is in the tracker. It then holds the guard that removes
-  /// it until the command has exited and whatever it started has been ended
-  /// (see above). Failing to add it leaves the command never having run, and
+  /// The command's process is created paused, added to @a tracker as the
+  /// build of @a output, and only let run once added - so nothing it does can
+  /// come before it is in the tracker. It is removed from the tracker only
+  /// once the command has exited and whatever it started has been ended (see
+  /// above). Failing to add it leaves the command never having run, and
   /// the sender completes with that error.
   ///
   /// The sender does its brief synchronous work - starting the command,
@@ -79,11 +79,12 @@ struct ProcessUtil {
   [[nodiscard]] static auto run(IoContext& io,
                                 std::filesystem::path working_directory,
                                 std::string command,
-                                BuildProcessOwner owner,
+                                BuildProcessTracker& tracker,
+                                std::filesystem::path output,
                                 stdexec::inplace_stop_token stop = {}) {
     return stdexec::write_env(
-        run_task(io, std::move(working_directory), std::move(command), owner,
-                 stop),
+        run_task(io, std::move(working_directory), std::move(command), tracker,
+                 std::move(output), stop),
         stdexec::prop{stdexec::get_stop_token, stdexec::never_stop_token{}});
   }
 
@@ -91,7 +92,8 @@ struct ProcessUtil {
   static exec::task<Result> run_task(IoContext& io,
                                      std::filesystem::path working_directory,
                                      std::string command,
-                                     BuildProcessOwner owner,
+                                     BuildProcessTracker& tracker,
+                                     std::filesystem::path output,
                                      stdexec::inplace_stop_token stop);
 };
 

@@ -3,6 +3,7 @@
 
 #include "iocontext.hpp"
 #include "processutilinternal.hpp"
+#include "scopeguard.hpp"
 
 #include <fuse_lowlevel.h>
 #include <exec/task.hpp>
@@ -936,7 +937,8 @@ class TracingSetup {
 exec::task<ProcessUtil::Result> run_traced(IoContext& io,
                                            std::filesystem::path root,
                                            std::string command,
-                                           BuildProcessOwner owner,
+                                           BuildProcessTracker& tracker,
+                                           std::filesystem::path output,
                                            stdexec::inplace_stop_token stop) {
   std::array<int, 2> out_pipe{-1, -1};
   if (::pipe(out_pipe.data()) != 0) {
@@ -956,9 +958,15 @@ exec::task<ProcessUtil::Result> run_traced(IoContext& io,
           .value_or(std::error_code{})
           .value();
 
-  // Held until the command has been reaped and what it left in its group
-  // killed - declared before the child so it is undone only after that.
-  ProcessRemoveGuard remove_guard;
+  // The command's record in the tracker, once added. Removed only once the
+  // command has been reaped and what it left in its group killed - declared
+  // before the child so it is removed only after that.
+  std::optional<BuildProcessTracker::Token> added_as;
+  const ScopeGuard remove_from_tracker([&tracker, &added_as] {
+    if (added_as.has_value()) {
+      tracker.remove(*added_as);
+    }
+  });
 
   const pid_t pid = ::fork();
   if (pid < 0) {
@@ -984,14 +992,14 @@ exec::task<ProcessUtil::Result> run_traced(IoContext& io,
   }
   // The child is parked at the barrier, before exec, so the command has done
   // nothing yet; and it is our unreaped child, so its pid is still its own.
-  std::expected<ProcessRemoveGuard, std::error_code> added =
-      owner.add(ProcessHandle{.pid = static_cast<std::uint32_t>(pid),
-                              .pidfd = child.exited()});
+  const std::expected<BuildProcessTracker::Token, std::error_code> added =
+      tracker.add(output, ProcessHandle{.pid = static_cast<std::uint32_t>(pid),
+                                        .pidfd = child.exited()});
   if (!added.has_value()) {
     co_await child.terminate(io);
     co_return std::unexpected(added.error());
   }
-  remove_guard = std::move(*added);
+  added_as = *added;
   setup->release();
 
   // Supervise the command and serve its requests side by side. Supervision
@@ -1028,7 +1036,8 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     IoContext& io,
     std::filesystem::path working_directory,
     std::string command,
-    BuildProcessOwner owner,
+    BuildProcessTracker& tracker,
+    std::filesystem::path output,
     stdexec::inplace_stop_token stop) {
   if (stop.stop_requested()) {
     co_return std::unexpected(
@@ -1044,8 +1053,8 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
   if (ec) {
     root = working_directory;
   }
-  co_return co_await run_traced(io, std::move(root), std::move(command), owner,
-                                stop);
+  co_return co_await run_traced(io, std::move(root), std::move(command),
+                                tracker, std::move(output), stop);
 }
 
 }  // namespace makebelieve
