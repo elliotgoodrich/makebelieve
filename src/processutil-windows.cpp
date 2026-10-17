@@ -626,26 +626,65 @@ class ChildProcess {
       return std::unexpected(job.error());
     }
 
-    STARTUPINFOW startup = {
-        .cb = sizeof(startup),
-        .dwFlags = STARTF_USESTDHANDLES,
-        .hStdInput = GetStdHandle(STD_INPUT_HANDLE),
-        .hStdOutput = spec.standard_output,
-        .hStdError = GetStdHandle(STD_ERROR_HANDLE),
+    const HANDLE standard_input = GetStdHandle(STD_INPUT_HANDLE);
+    const HANDLE standard_error = GetStdHandle(STD_ERROR_HANDLE);
+
+    // The command inherits its standard handles alone, not every inheritable
+    // handle this process has - which includes the pipe of any other command
+    // being launched meanwhile, and would hold it open for as long as this
+    // one lived. Only inheritable handles may be listed, and each once.
+    std::vector<HANDLE> inherited = {spec.standard_output};
+    for (const HANDLE handle : {standard_input, standard_error}) {
+      DWORD flags = 0;
+      if (handle != nullptr && handle != INVALID_HANDLE_VALUE &&
+          GetHandleInformation(handle, &flags) &&
+          (flags & HANDLE_FLAG_INHERIT) != 0 &&
+          std::ranges::find(inherited, handle) == inherited.end()) {
+        inherited.push_back(handle);
+      }
+    }
+    SIZE_T attributes_size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attributes_size);
+    std::vector<std::byte> attributes_buffer(attributes_size);
+    auto* const attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
+        attributes_buffer.data());
+    if (!InitializeProcThreadAttributeList(attributes, 1, 0,
+                                           &attributes_size)) {
+      return std::unexpected(last_error_code());
+    }
+    const ScopeGuard delete_attributes(
+        [attributes] { DeleteProcThreadAttributeList(attributes); });
+    if (!UpdateProcThreadAttribute(
+            attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited.data(),
+            inherited.size() * sizeof(HANDLE), nullptr, nullptr)) {
+      return std::unexpected(last_error_code());
+    }
+
+    STARTUPINFOEXW startup = {
+        .StartupInfo =
+            {
+                .cb = sizeof(startup),
+                .dwFlags = STARTF_USESTDHANDLES,
+                .hStdInput = standard_input,
+                .hStdOutput = spec.standard_output,
+                .hStdError = standard_error,
+            },
+        .lpAttributeList = attributes,
     };
 
     // Suspended, so the command is enrolled in the job before its code runs.
     // Detours injects into the suspended process and, given CREATE_SUSPENDED,
     // leaves the resume to us. The hook is in place before the command's code
     // runs, and re-injects into anything it starts.
-    const DWORD creation_flags =
-        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
+    const DWORD creation_flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT |
+                                 CREATE_SUSPENDED |
+                                 EXTENDED_STARTUPINFO_PRESENT;
     PROCESS_INFORMATION info{};
-    if (!DetourCreateProcessWithDllExW(nullptr, spec.command_line.data(),
-                                       nullptr, nullptr, TRUE, creation_flags,
-                                       spec.environment.data(),
-                                       spec.working_directory.c_str(), &startup,
-                                       &info, spec.hook.c_str(), nullptr)) {
+    if (!DetourCreateProcessWithDllExW(
+            nullptr, spec.command_line.data(), nullptr, nullptr, TRUE,
+            creation_flags, spec.environment.data(),
+            spec.working_directory.c_str(), &startup.StartupInfo, &info,
+            spec.hook.c_str(), nullptr)) {
       return std::unexpected(last_error_code());
     }
     ScopedHandle process(info.hProcess);
