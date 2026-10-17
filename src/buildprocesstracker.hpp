@@ -99,8 +99,8 @@ struct ProcessHandle {
 /// Whoever adds a process keeps it in the tracker for exactly as long as the
 /// process, or anything it started, might make a request that should be
 /// found, and removes it then: `ProcessUtil::run` removes it once the command
-/// has exited and whatever it started has been ended (on Windows, waited for
-/// too). Removing it no earlier is what keeps a recycled process id from
+/// has exited and whatever it started has been killed and has exited too.
+/// Removing it no earlier is what keeps a recycled process id from
 /// being found to belong to a build that has ended. It calls `remove` from a
 /// `ScopeGuard`, so that no early return can leave a record behind.
 ///

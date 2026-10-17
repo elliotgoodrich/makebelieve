@@ -26,6 +26,15 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <cerrno>
+#include <cstddef>
+#include <cstring>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -339,7 +348,8 @@ TEST_F(ProcessUtil, ACommandInheritsNothingFromAnotherBeingLaunched) {
   // handle it holds was inherited or made by the launch.
   const std::string command = "cmake -E true";
 #else
-  const std::string command = "ls /proc/$$/fd";
+  // Its shell, and the init it runs under in its own pid namespace.
+  const std::string command = "ls /proc/1/fd /proc/$$/fd";
 #endif
   // What the second command inherited.
   const auto run_second = [&] {
@@ -530,6 +540,63 @@ TEST_F(ProcessUtil, ATracingFailureWhileRunningFailsTheRunAndEndsTheCommand) {
   EXPECT_LT(elapsed, 10s);
 
   EXPECT_TRUE(run(print_file_command("input.txt")).has_value());
+}
+
+// --- What the command leaves running ----------------------------------------
+
+// Whatever the command started is ended with it - even a process that left
+// its process group and session, as a daemon does - so it cannot go on to
+// change files after the run.
+TEST_F(ProcessUtil, EndsWhatTheCommandStartedEvenIfItDetached) {
+  const std::filesystem::path marker = marker_path();
+  std::error_code ec;
+  std::filesystem::remove(marker, ec);
+
+  const makebelieve::ProcessUtil::Result result =
+      run("setsid sh -c 'sleep 1; " + touch_command(marker) +
+          "' > /dev/null 2>&1 &");
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->exit_status, 0);
+  std::this_thread::sleep_for(3s);
+  EXPECT_FALSE(std::filesystem::exists(marker));
+  std::filesystem::remove(marker, ec);
+}
+
+// The run completes only once whatever the command started has exited. Here a
+// child it leaves running holds a FIFO open for writing, which is closed only
+// as the child exits: by the time the run completes, no writer is left.
+TEST_F(ProcessUtil, CompletesOnlyOnceWhatTheCommandStartedHasExited) {
+  const std::filesystem::path fifo = marker_path();
+  std::error_code ec;
+  std::filesystem::remove(fifo, ec);
+  ASSERT_EQ(::mkfifo(fifo.c_str(), 0600), 0);
+  // Opened before the command, so that its writers do not block opening it.
+  const int reader = ::open(fifo.c_str(), O_RDONLY | O_NONBLOCK);
+  ASSERT_GE(reader, 0);
+
+  const auto start = std::chrono::steady_clock::now();
+  const makebelieve::ProcessUtil::Result result =
+      run("{ echo started; " + sleep_command(30) + " & } > \"" + fifo.string() +
+          "\"");
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  std::string written;
+  std::array<char, 64> buffer{};
+  ssize_t count = 0;
+  while ((count = ::read(reader, buffer.data(), buffer.size())) > 0) {
+    written.append(buffer.data(), static_cast<std::size_t>(count));
+  }
+  const int read_error = errno;
+  ::close(reader);
+  std::filesystem::remove(fifo, ec);
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(written, "started\n");
+  // End of file, not EAGAIN: the backgrounded child has gone.
+  EXPECT_EQ(count, 0) << std::strerror(read_error);
+  // Ended rather than waited out.
+  EXPECT_LT(elapsed, 10s);
 }
 #endif
 
