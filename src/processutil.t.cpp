@@ -672,6 +672,39 @@ TEST_F(ProcessUtil, ReadsAFileTheCommandMapsShared) {
   EXPECT_EQ(result->standard_output, "hello world");
 }
 
+// The kernel asks for a big directory's entries a page at a time, so listing
+// one must carry on each time from where the last left off.
+TEST_F(ProcessUtil, ListsADirectoryTooBigForOneRequest) {
+  for (int i = 0; i < 1000; ++i) {
+    write_input("file" + std::to_string(i) + ".txt", "");
+  }
+
+  const makebelieve::ProcessUtil::Result result = run("ls | wc -l");
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->exit_status, 0);
+  EXPECT_EQ(result->standard_output, "1000\n");
+}
+
+// An absolute symlink to a directory inside the working directory resolves
+// back through the tracing mount, so what is read through it is traced too.
+TEST_F(ProcessUtil, ReadsThroughAnAbsoluteDirectorySymlinkAndTracesTheTarget) {
+  std::filesystem::create_directory(work / "sub");
+  write_input("sub/c.txt", "hello world");
+  std::error_code ec;
+  std::filesystem::create_directory_symlink(work / "sub", work / "linkdir", ec);
+  ASSERT_FALSE(ec) << ec.message();
+
+  const makebelieve::ProcessUtil::Result result = run("cat linkdir/c.txt");
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->exit_status, 0);
+  EXPECT_EQ(result->standard_output, "hello world");
+  EXPECT_EQ(result->inputs,
+            std::vector<std::filesystem::path>{
+                std::filesystem::canonical(work) / "sub" / "c.txt"});
+}
+
 TEST_F(ProcessUtil, ReportsACommandKilledByASignalAsTheShellWould) {
   const makebelieve::ProcessUtil::Result result = run("kill -KILL $$");
 
