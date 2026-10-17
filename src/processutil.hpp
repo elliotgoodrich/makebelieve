@@ -81,7 +81,7 @@ struct ProcessUtil {
                                 std::string command,
                                 BuildProcessTracker& tracker,
                                 std::filesystem::path output,
-                                stdexec::inplace_stop_token stop = {}) {
+                                stdexec::inplace_stop_token stop) {
     return stdexec::write_env(
         run_task(io, std::move(working_directory), std::move(command), tracker,
                  std::move(output), stop),
