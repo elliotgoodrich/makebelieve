@@ -27,6 +27,10 @@
 #include <windows.h>
 #endif
 
+#ifdef __linux__
+#include <sys/stat.h>
+#endif
+
 namespace {
 
 using namespace std::chrono_literals;
@@ -375,6 +379,62 @@ TEST_F(ProcessUtil, ReportsTheStatusACommandExitedWith) {
 }
 
 #ifdef __linux__
+// The tracer lets the kernel cache what a command reads, so a file rewritten
+// while the command runs - by an earlier build step finishing, say - must read
+// as its new contents when the command next opens it, not as the cached old.
+TEST_F(ProcessUtil, ReadsAFileRewrittenBetweenOpensAsItsNewContents) {
+  write_input("input.txt", "before");
+
+  // FIFOs outside the working directory, which the command sees untraced:
+  // through "opened" it says it has read the file once, and through "rewritten"
+  // it waits until the file has changed.
+  const std::filesystem::path opened = marker_file().string() + "-opened";
+  const std::filesystem::path rewritten = marker_file().string() + "-rewritten";
+  std::error_code ec;
+  std::filesystem::remove(opened, ec);
+  std::filesystem::remove(rewritten, ec);
+  ASSERT_EQ(::mkfifo(opened.c_str(), 0600), 0);
+  ASSERT_EQ(::mkfifo(rewritten.c_str(), 0600), 0);
+
+  std::jthread rewriter([&] {
+    std::string line;
+    std::getline(std::ifstream(opened), line);
+    // The same size, so that only the contents differ.
+    write_input("input.txt", "after!");
+    std::ofstream(rewritten) << "\n";
+  });
+
+  const makebelieve::ProcessUtil::Result result =
+      run(print_file_command("input.txt") + " && echo > \"" + opened.string() +
+          "\" && read line < \"" + rewritten.string() + "\" && " +
+          print_file_command("input.txt"));
+  rewriter.join();
+  std::filesystem::remove(opened, ec);
+  std::filesystem::remove(rewritten, ec);
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->standard_output, "beforeafter!");
+}
+
+// Compilers and linkers read their inputs through shared read-only mmaps, as
+// this command does, so the tracer must allow them.
+TEST_F(ProcessUtil, ReadsAFileTheCommandMapsShared) {
+  write_input("input.txt", "hello world");
+
+  // -I keeps python from listing the working directory for modules.
+  const makebelieve::ProcessUtil::Result result =
+      run("python3 -I -c \"import mmap, sys; f = open('input.txt', 'rb'); "
+          "sys.stdout.buffer.write(mmap.mmap(f.fileno(), 0, mmap.MAP_SHARED, "
+          "mmap.PROT_READ)[:])\"");
+
+  ASSERT_TRUE(result.has_value());
+  if (result->exit_status == 127) {
+    GTEST_SKIP() << "python3 is not installed";
+  }
+  EXPECT_EQ(result->exit_status, 0);
+  EXPECT_EQ(result->standard_output, "hello world");
+}
+
 TEST_F(ProcessUtil, ReportsACommandKilledByASignalAsTheShellWould) {
   const makebelieve::ProcessUtil::Result result = run("kill -KILL $$");
 
