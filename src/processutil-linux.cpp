@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <cerrno>
 #include <csignal>
@@ -36,6 +37,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <linux/sched.h>
 #include <sched.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
@@ -166,6 +168,20 @@ bool write_whole_file(const char* path, std::string_view data) {
                   static_cast<ssize_t>(data.size());
   ::close(fd);
   return ok;
+}
+
+// Forks, as fork() does, but through clone3(2) with @a flags: returns the
+// child's pid in the parent, 0 in the child, or -1 with errno set. With
+// CLONE_PIDFD, @a pidfd receives a pidfd for the child. Unlike fork() it runs
+// no atfork handlers - so a child of a multithreaded parent may call nothing
+// that takes a lock, fork() included - and so it is safe to call again in such
+// a child.
+// NOLINTNEXTLINE(readability-non-const-parameter): clone3 writes to pidfd.
+pid_t clone_process(std::uint64_t flags, int* pidfd = nullptr) {
+  const clone_args args{.flags = flags,
+                        .pidfd = std::bit_cast<std::uintptr_t>(pidfd),
+                        .exit_signal = SIGCHLD};
+  return static_cast<pid_t>(::syscall(SYS_clone3, &args, sizeof(args)));
 }
 
 // One O_PATH-fd-backed inode in the tracer's passthrough view, keyed by a
@@ -366,8 +382,9 @@ constexpr fuse_custom_io k_io = {
     .splice_send = nullptr,
 };
 
-// Points stdout at the pipe and puts the command in its own process group, so a
-// stop can signal the whole tree it spawns. Returns false on failure.
+// Points stdout at the pipe and puts the command in its own process group, out
+// of reach of signals sent to ours - an interrupt at the terminal, say - which
+// makebelieve handles by stopping the run instead. Returns false on failure.
 bool prepare_child_io(int stdout_fd) {
   if (::dup2(stdout_fd, STDOUT_FILENO) < 0) {
     return false;
@@ -377,10 +394,65 @@ bool prepare_child_io(int stdout_fd) {
   return true;
 }
 
-// The traced child: either execve()s the command inside its private FUSE mount
-// or _exit()s - it never returns. Mounting directly on @a cwd keeps parent
-// directories untracked, since ".." resolves out of the mount; only paths under
-// @a cwd reach the tracer. Nothing between fork and exec allocates, so uid_map
+// The status a shell would report for a process that ended with wait status
+// @a status: its exit status, or 128 plus the signal that ended it.
+int shell_status(int status) noexcept {
+  if (WIFEXITED(status)) {
+    return WEXITSTATUS(status);
+  }
+  if (WIFSIGNALED(status)) {
+    return 128 + WTERMSIG(status);
+  }
+  return 0;
+}
+
+// Runs @a command in a child of this process, in @a cwd, and waits for it,
+// reaping anything else that is reparented here meanwhile. Exits with the
+// status the command ended with, as a shell reports it. Never returns.
+//
+// This process is the init of the command's pid namespace, so when it exits,
+// the kernel kills everything left in the namespace - all that the command
+// started, however it detached - and only lets this process be reaped once
+// all of that has gone. The command runs as a child, rather than in this
+// process, because the kernel shields an init from signals it has no handler
+// for: as init, a shell could not even `kill $$`.
+[[noreturn]] void run_as_init(const std::filesystem::path& cwd,
+                              const std::string& command) {
+  // This process never execs, so it would otherwise go on holding every
+  // descriptor it was cloned with, close-on-exec or not - the parent's, and
+  // so those of other commands running at the time - for as long as the
+  // command ran. It keeps only the command's standard streams, for the shell
+  // to inherit.
+  ::close_range(STDERR_FILENO + 1, ~0U, 0);
+  const pid_t shell = clone_process(0);
+  if (shell < 0) {
+    _exit(125);
+  }
+  if (shell == 0) {
+    if (::chdir(cwd.c_str()) != 0) {
+      _exit(127);
+    }
+    ::execl("/bin/sh", "sh", "-c", command.c_str(), nullptr);
+    _exit(127);  // Only reached if exec failed.
+  }
+  while (true) {
+    int status = 0;
+    const pid_t reaped = ::waitpid(-1, &status, 0);
+    if (reaped == shell) {
+      _exit(shell_status(status));
+    }
+    if (reaped < 0 && errno != EINTR) {
+      _exit(125);
+    }
+  }
+}
+
+// The traced child, created by clone_process() in a fresh user, mount and pid
+// namespace, of which it is the init: it sets up a private FUSE mount on @a cwd
+// and then runs the command under it as run_as_init() does - or _exit()s. It
+// never returns. Mounting directly on @a cwd keeps parent directories
+// untracked, since ".." resolves out of the mount; only paths under @a cwd
+// reach the tracer. Nothing in the child allocates or takes a lock, so uid_map
 // and gid_map arrive pre-formatted.
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
 [[noreturn]] void run_traced_child(const std::filesystem::path& cwd,
@@ -405,19 +477,22 @@ bool prepare_child_io(int stdout_fd) {
     fail(errno);
   }
 
-  // A fresh user + mount namespace, so the mount below is invisible elsewhere
-  // and can be made without real privilege.
-  if (::unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0 ||
-      !write_whole_file("/proc/self/setgroups", "deny") ||
+  // The namespaces let the mounts below be made without real privilege, and
+  // keep them invisible elsewhere.
+  if (!write_whole_file("/proc/self/setgroups", "deny") ||
       !write_whole_file("/proc/self/uid_map", uid_map) ||
       !write_whole_file("/proc/self/gid_map", gid_map) ||
       // Detach mount propagation so nothing here leaks to or from the host.
-      ::mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
+      ::mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0 ||
+      // A /proc of the command's own pid namespace, so that the ids its
+      // processes see for themselves and each other are found there.
+      ::mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              nullptr) != 0) {
     fail(errno);
   }
 
-  // Opened fresh, post-unshare - a pre-fork-opened /dev/fuse fd inherited from
-  // the parent fails the mount(2) below with EINVAL.
+  // Opened fresh, in the new namespaces - a pre-fork-opened /dev/fuse fd
+  // inherited from the parent fails the mount(2) below with EINVAL.
   const int fuse_fd = ::open("/dev/fuse", O_RDWR);
   if (fuse_fd < 0) {
     fail(errno);
@@ -443,33 +518,28 @@ bool prepare_child_io(int stdout_fd) {
   }
   ::close(handoff_sock);
 
-  if (::chdir(cwd.c_str()) != 0) {
-    _exit(127);
-  }
-  ::execl("/bin/sh", "sh", "-c", command.c_str(), nullptr);
-  _exit(127);  // Only reached if exec failed.
+  run_as_init(cwd, command);
 }
 
-// A running command, leading its own process group. terminate() kills that
-// group and waits for the command itself to exit, through the IoContext,
-// before reaping it. Destroying one that has not been reaped does the same,
-// blocking, as a last resort. Whatever else is in the group is only asked to
-// exit: those processes are not our children, so their exit is neither
-// waited for nor reaped, and anything that has left the group is not killed.
+// A running command: the init of its own pid namespace, which runs the
+// command's shell and exits with its status (see run_as_init()). It exits -
+// and its pidfd becomes readable - only once everything else in the namespace
+// has gone, and killing it kills all of that. So terminate(), which kills it
+// and waits for it to exit, through the IoContext, before reaping it, ends
+// everything the command started and waits for all of it. Destroying one that
+// has not been reaped does the same, blocking, as a last resort.
 class ChildProcess {
   pid_t m_pid;
 
-  // Readable once the command has exited; invalid if the kernel could not
-  // open it.
+  // Readable once the command, and everything it started, has exited.
   UniqueFd m_exited;
 
   bool m_reaped = false;
   int m_status = 0;
 
  public:
-  explicit ChildProcess(pid_t pid)
-      : m_pid(pid),
-        m_exited(static_cast<int>(::syscall(SYS_pidfd_open, pid, 0))) {}
+  ChildProcess(pid_t pid, UniqueFd pidfd)
+      : m_pid(pid), m_exited(std::move(pidfd)) {}
 
   ~ChildProcess() {
     if (!m_reaped) {
@@ -483,25 +553,17 @@ class ChildProcess {
   ChildProcess(ChildProcess&&) = delete;
   ChildProcess& operator=(ChildProcess&&) = delete;
 
-  // Readable once the command has exited; -1 if the kernel could not say.
+  // Readable once the command, and everything it started, has exited.
   [[nodiscard]] int exited() const noexcept { return m_exited.get(); }
 
-  // Kills the command and whatever is in its process group. Touches nothing
-  // but the numbers it was started with, so it is safe from any thread -
-  // until the command is reaped, after which its id may be reused.
+  // Kills the command and everything it started. Touches nothing but the
+  // numbers it was started with, so it is safe from any thread - until the
+  // command is reaped, after which its id may be reused.
   // @pre The command has not been reaped.
-  void signal() const noexcept {
-    ::kill(-m_pid, SIGKILL);
-    ::kill(m_pid, SIGKILL);
-  }
-
-  // Once the command has been reaped: kills whatever it left in its process
-  // group - requested, not confirmed, since those processes are not our
-  // children.
-  void kill_leftovers() const noexcept { ::kill(-m_pid, SIGKILL); }
+  void signal() const noexcept { ::kill(m_pid, SIGKILL); }
 
   // Waits for the command, which has exited or been killed, recording how it
-  // ended.
+  // ended. Blocks until everything it started has gone, too.
   void reap() noexcept {
     while (::waitpid(m_pid, &m_status, 0) < 0 && errno == EINTR) {
     }
@@ -511,28 +573,20 @@ class ChildProcess {
   // How the command ended, as a shell reports it: its exit status, or 128
   // plus the signal that ended it. @pre It has been reaped.
   [[nodiscard]] int exit_status() const noexcept {
-    if (WIFEXITED(m_status)) {
-      return WEXITSTATUS(m_status);
-    }
-    if (WIFSIGNALED(m_status)) {
-      return 128 + WTERMSIG(m_status);
-    }
-    return 0;
+    return shell_status(m_status);
   }
 
-  // Kills the command and what is in its group, then waits for it to exit
-  // through @a io and reaps it - which then no longer blocks.
+  // Kills the command and everything it started, then waits for all of it to
+  // exit through @a io and reaps the command - which then no longer blocks.
   exec::task<void> terminate(IoContext& io) {
     if (m_reaped) {
       co_return;
     }
     signal();
-    if (m_exited) {
-      co_await (stdexec::write_env(io.async_wait(m_exited.get()),
-                                   stdexec::prop{stdexec::get_stop_token,
-                                                 stdexec::never_stop_token{}}) |
-                stdexec::upon_error([](std::error_code) noexcept {}));
-    }
+    co_await (stdexec::write_env(io.async_wait(m_exited.get()),
+                                 stdexec::prop{stdexec::get_stop_token,
+                                               stdexec::never_stop_token{}}) |
+              stdexec::upon_error([](std::error_code) noexcept {}));
     reap();
   }
 };
@@ -569,10 +623,6 @@ exec::task<Supervision> supervise(IoContext& io,
                                   UniqueFd read_fd,
                                   KillOn kill_on) {
   Supervision result;
-  if (child.exited() < 0) {
-    result.error = last_error_code();
-    co_return result;  // Killed and reaped by its owner.
-  }
 
   // Non-blocking, so draining stops at what is there now.
   ::fcntl(read_fd.get(), F_SETFL, ::fcntl(read_fd.get(), F_GETFL) | O_NONBLOCK);
@@ -593,7 +643,8 @@ exec::task<Supervision> supervise(IoContext& io,
 
   // Collect output until the direct child exits. Waiting on the child rather
   // than on the pipe closing is what keeps a grandchild that inherited the
-  // pipe from wedging us, and reading as it arrives keeps a full pipe from
+  // pipe from wedging us - the child exits once its shell has, and all else
+  // is then killed - and reading as it arrives keeps a full pipe from
   // blocking the command.
   std::error_code wait_error;
   bool open = true;
@@ -835,9 +886,8 @@ exec::task<Supervision> supervise_then_end(
   } catch (...) {
     supervision.error = std::make_error_code(std::errc::not_enough_memory);
   }
-  // Reaped by now: whatever it left behind is asked to go, so the mount tears
-  // down even if a descendant outlived the shell.
-  child.kill_leftovers();
+  // Reaped by now, and with it everything it started, so nothing is left to
+  // make a request.
   session.end();
   stop_serving.request_stop();
   co_return supervision;
@@ -870,8 +920,8 @@ exec::task<void> serve_or_abort(IoContext& io,
 // 1. prepare(), before the launch: a socket pair for the child to hand the
 //    device back over, and its uid and gid maps, formatted now because the
 //    child may not allocate.
-// 2. run_child(), in the child: enters a fresh namespace, mounts the device
-//    over the root, hands it back and waits.
+// 2. run_child(), in the child, which starts in fresh namespaces: mounts the
+//    device over the root, hands it back and waits.
 // 3. attach(), in the parent: serves the device it was handed, or reports why
 //    the child could not set up; the command is then added to the build
 //    process tracker, and only once that succeeds does release() tell the
@@ -966,8 +1016,8 @@ exec::task<ProcessUtil::Result> run_traced(IoContext& io,
           .value();
 
   // The command's record in the tracker, once added. Removed only once the
-  // command has been reaped and what it left in its group killed - declared
-  // before the child so it is removed only after that.
+  // command, and everything it started, has been reaped - declared before the
+  // child so it is removed only after that.
   std::optional<BuildProcessTracker::Token> added_as;
   const ScopeGuard remove_from_tracker([&tracker, &added_as] {
     if (added_as.has_value()) {
@@ -975,7 +1025,9 @@ exec::task<ProcessUtil::Result> run_traced(IoContext& io,
     }
   });
 
-  const pid_t pid = ::fork();
+  int pidfd = -1;
+  const pid_t pid = clone_process(
+      CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_PIDFD, &pidfd);
   if (pid < 0) {
     co_return std::unexpected(last_error_code());
   }
@@ -983,7 +1035,7 @@ exec::task<ProcessUtil::Result> run_traced(IoContext& io,
     out_read.reset();
     setup->run_child(root, command, out_write.get(), forced_setup_error);
   }
-  ChildProcess child(pid);
+  ChildProcess child(pid, UniqueFd(pidfd));
   setup->launched();
   out_write.reset();  // Only the child writes stdout.
 

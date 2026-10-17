@@ -53,21 +53,17 @@ struct ProcessUtil {
   /// the command ran. A command that cannot be traced never runs, or is
   /// terminated.
   ///
-  /// Whatever the command started and left running is asked to exit before
-  /// the sender completes, but only on Windows does it wait until all of it
-  /// has: there, everything the command started shares a job, whose processes
-  /// can each be waited on. On Linux it kills what is still in the command's
-  /// process group and does not wait - those processes are not its children,
-  /// so it cannot reap them, and anything that left the group is not even
-  /// killed. Waiting for every descendant there would take making this
-  /// process a child subreaper, which has not been done.
+  /// Once the command has exited, whatever it started and left running is
+  /// killed, and the sender completes only once all of it has exited too -
+  /// however it detached, so nothing the command started can go on to change
+  /// files after the run.
   ///
   /// The command's process is created paused, added to @a tracker as the
   /// build of @a output, and only let run once added - so nothing it does can
   /// come before it is in the tracker. It is removed from the tracker only
-  /// once the command has exited and whatever it started has been ended (see
-  /// above). Failing to add it leaves the command never having run, and
-  /// the sender completes with that error.
+  /// once the command, and whatever it started, has exited (see above). Failing
+  /// to add it leaves the command never having run, and the sender completes
+  /// with that error.
   ///
   /// The sender does its brief synchronous work - starting the command,
   /// reading back what it traced - on whatever thread it is started on, and

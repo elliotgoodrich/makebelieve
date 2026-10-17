@@ -25,10 +25,11 @@
 // before exec as our unreaped child. A requester - a thread, as FUSE reports
 // it - is mapped to its process and followed up its parents to a command in
 // the tracker, matched on pid and start time both, so a recycled pid is never
-// found to belong to a build that has ended. A process that has been
-// re-parented away from its command (to init, say) is missed, and its request
-// is taken to come from no build. makebelieve is not made a child subreaper; a
-// cgroup per command could close that gap later.
+// found to belong to a build that has ended. The process ProcessUtil adds is
+// the init of the command's own pid namespace, so a process orphaned within
+// it - a daemon, say - is re-parented to that init, and so is still found.
+// Ids are the ones this process sees, in its own pid namespace, as are those
+// FUSE reports for requests to a mount made there.
 //
 // /proc is read outside the lock; only comparing against the records holds
 // it.
