@@ -14,6 +14,7 @@
 #include <expected>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <ios>
 #include <optional>
 #include <string>
@@ -300,6 +301,92 @@ TEST_F(ProcessUtil, ACommandThatCannotBeAddedNeverRuns) {
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error(), refusal);
   EXPECT_FALSE(std::filesystem::exists(marker));
+}
+
+// A build process tracker that calls @a on_add with each process added to it,
+// before letting it run. It finds nothing.
+struct CallingBuildProcessTracker final : makebelieve::BuildProcessTracker {
+  std::function<void(const makebelieve::ProcessHandle&)> on_add;
+
+  explicit CallingBuildProcessTracker(
+      std::function<void(const makebelieve::ProcessHandle&)> call)
+      : on_add(std::move(call)) {}
+
+  std::expected<Token, std::error_code> add(
+      const std::filesystem::path& /*output*/,
+      const makebelieve::ProcessHandle& process) override {
+    on_add(process);
+    return Token{1};
+  }
+
+  void remove(Token /*token*/) noexcept override {}
+
+  std::optional<std::filesystem::path> find(
+      std::uint32_t /*requester_pid*/) override {
+    return std::nullopt;
+  }
+};
+
+// A command launched while another is being launched inherits none of the
+// other's descriptors - which would hold its pipe, and on Linux its tracing
+// mount, open for as long as the second command lived. The second command is
+// launched from the tracker while the first is added to it, so with every
+// descriptor the first has; what it inherited must match what it inherits
+// launched alone.
+TEST_F(ProcessUtil, ACommandInheritsNothingFromAnotherBeingLaunched) {
+#ifdef _WIN32
+  // Counted while it is suspended, before any code of its own has run, every
+  // handle it holds was inherited or made by the launch.
+  const std::string command = "cmake -E true";
+#else
+  const std::string command = "ls /proc/$$/fd";
+#endif
+  // What the second command inherited.
+  const auto run_second = [&] {
+    std::string inherited;
+    CallingBuildProcessTracker tracker(
+        [&](const makebelieve::ProcessHandle& process) {
+#ifdef _WIN32
+          const HANDLE handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                            FALSE, process.pid);
+          DWORD count = 0;
+          if (handle != nullptr && GetProcessHandleCount(handle, &count)) {
+            inherited = std::to_string(count);
+          }
+          if (handle != nullptr) {
+            CloseHandle(handle);
+          }
+#else
+          static_cast<void>(process);
+#endif
+        });
+    const makebelieve::ProcessUtil::Result result = std::get<0>(
+        stdexec::sync_wait(makebelieve::ProcessUtil::run(io, work, command,
+                                                         tracker, "second", {}))
+            .value());
+    EXPECT_TRUE(result.has_value()) << result.error().message();
+#ifndef _WIN32
+    if (result.has_value()) {
+      inherited = result->standard_output;
+    }
+#endif
+    return inherited;
+  };
+
+  const std::string alone = run_second();
+  ASSERT_FALSE(alone.empty());
+
+  std::string during_launch;
+  CallingBuildProcessTracker first(
+      [&](const makebelieve::ProcessHandle& /*process*/) {
+        during_launch = run_second();
+      });
+  const makebelieve::ProcessUtil::Result result =
+      std::get<0>(stdexec::sync_wait(makebelieve::ProcessUtil::run(
+                                         io, work, command, first, "first", {}))
+                      .value());
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(during_launch, alone);
 }
 
 // Waiting on a command holds no thread: ten one-second commands started from

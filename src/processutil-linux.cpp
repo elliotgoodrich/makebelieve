@@ -135,7 +135,11 @@ std::expected<UniqueFd, std::error_code> recv_result(int sock) {
              .msg_control = control.data(),
              .msg_controllen = control.size()};
 
-  if (::recvmsg(sock, &msg, 0) != static_cast<ssize_t>(sizeof(payload))) {
+  // Close-on-exec, like every descriptor the parent holds, so that no other
+  // command launched meanwhile inherits it - which would keep this command's
+  // FUSE connection alive for as long as that one lived.
+  if (::recvmsg(sock, &msg, MSG_CMSG_CLOEXEC) !=
+      static_cast<ssize_t>(sizeof(payload))) {
     return std::unexpected(std::make_error_code(std::errc::protocol_error));
   }
   if (!payload.ok) {
@@ -202,7 +206,7 @@ class Tracer {
       return;
     }
     const std::filesystem::path child_path = p->real_path / name;
-    UniqueFd fd(::openat(p->fd.get(), name, O_PATH | O_NOFOLLOW));
+    UniqueFd fd(::openat(p->fd.get(), name, O_PATH | O_NOFOLLOW | O_CLOEXEC));
     if (!fd) {
       fuse_reply_err(req, errno);
       return;
@@ -262,7 +266,7 @@ class Tracer {
     std::array<char, 32> proc_fd_path{};
     std::snprintf(proc_fd_path.data(), proc_fd_path.size(), "/proc/self/fd/%d",
                   n->fd.get());
-    UniqueFd fd(::open(proc_fd_path.data(), O_RDONLY));
+    UniqueFd fd(::open(proc_fd_path.data(), O_RDONLY | O_CLOEXEC));
     if (!fd) {
       fuse_reply_err(req, errno);
       return;
@@ -715,7 +719,7 @@ class TracingSession {
       UniqueFd fuse_fd) {
     // The parent's own passthrough root, resolved in the parent's namespace
     // and so unaffected by the child's private mount.
-    const int root_fd = ::open(root.c_str(), O_PATH | O_DIRECTORY);
+    const int root_fd = ::open(root.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (root_fd < 0) {
       return std::unexpected(last_error_code());
     }
@@ -940,8 +944,11 @@ exec::task<ProcessUtil::Result> run_traced(IoContext& io,
                                            BuildProcessTracker& tracker,
                                            std::filesystem::path output,
                                            stdexec::inplace_stop_token stop) {
+  // Close-on-exec, so that only this command gets the write end - as its
+  // stdout, which dup2() leaves inheritable - and no other launched meanwhile
+  // gets either end.
   std::array<int, 2> out_pipe{-1, -1};
-  if (::pipe(out_pipe.data()) != 0) {
+  if (::pipe2(out_pipe.data(), O_CLOEXEC) != 0) {
     co_return std::unexpected(last_error_code());
   }
   UniqueFd out_read(out_pipe[0]);
