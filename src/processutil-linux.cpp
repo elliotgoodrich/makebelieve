@@ -205,6 +205,10 @@ class Tracer {
   std::map<std::pair<dev_t, ino_t>, fuse_ino_t> m_by_dev_ino;
   fuse_ino_t m_next_ino = FUSE_ROOT_ID + 1;
 
+  // Every read's data, reused rather than allocated per read: a session
+  // serves one request at a time, so reads never overlap.
+  std::vector<char> m_read_buffer;
+
  public:
   Tracer(int root_fd, std::filesystem::path root) {
     Inode& r = m_inodes[FUSE_ROOT_ID];
@@ -293,9 +297,15 @@ class Tracer {
       m_read_files.push_back(n->real_path);
     }
 
-    // The fd now belongs to fi->fh; Tracer::release() closes it.
+    // The fd now belongs to fi->fh; Tracer::release() closes it. Reads go
+    // through the kernel's page cache - no direct_io, which would also refuse
+    // the shared mmaps that compilers and linkers make of their inputs. That
+    // loses no traced reads, since every open still comes here and is recorded
+    // above. Nor can it show stale contents: each command's mount is new, so
+    // its cache starts empty, and without keep_cache the kernel drops a file's
+    // cached pages at every open, so a file rewritten while the command runs
+    // reads as new at its next open.
     fi->fh = static_cast<std::uint64_t>(fd.release());
-    fi->direct_io = 1;
     fuse_reply_open(req, fi);
   }
 
@@ -304,13 +314,16 @@ class Tracer {
             size_t size,
             off_t off,
             fuse_file_info* fi) {
-    std::vector<char> buf(size);
-    const ssize_t n = ::pread(static_cast<int>(fi->fh), buf.data(), size, off);
+    if (m_read_buffer.size() < size) {
+      m_read_buffer.resize(size);
+    }
+    const ssize_t n =
+        ::pread(static_cast<int>(fi->fh), m_read_buffer.data(), size, off);
     if (n < 0) {
       fuse_reply_err(req, errno);
       return;
     }
-    fuse_reply_buf(req, buf.data(), static_cast<std::size_t>(n));
+    fuse_reply_buf(req, m_read_buffer.data(), static_cast<std::size_t>(n));
   }
 
   void release(fuse_req_t req, fuse_ino_t /*ino*/, fuse_file_info* fi) {
@@ -359,7 +372,15 @@ struct Trampoline<MemFn> {
 template <auto MemFn>
 inline constexpr auto trampoline = Trampoline<MemFn>::call;
 
+// Without auto_inval_data, which libfuse asks for by default: with attributes
+// never cached, it would cost a getattr before every read the page cache could
+// otherwise answer. Opens drop a file's cached pages anyway (see Tracer::open).
+void init_tracer(void* /*userdata*/, fuse_conn_info* conn) {
+  conn->want &= ~FUSE_CAP_AUTO_INVAL_DATA;
+}
+
 constexpr fuse_lowlevel_ops k_ops = {
+    .init = init_tracer,
     .lookup = trampoline<&Tracer::lookup>,
     .getattr = trampoline<&Tracer::getattr>,
     .open = trampoline<&Tracer::open>,
