@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -39,6 +40,10 @@
 
 #ifdef __linux__
 #include <sys/stat.h>
+#endif
+
+#ifdef __linux__
+#include <sys/resource.h>
 #endif
 
 namespace {
@@ -537,6 +542,32 @@ TEST_F(ProcessUtil, ReportsACommandKilledByASignalAsTheShellWould) {
 
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->exit_status, 128 + 9);
+}
+
+// The tracer holds no fd per file the command looks up, so a command reading
+// more files than the process may have open at once still reads, and is traced
+// reading, every one.
+TEST_F(ProcessUtil, TracesMoreFilesThanTheProcessMayHaveOpen) {
+  constexpr std::size_t k_files = 600;
+  std::string command = "cat";
+  for (std::size_t i = 0; i < k_files; ++i) {
+    const std::string name = "input" + std::to_string(i) + ".txt";
+    write_input(name, "x");
+    command += " " + name;
+  }
+
+  rlimit original{};
+  ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &original), 0);
+  rlimit lowered = original;
+  lowered.rlim_cur = 256;
+  ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &lowered), 0);
+  const makebelieve::ProcessUtil::Result result = run(command);
+  ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &original), 0);
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->exit_status, 0);
+  EXPECT_EQ(result->standard_output, std::string(k_files, 'x'));
+  EXPECT_EQ(result->inputs.size(), k_files);
 }
 #endif
 

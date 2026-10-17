@@ -31,9 +31,27 @@
 #include <thread>
 #include <utility>
 
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
+
 namespace {
 
 using namespace makebelieve;
+
+// Raises the soft limit on open files to the hard limit: the mount, and each
+// of the many commands it may run at once, all draw on this one process's fds.
+// Best-effort, as the soft limit is only a default that suits smaller programs.
+void raise_open_file_limit() {
+#ifndef _WIN32
+  rlimit limit{};
+  if (::getrlimit(RLIMIT_NOFILE, &limit) == 0 &&
+      limit.rlim_cur < limit.rlim_max) {
+    limit.rlim_cur = limit.rlim_max;
+    ::setrlimit(RLIMIT_NOFILE, &limit);
+  }
+#endif
+}
 
 int usage(const char* program) {
   std::println(stderr,
@@ -178,6 +196,7 @@ int unmount(const char* mountpoint_arg) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  raise_open_file_limit();
   try {
     if (argc < 3) {
       return usage(argv[0]);
