@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-#include <stdexec/execution.hpp>
-
-#include <concepts>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -34,21 +31,21 @@
 //
 // In order:
 //
-// 1. BuildCoordinator starts a build's sender with a BuildProcessOwner - the
-//    BuildProcessTracker and the output being built - in the sender's
-//    environment, under `get_build_process_owner`.
-// 2. ShellRunner reads it from there and passes it to ProcessUtil::run.
+// 1. One BuildProcessTracker is made for the mount, and given both to the
+//    ShellRunner, which adds commands to it, and to the BuildCoordinator,
+//    which looks requesters up in it.
+// 2. ShellRunner passes it, and the output the command builds
+//    (`Command::output`), to ProcessUtil::run.
 // 3. ProcessUtil::run creates the command's process paused, describes it
-//    with a ProcessHandle, and adds it to the tracker through the
-//    BuildProcessOwner.
-//    It lets the process run only once added, and keeps the
-//    ProcessRemoveGuard it got back until the command and everything it
-//    started are gone.
+//    with a ProcessHandle, and adds it to the tracker under that output. It
+//    lets the process run only once added, and has a ScopeGuard remove it
+//    again once the command and everything it started are gone.
 // 4. Meanwhile, a request from any of those processes reaches the build
 //    directory tree with the requester's id, which BuildCoordinator looks up
-//    in the same BuildProcessTracker.
-// 5. Destroying the ProcessRemoveGuard removes the command from the tracker:
-//    the build's processes are no longer found.
+//    in the tracker. The output it finds names the running attempt, because
+//    the tree names each attempt by its rule's output, the same path it hands
+//    the runner as `Command::output`.
+// 5. Once removed, the build's processes are no longer found.
 //
 // This header is the whole contract between those parts, and depends on none
 // of them.
@@ -99,9 +96,13 @@ struct ProcessHandle {
 ///
 /// All three may be called from any thread, at the same time.
 ///
-/// Code that adds a process does not call `remove` itself: it holds a
-/// @link ProcessRemoveGuard, which calls it on destruction, so the record is
-/// removed on every way out.
+/// Whoever adds a process keeps it in the tracker for exactly as long as the
+/// process, or anything it started, might make a request that should be
+/// found, and removes it then: `ProcessUtil::run` removes it once the command
+/// has exited and whatever it started has been ended (on Windows, waited for
+/// too). Removing it no earlier is what keeps a recycled process id from
+/// being found to belong to a build that has ended. It calls `remove` from a
+/// `ScopeGuard`, so that no early return can leave a record behind.
 ///
 /// Implemented by `OsBuildProcessTracker`, the real tracker, which knows how
 /// each platform groups processes; and by fakes in the tests.
@@ -164,132 +165,5 @@ inline BuildProcessTracker& BuildProcessTracker::none() noexcept {
   static Empty empty;
   return empty;
 }
-
-/// @class ProcessRemoveGuard
-/// Removes a process from a @link BuildProcessTracker when destroyed.
-///
-/// `BuildProcessOwner::add` returns one for each process it adds. Whoever
-/// launched the process keeps it for exactly as long as the process, or
-/// anything it started, might make a request that should be found -
-/// `ProcessUtil::run` holds it until the command has exited and whatever it
-/// started has been ended (on Windows, waited for too) - and then destroys
-/// it, after which the build's processes are no longer found. That ordering
-/// is what keeps a recycled process id from being found to belong to a build
-/// that has ended. Holding a guard rather than calling `remove` by hand means
-/// no early return can leave a record behind.
-///
-/// A default-constructed guard removes nothing. Move-only: each record has
-/// one guard. The tracker must outlive it.
-class ProcessRemoveGuard {
-  BuildProcessTracker* m_tracker = nullptr;
-  BuildProcessTracker::Token m_token = 0;
-
- public:
-  /// Removes nothing.
-  ProcessRemoveGuard() = default;
-
-  /// Removes @a token from @a tracker on destruction.
-  ProcessRemoveGuard(BuildProcessTracker& tracker,
-                     BuildProcessTracker::Token token) noexcept
-      : m_tracker(&tracker), m_token(token) {}
-
-  /// Takes @a other's record, leaving it removing nothing.
-  ProcessRemoveGuard(ProcessRemoveGuard&& other) noexcept
-      : m_tracker(std::exchange(other.m_tracker, nullptr)),
-        m_token(other.m_token) {}
-
-  /// Takes @a other's record and removes this object's previous one.
-  ProcessRemoveGuard& operator=(ProcessRemoveGuard other) noexcept {
-    std::swap(m_tracker, other.m_tracker);
-    std::swap(m_token, other.m_token);
-    return *this;
-  }
-
-  ProcessRemoveGuard(const ProcessRemoveGuard&) = delete;
-
-  /// Removes the record, if any.
-  ~ProcessRemoveGuard() {
-    if (m_tracker != nullptr) {
-      m_tracker->remove(m_token);
-    }
-  }
-};
-
-/// @class BuildProcessOwner
-/// The build that owns the processes a launch starts: the
-/// @link BuildProcessTracker to add them to, and the output to add them under.
-///
-/// The BuildCoordinator makes one for each build it starts and hands it to
-/// the build through `get_build_process_owner`. `ShellRunner` passes it to
-/// `ProcessUtil::run`, which calls `add` with the command's process after
-/// creating it paused and before letting it run, so that nothing the command
-/// does can come before it is in the tracker. A launcher has no need to
-/// interpret the output; it only passes it on.
-///
-/// There is no default constructor: a launch that no build owns says so with
-/// `BuildProcessOwner::none()`, so that it is always a deliberate choice.
-///
-/// Copying it copies the output's path. The tracker must outlive every copy.
-class BuildProcessOwner {
-  BuildProcessTracker* m_tracker;
-  std::filesystem::path m_output;
-
- public:
-  /// Adds to @a tracker as the build of @a output.
-  BuildProcessOwner(BuildProcessTracker& tracker, std::filesystem::path output)
-      : m_tracker(&tracker), m_output(std::move(output)) {}
-
-  /// Owned by no build: adds nothing.
-  [[nodiscard]] static BuildProcessOwner none() {
-    return {BuildProcessTracker::none(), {}};
-  }
-
-  /// The output of the build that owns the processes.
-  [[nodiscard]] const std::filesystem::path& output() const noexcept {
-    return m_output;
-  }
-
-  /// Records that @a process, and what it starts, belong to this build, until
-  /// the guard returned is destroyed - or says why it could not, in which
-  /// case the process must never be let run.
-  /// @pre @a process has not yet run any of its own code.
-  [[nodiscard]] std::expected<ProcessRemoveGuard, std::error_code> add(
-      const ProcessHandle& process) const {
-    return m_tracker->add(m_output, process)
-        .transform([this](BuildProcessTracker::Token token) {
-          return ProcessRemoveGuard(*m_tracker, token);
-        });
-  }
-};
-
-/// @class get_build_process_owner_t
-/// The query for the @link BuildProcessOwner a build sender must add every
-/// process it launches under.
-///
-/// The tracker belongs to the BuildCoordinator, which only meets a build's
-/// sender when it starts it, after the @link CommandRunner made it, so it
-/// supplies the owner through the sender's environment rather than as an
-/// argument. The query has no default: a receiver whose environment does not
-/// answer it cannot run a build sender, so no wrapper along the way can drop
-/// it and have processes silently go missing from the tracker. It is forwarded
-/// through sender adaptors.
-struct get_build_process_owner_t {
-  /// Obtains the required owner from @a env; there is no fallback.
-  template <class Env>
-    requires requires(const Env& env, const get_build_process_owner_t& query) {
-      { env.query(query) } noexcept -> std::convertible_to<BuildProcessOwner>;
-    }
-  [[nodiscard]] BuildProcessOwner operator()(const Env& env) const noexcept {
-    return env.query(*this);
-  }
-
-  /// Marks this query for forwarding through sender environment adaptors.
-  [[nodiscard]] static consteval bool query(stdexec::forwarding_query_t) {
-    return true;
-  }
-};
-
-/// Queries the owner of the processes a process-launching sender starts.
-inline constexpr get_build_process_owner_t get_build_process_owner{};
 
 }  // namespace makebelieve

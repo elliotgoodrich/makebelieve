@@ -274,7 +274,8 @@ class BuildDirectoryTreeTest : public ::testing::Test {
 
   // Runs real commands in `work`, as if the outputs were mounted beside it.
   [[nodiscard]] auto shell() {
-    return ShellRunner(work, work.string() + "-mnt", io, pool.get_scheduler());
+    return ShellRunner(work, work.string() + "-mnt", io,
+                       BuildProcessTracker::none(), pool.get_scheduler());
   }
 
   void SetUp() override {

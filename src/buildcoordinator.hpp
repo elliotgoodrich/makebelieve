@@ -104,10 +104,11 @@ class BuildCoordinator {
   std::unique_ptr<Impl> m_impl;
 
  public:
-  /// Coordinates attempts that take their permits from @a permits, and whose
-  /// processes are added to and looked up in @a tracker. Completion
-  /// work uses @a completions, which must defer execution off the calling
-  /// thread (never an inline scheduler).
+  /// Coordinates attempts that take their permits from @a permits, finding
+  /// which attempt a request comes from in @a tracker - the one the runner
+  /// adds each command to, under the output it builds. Completion work uses
+  /// @a completions, which must defer execution off the calling thread (never
+  /// an inline scheduler).
   /// @pre The permit provider, build process tracker and executor outlive this.
   BuildCoordinator(PermitProvider permits,
                    BuildProcessTracker& tracker,
@@ -125,17 +126,17 @@ class BuildCoordinator {
   /// given - the attempt of the same output under way - this one cannot start
   /// until it has ended, which a request waiting on this one waits on too.
   ///
-  /// @a output names the attempt in the build process tracker: the processes
-  /// it launches are added under @a output, and a request found to come from
-  /// @a output's build is taken to come from the attempt at it that is
-  /// running. So at most one
-  /// attempt at each output may run at a time (see `run`).
+  /// @a output names the attempt: a request the build process tracker finds
+  /// to come from @a output's build is taken to come from the attempt at it
+  /// that is running. So it must be the path the runner adds the attempt's
+  /// command under - its `Command::output` - and at most one attempt at each
+  /// output may run at a time (see `run`).
   [[nodiscard]] AttemptPtr create_attempt(std::filesystem::path output,
                                           AttemptPtr predecessor = nullptr);
 
   /// Runs @a work as @a attempt once it has a permit: in an environment that
   /// stops it when @a attempt is stopped (or the receiver's own stop token
-  /// is) and adds the processes it launches to the tracker as @a attempt's.
+  /// is).
   /// Completes with its result - with
   /// `std::errc::resource_deadlock_would_occur` instead, whatever it produced,
   /// if the attempt was on a cycle - once nothing of the attempt remains under
@@ -178,7 +179,7 @@ class BuildCoordinator {
   [[nodiscard]] std::size_t edge_count(const AttemptPtr& from,
                                        const AttemptPtr& to) const;
 
-  /// The output @a attempt builds, which its processes are added under.
+  /// The output @a attempt builds, which names it.
   [[nodiscard]] static const std::filesystem::path& output_of(
       const AttemptPtr& attempt);
 };

@@ -95,59 +95,32 @@ class ShellRunnerTest : public ::testing::Test {
     std::ofstream(work / name, std::ios::binary) << content;
   }
 
-  // Runs @a command through @a run, stoppable through @a stop, adding what it
-  // launches to the tracker under @a owner.
+  // Runs @a command through @a run, stoppable through @a stop.
   template <class Scheduler>
   static Built build(const ShellRunner<Scheduler>& run,
                      Command command,
-                     ex::inplace_stop_token stop = {},
-                     BuildProcessOwner owner = BuildProcessOwner::none()) {
+                     ex::inplace_stop_token stop = {}) {
     return std::get<0>(
-        ex::sync_wait(
-            ex::write_env(run(std::move(command)),
-                          ex::env{ex::prop{ex::get_stop_token, stop},
-                                  ex::prop{get_build_process_owner, owner}}) |
-            ex::then([](BuildResult result) {
-              return Built{.result = std::move(result),
-                           .completed_on = std::this_thread::get_id()};
-            }))
+        ex::sync_wait(ex::write_env(run(std::move(command)),
+                                    ex::prop{ex::get_stop_token, stop}) |
+                      ex::then([](BuildResult result) {
+                        return Built{
+                            .result = std::move(result),
+                            .completed_on = std::this_thread::get_id()};
+                      }))
             .value());
   }
 
+  // As above, through a runner that adds what it launches to @a tracker.
   [[nodiscard]] Built build(
       Command command,
       ex::inplace_stop_token stop = {},
-      BuildProcessOwner owner = BuildProcessOwner::none()) {
-    const ShellRunner run(work, mountpoint, io, context.get_scheduler());
-    return build(run, std::move(command), stop, owner);
+      BuildProcessTracker& tracker = BuildProcessTracker::none()) {
+    const ShellRunner run(work, mountpoint, io, tracker,
+                          context.get_scheduler());
+    return build(run, std::move(command), stop);
   }
 };
-
-// A receiver whose environment has a stop token but no build process owner -
-// as one that some wrapper had dropped it from would.
-struct ReceiverWithoutOwner {
-  using receiver_concept = ex::receiver_t;
-  void set_value(BuildResult) noexcept {}
-  void set_error(std::exception_ptr) noexcept {}
-  void set_stopped() noexcept {}
-  [[nodiscard]] auto get_env() const noexcept {
-    return ex::prop{ex::get_stop_token, ex::inplace_stop_token{}};
-  }
-};
-
-// The same receiver with a build process owner too.
-struct ReceiverWithOwner : ReceiverWithoutOwner {
-  [[nodiscard]] auto get_env() const noexcept {
-    return ex::env{
-        ex::prop{ex::get_stop_token, ex::inplace_stop_token{}},
-        ex::prop{get_build_process_owner, BuildProcessOwner::none()}};
-  }
-};
-
-// A build cannot run anywhere its processes would go missing from the tracker:
-// losing the owner on the way is a compile error, not a silent default.
-static_assert(!ex::sender_to<BuildSender, ReceiverWithoutOwner>);
-static_assert(ex::sender_to<BuildSender, ReceiverWithOwner>);
 
 // A file outside the working directory, which on Linux a command sees only
 // through the read-only tracing mount, for a command to create to show it ran.
@@ -158,9 +131,9 @@ std::filesystem::path marker_file() {
               ::testing::UnitTest::GetInstance()->current_test_info()->name()));
 }
 
-// The build process owner named in the receiver's environment reaches the
-// command through the type-erased BuildSender and the hop onto the runner's
-// scheduler, and adds the command to the tracker before it does anything.
+// The runner adds each command to its tracker, before the command does
+// anything, under the output the command builds - the path the build
+// directory tree names that build by - however deep it is.
 TEST_F(ShellRunnerTest, AddsEachCommandBeforeItRuns) {
   const std::filesystem::path marker = marker_file();
   std::filesystem::remove(marker);
@@ -192,12 +165,12 @@ TEST_F(ShellRunnerTest, AddsEachCommandBeforeItRuns) {
       return std::nullopt;
     }
   } recording(marker);
-  const std::filesystem::path k_output = "output.txt";
+  const std::filesystem::path k_output = "out/sub/report.txt";
   const Built built =
-      build({.output = "output.txt",
+      build({.output = k_output,
              .action = Manifest::Action::Capture,
              .text = "cmake -E touch \"" + marker.string() + "\""},
-            {}, BuildProcessOwner(recording, k_output));
+            {}, recording);
   ASSERT_TRUE(built.result.has_value()) << built.result.error().message();
   EXPECT_TRUE(std::filesystem::exists(marker));
   std::filesystem::remove(marker);
@@ -235,7 +208,7 @@ TEST_F(ShellRunnerTest, ACommandThatCannotBeAddedNeverRunsAndFails) {
       build({.output = "output.txt",
              .action = Manifest::Action::Capture,
              .text = "cmake -E touch \"" + marker.string() + "\""},
-            {}, BuildProcessOwner(refusing, "output.txt"));
+            {}, refusing);
   ASSERT_FALSE(built.result.has_value());
   EXPECT_EQ(built.result.error(), refusal);
   EXPECT_FALSE(std::filesystem::exists(marker));
@@ -404,7 +377,8 @@ TEST_F(ShellRunnerTest, RunsAndCompletesEachBuildOnItsScheduler) {
 TEST_F(ShellRunnerTest, RunsOnAThreadPool) {
   write_input("input.txt", "pooled");
   exec::static_thread_pool pool(1);
-  const ShellRunner run(work, mountpoint, io, pool.get_scheduler());
+  const ShellRunner run(work, mountpoint, io, BuildProcessTracker::none(),
+                        pool.get_scheduler());
   const Built built = build(run, {.output = "output.txt",
                                   .action = Manifest::Action::Capture,
                                   .text = "cmake -E cat input.txt"});

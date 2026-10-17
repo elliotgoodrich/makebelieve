@@ -605,8 +605,11 @@ class ChildProcess {
     const std::string& hook;     // the DLL to inject, as Detours wants it
     const std::filesystem::path& working_directory;
     HANDLE standard_output;
-    BuildProcessOwner owner;  // adds the command to the tracker before it runs
-    ProcessRemoveGuard& remove_guard;  // takes it out of the tracker again
+    BuildProcessTracker& tracker;         // added to before the command runs
+    const std::filesystem::path& output;  // what to add the command under
+    // Set to the command's record in the tracker as soon as it is added, for
+    // the caller to remove.
+    std::optional<BuildProcessTracker::Token>& added_as;
   };
 
   // Starts the command @a spec describes, with the hook it names injected,
@@ -660,15 +663,17 @@ class ChildProcess {
     }
     // In the job, so the record covers everything the command will
     // start, and still suspended, so the command has done nothing yet.
-    std::expected<ProcessRemoveGuard, std::error_code> added = spec.owner.add(
-        ProcessHandle{.pid = info.dwProcessId, .job = job->get()});
+    const std::expected<BuildProcessTracker::Token, std::error_code> added =
+        spec.tracker.add(spec.output, ProcessHandle{.pid = info.dwProcessId,
+                                                    .job = job->get()});
     if (!added.has_value()) {
       return abandon(added.error());
     }
+    // At once, so the caller removes it whatever happens from here on.
+    spec.added_as = *added;
     if (ResumeThread(thread.get()) == static_cast<DWORD>(-1)) {
       return abandon(last_error_code());
     }
-    spec.remove_guard = std::move(*added);
     return std::unique_ptr<ChildProcess>(new ChildProcess(
         std::move(*job), std::move(process), std::move(thread)));
   }
@@ -767,7 +772,8 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     IoContext& io,
     std::filesystem::path working_directory,
     std::string command,
-    BuildProcessOwner owner,
+    BuildProcessTracker& tracker,
+    std::filesystem::path output,
     stdexec::inplace_stop_token stop) {
   if (stop.stop_requested()) {
     co_return std::unexpected(
@@ -798,9 +804,15 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
   // CreateProcessW takes a mutable command line.
   std::wstring command_line = L"cmd.exe /c " + *wcommand;
 
-  // Held until the command, and everything it started, has gone - declared
-  // before the child so it is undone only after that.
-  ProcessRemoveGuard remove_guard;
+  // The command's record in the tracker, once added. Removed only once the
+  // command, and everything it started, has gone - declared before the child
+  // so it is removed only after that.
+  std::optional<BuildProcessTracker::Token> added_as;
+  const ScopeGuard remove_from_tracker([&tracker, &added_as] {
+    if (added_as.has_value()) {
+      tracker.remove(*added_as);
+    }
+  });
 
   std::expected<std::unique_ptr<ChildProcess>, std::error_code> child =
       ChildProcess::launch({.command_line = command_line,
@@ -808,8 +820,9 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
                             .hook = (*tracing)->hook(),
                             .working_directory = working_directory,
                             .standard_output = write_end.get(),
-                            .owner = owner,
-                            .remove_guard = remove_guard});
+                            .tracker = tracker,
+                            .output = output,
+                            .added_as = added_as});
   // Close our copy of the command's end, so only it can write to the pipe and
   // the pipe closes once it has gone.
   write_end.reset(nullptr);

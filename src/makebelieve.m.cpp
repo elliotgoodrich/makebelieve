@@ -103,20 +103,23 @@ int mount(const char* mountpoint_arg, unsigned jobs) {
 
   const RealDirectoryTree tree(source, io);
 
+  // Tracks which build each process the runner launches belongs to: the
+  // runner adds its commands, and the coordinator looks up who an open comes
+  // from. Outlives both, and the tree and the mount, which use them until
+  // they are torn down.
+  OsBuildProcessTracker tracker;
+
   // Runs each build through the shell. Its working directory is the source
   // root, so the inputs it traces line up with the source's own change
   // notifications.
-  const ShellRunner run(source, mountpoint, io, workers.get_scheduler());
+  const ShellRunner run(source, mountpoint, io, tracker,
+                        workers.get_scheduler());
 
   // How many builds hold a permit at once: -j, or one per core. A build whose
   // command waits on another output gives its permit back meanwhile, so this
   // limits permit-holding builds, not runnable processes or CPU use.
   BuildQueue builds(jobs != 0 ? jobs : cores, workers.get_scheduler());
 
-  // Tells the processes each build launches apart from everyone else's, so
-  // the coordinator can see which build an open comes from. Both outlive the
-  // tree and the mount, which use them until they are torn down.
-  OsBuildProcessTracker tracker;
   BuildCoordinator coordinator(permits_from(builds), tracker,
                                workers.get_scheduler());
 
