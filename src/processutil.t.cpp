@@ -267,7 +267,7 @@ TEST_F(ProcessUtil, AddsTheCommandBeforeItRunsAndRemovesItAfter) {
       stdexec::sync_wait(makebelieve::ProcessUtil::run(
                              io, work,
                              "cmake -E touch \"" + marker.string() + "\"",
-                             recording, k_output))
+                             recording, k_output, {}))
           .value());
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(result->exit_status, 0);
@@ -295,7 +295,7 @@ TEST_F(ProcessUtil, ACommandThatCannotBeAddedNeverRuns) {
       stdexec::sync_wait(makebelieve::ProcessUtil::run(
                              io, work,
                              "cmake -E touch \"" + marker.string() + "\"",
-                             refusing, "out/built.txt"))
+                             refusing, "out/built.txt", {}))
           .value());
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error(), refusal);
@@ -307,16 +307,16 @@ TEST_F(ProcessUtil, ACommandThatCannotBeAddedNeverRuns) {
 TEST_F(ProcessUtil, RunsCommandsAtOnceWithoutAThreadEach) {
   const auto start = std::chrono::steady_clock::now();
   const auto results = stdexec::sync_wait(stdexec::when_all(
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}),
-      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {})));
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}, {}),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}, {}),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}, {}),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}, {}),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}, {}),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}, {}),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}, {}),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}, {}),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}, {}),
+      makebelieve::ProcessUtil::run(io, work, sleep_command(1), none, {}, {})));
   const auto elapsed = std::chrono::steady_clock::now() - start;
 
   ASSERT_TRUE(results.has_value());
