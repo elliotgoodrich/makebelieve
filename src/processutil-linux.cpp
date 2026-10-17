@@ -6,6 +6,7 @@
 #include "scopeguard.hpp"
 
 #include <fuse_lowlevel.h>
+#include <linux/openat2.h>
 #include <exec/task.hpp>
 #include <exec/when_any.hpp>
 #include <stdexec/execution.hpp>
@@ -184,12 +185,30 @@ pid_t clone_process(std::uint64_t flags, int* pidfd = nullptr) {
   return static_cast<pid_t>(::syscall(SYS_clone3, &args, sizeof(args)));
 }
 
-// One O_PATH-fd-backed inode in the tracer's passthrough view, keyed by a
-// synthetic fuse_ino_t (root is always FUSE_ROOT_ID). Owns its fd via UniqueFd,
-// so destroying m_inodes closes every fd for free.
+// Opens @a relative under @a root_fd with @a flags, following no symlink and
+// never leaving @a root_fd - not even through a directory swapped for a
+// symlink since it was looked up.
+UniqueFd open_beneath(int root_fd,
+                      const std::filesystem::path& relative,
+                      int flags) {
+  const open_how how{
+      .flags = static_cast<std::uint64_t>(flags | O_NOFOLLOW | O_CLOEXEC),
+      .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+  };
+  return UniqueFd(static_cast<int>(
+      ::syscall(SYS_openat2, root_fd, relative.c_str(), &how, sizeof(how))));
+}
+
+// One inode in the tracer's passthrough view, keyed by a synthetic fuse_ino_t
+// (root is always FUSE_ROOT_ID). Holds no fd: one per inode for the whole run
+// would exhaust RLIMIT_NOFILE under a command that touches many files, so each
+// request reopens it by its path instead, checking that it is still the same
+// file.
 struct Inode {
-  UniqueFd fd;
+  std::filesystem::path relative;  // to the root; "." for the root itself
   std::filesystem::path real_path;
+  dev_t dev;
+  ino_t ino;
 };
 
 // Services one command's FUSE mount: a read-only passthrough view over the
@@ -201,6 +220,7 @@ class Tracer {
 
   // Set when a request could not be handled, which may have lost a read.
   std::atomic<bool> m_failed = false;
+  UniqueFd m_root;
   std::unordered_map<fuse_ino_t, Inode> m_inodes;
   std::map<std::pair<dev_t, ino_t>, fuse_ino_t> m_by_dev_ino;
   fuse_ino_t m_next_ino = FUSE_ROOT_ID + 1;
@@ -210,10 +230,11 @@ class Tracer {
   std::vector<char> m_read_buffer;
 
  public:
-  Tracer(int root_fd, std::filesystem::path root) {
-    Inode& r = m_inodes[FUSE_ROOT_ID];
-    r.fd = UniqueFd(root_fd);
-    r.real_path = std::move(root);
+  // @pre @a root_fd is open on @a root.
+  Tracer(int root_fd, const std::filesystem::path& root) : m_root(root_fd) {
+    struct stat st {};
+    ::fstat(root_fd, &st);
+    m_inodes.try_emplace(FUSE_ROOT_ID, ".", root, st.st_dev, st.st_ino);
   }
 
   Tracer(const Tracer&) = delete;
@@ -225,14 +246,16 @@ class Tracer {
       fuse_reply_err(req, EIO);
       return;
     }
-    const std::filesystem::path child_path = p->real_path / name;
-    UniqueFd fd(::openat(p->fd.get(), name, O_PATH | O_NOFOLLOW | O_CLOEXEC));
+    const std::filesystem::path child = parent == FUSE_ROOT_ID
+                                            ? std::filesystem::path(name)
+                                            : p->relative / name;
+    const UniqueFd fd = open_beneath(m_root.get(), child, O_PATH);
     if (!fd) {
       fuse_reply_err(req, errno);
       return;
     }
     struct stat st {};
-    if (::fstatat(fd.get(), "", &st, AT_EMPTY_PATH) != 0) {
+    if (::fstat(fd.get(), &st) != 0) {
       // Read errno before fd's destructor (whose close() may touch it) runs.
       fuse_reply_err(req, errno);
       return;
@@ -243,9 +266,8 @@ class Tracer {
     if (inserted) {
       ++m_next_ino;
       assert(!m_inodes.contains(it->second));
-      m_inodes.try_emplace(it->second, std::move(fd), child_path);
-    } else {
-      fd.reset();
+      m_inodes.try_emplace(it->second, child, p->real_path / name, st.st_dev,
+                           st.st_ino);
     }
 
     const fuse_entry_param e = {
@@ -264,7 +286,7 @@ class Tracer {
       return;
     }
     struct stat st {};
-    if (::fstatat(n->fd.get(), "", &st, AT_EMPTY_PATH) != 0) {
+    if (const UniqueFd fd = reopen(*n, O_PATH, st); !fd) {
       fuse_reply_err(req, errno);
       return;
     }
@@ -281,12 +303,8 @@ class Tracer {
       fuse_reply_err(req, EROFS);
       return;
     }
-    // An O_PATH fd reopens via "." only for directories; /proc/self/fd/N
-    // reopens a regular file too.
-    std::array<char, 32> proc_fd_path{};
-    std::snprintf(proc_fd_path.data(), proc_fd_path.size(), "/proc/self/fd/%d",
-                  n->fd.get());
-    UniqueFd fd(::open(proc_fd_path.data(), O_RDONLY | O_CLOEXEC));
+    struct stat st {};
+    UniqueFd fd = reopen(*n, O_RDONLY, st);
     if (!fd) {
       fuse_reply_err(req, errno);
       return;
@@ -348,6 +366,21 @@ class Tracer {
   Inode* find(fuse_ino_t ino) {
     auto it = m_inodes.find(ino);
     return it == m_inodes.end() ? nullptr : &it->second;
+  }
+
+  // Opens @a n with @a flags, filling in @a st, or sets errno and returns no
+  // fd - ESTALE if its path now names another file, as a rename or a delete
+  // since its lookup can leave it.
+  UniqueFd reopen(const Inode& n, int flags, struct stat& st) {
+    UniqueFd fd = open_beneath(m_root.get(), n.relative, flags);
+    if (!fd || ::fstat(fd.get(), &st) != 0) {
+      return {};
+    }
+    if (st.st_dev != n.dev || st.st_ino != n.ino) {
+      errno = ESTALE;
+      return {};
+    }
+    return fd;
   }
 };
 
@@ -747,8 +780,8 @@ class TracingSession {
   // ProcessUtilTestUtil's tracing_service, due at the first request.
   std::optional<std::error_code> m_forced_error;
 
-  TracingSession(int root_fd, std::filesystem::path root, int descriptor)
-      : m_tracer(root_fd, std::move(root)), m_descriptor(descriptor) {}
+  TracingSession(int root_fd, const std::filesystem::path& root, int descriptor)
+      : m_tracer(root_fd, root), m_descriptor(descriptor) {}
 
   // Whether a session has more requests to come.
   enum class Serving : bool { more, ended };
