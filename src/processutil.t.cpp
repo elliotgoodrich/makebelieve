@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -17,7 +18,9 @@
 #include <fstream>
 #include <functional>
 #include <ios>
+#include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -478,6 +481,96 @@ TEST_F(ProcessUtil, ReportsTheStatusACommandExitedWith) {
   EXPECT_EQ(result->exit_status, 3);
   EXPECT_EQ(result->standard_output, "hello world");
   EXPECT_FALSE(result->inputs.empty());
+}
+
+// Makes our stdin, while it lives, a pipe that never has anything to read nor
+// closes - so anything reading it waits forever, as on a terminal.
+class StdinThatNeverEnds {
+#ifdef _WIN32
+  HANDLE m_saved = GetStdHandle(STD_INPUT_HANDLE);
+  HANDLE m_read = nullptr;
+  HANDLE m_write = nullptr;
+
+ public:
+  StdinThatNeverEnds() {
+    SECURITY_ATTRIBUTES inheritable = {
+        .nLength = sizeof(inheritable),
+        .bInheritHandle = TRUE,
+    };
+    if (CreatePipe(&m_read, &m_write, &inheritable, 0)) {
+      SetStdHandle(STD_INPUT_HANDLE, m_read);
+    }
+  }
+
+  ~StdinThatNeverEnds() {
+    SetStdHandle(STD_INPUT_HANDLE, m_saved);
+    if (m_read != nullptr) {
+      CloseHandle(m_read);
+      CloseHandle(m_write);
+    }
+  }
+
+  [[nodiscard]] bool valid() const { return m_read != nullptr; }
+#else
+  int m_saved = ::dup(STDIN_FILENO);
+  std::array<int, 2> m_pipe{-1, -1};
+
+ public:
+  StdinThatNeverEnds() {
+    if (m_saved >= 0 && ::pipe2(m_pipe.data(), O_CLOEXEC) == 0) {
+      ::dup2(m_pipe[0], STDIN_FILENO);
+    }
+  }
+
+  ~StdinThatNeverEnds() {
+    if (m_saved >= 0) {
+      ::dup2(m_saved, STDIN_FILENO);
+      ::close(m_saved);
+    }
+    for (const int fd : m_pipe) {
+      if (fd >= 0) {
+        ::close(fd);
+      }
+    }
+  }
+
+  [[nodiscard]] bool valid() const { return m_pipe[0] >= 0; }
+#endif
+
+  StdinThatNeverEnds(const StdinThatNeverEnds&) = delete;
+  StdinThatNeverEnds& operator=(const StdinThatNeverEnds&) = delete;
+  StdinThatNeverEnds(StdinThatNeverEnds&&) = delete;
+  StdinThatNeverEnds& operator=(StdinThatNeverEnds&&) = delete;
+};
+
+// A command reads no input, rather than ours: from a terminal, a read would
+// block it on the console or - in its own process group - stop it for good,
+// and the build with it. Given a stdin that never ends, one reading to the end
+// of its input still finishes at once, having read nothing.
+TEST_F(ProcessUtil, ACommandReadsNoInput) {
+  const StdinThatNeverEnds stdin_that_never_ends;
+  ASSERT_TRUE(stdin_that_never_ends.valid());
+
+  // Stopped if it waits, so a failure fails rather than hangs.
+  stdexec::inplace_stop_source source;
+  std::jthread stopper([&source](const std::stop_token& done) {
+    std::mutex mutex;
+    std::unique_lock lock(mutex);
+    std::condition_variable_any().wait_for(lock, done, 10s,
+                                           [] { return false; });
+    source.request_stop();
+  });
+#ifdef _WIN32
+  const std::string command = R"(%SystemRoot%\System32\sort.exe)";
+#else
+  const std::string command = "cat";
+#endif
+  const makebelieve::ProcessUtil::Result result =
+      run(command, source.get_token());
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->exit_status, 0);
+  EXPECT_EQ(result->standard_output, "");
 }
 
 #ifdef __linux__

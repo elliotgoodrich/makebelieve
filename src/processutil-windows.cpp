@@ -626,22 +626,33 @@ class ChildProcess {
       return std::unexpected(job.error());
     }
 
-    const HANDLE standard_input = GetStdHandle(STD_INPUT_HANDLE);
+    // The command reads nothing: given our stdin, one reading it would block
+    // on the console for good.
+    SECURITY_ATTRIBUTES inheritable = {
+        .nLength = sizeof(inheritable),
+        .bInheritHandle = TRUE,
+    };
+    const HANDLE null_device = CreateFileW(
+        L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (null_device == INVALID_HANDLE_VALUE) {
+      return std::unexpected(last_error_code());
+    }
+    const ScopedHandle standard_input(null_device);
     const HANDLE standard_error = GetStdHandle(STD_ERROR_HANDLE);
 
     // The command inherits its standard handles alone, not every inheritable
     // handle this process has - which includes the pipe of any other command
     // being launched meanwhile, and would hold it open for as long as this
     // one lived. Only inheritable handles may be listed, and each once.
-    std::vector<HANDLE> inherited = {spec.standard_output};
-    for (const HANDLE handle : {standard_input, standard_error}) {
-      DWORD flags = 0;
-      if (handle != nullptr && handle != INVALID_HANDLE_VALUE &&
-          GetHandleInformation(handle, &flags) &&
-          (flags & HANDLE_FLAG_INHERIT) != 0 &&
-          std::ranges::find(inherited, handle) == inherited.end()) {
-        inherited.push_back(handle);
-      }
+    std::vector<HANDLE> inherited = {spec.standard_output,
+                                     standard_input.get()};
+    DWORD flags = 0;
+    if (standard_error != nullptr && standard_error != INVALID_HANDLE_VALUE &&
+        GetHandleInformation(standard_error, &flags) &&
+        (flags & HANDLE_FLAG_INHERIT) != 0 &&
+        std::ranges::find(inherited, standard_error) == inherited.end()) {
+      inherited.push_back(standard_error);
     }
     SIZE_T attributes_size = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &attributes_size);
@@ -665,7 +676,7 @@ class ChildProcess {
             {
                 .cb = sizeof(startup),
                 .dwFlags = STARTF_USESTDHANDLES,
-                .hStdInput = standard_input,
+                .hStdInput = standard_input.get(),
                 .hStdOutput = spec.standard_output,
                 .hStdError = standard_error,
             },

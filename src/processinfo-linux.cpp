@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT
 #include "processinfo.hpp"
 
+#include "filesystemutil.hpp"
+
 #include <unistd.h>
 
 #include <cstddef>
 #include <cstdint>
-#include <fstream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -19,7 +21,9 @@ namespace {
 // request and this lookup gives.
 std::optional<std::string> read_proc_status(std::uint32_t id,
                                             std::string_view field) {
-  std::ifstream status("/proc/" + std::to_string(id) + "/status");
+  std::istringstream status(
+      FileSystemUtil::read_file("/proc/" + std::to_string(id) + "/status")
+          .value_or(""));
   std::string line;
   while (std::getline(status, line)) {
     if (!line.starts_with(field)) {

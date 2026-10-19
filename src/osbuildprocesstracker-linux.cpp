@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 #include "osbuildprocesstracker.hpp"
 
+#include "filesystemutil.hpp"
+
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -45,16 +45,35 @@ struct Stat {
   std::uint64_t start_time;
 };
 
-// Reads /proc/<pid>/stat, or nothing if the process has gone.
-std::optional<Stat> stat_of(std::uint32_t pid) {
-  std::ifstream file("/proc/" + std::to_string(pid) + "/stat");
-  const std::string line((std::istreambuf_iterator<char>(file)),
-                         std::istreambuf_iterator<char>());
+// Reads /proc/@a path for a process or thread, failing with
+// `std::errc::no_such_process` if it has gone - which is all a missing file
+// there means - or with why it could not be read.
+std::expected<std::string, std::error_code> read_proc(const std::string& path) {
+  std::expected<std::string, std::error_code> contents =
+      FileSystemUtil::read_file("/proc/" + path);
+  if (!contents.has_value() &&
+      contents.error() == std::errc::no_such_file_or_directory) {
+    return std::unexpected(std::make_error_code(std::errc::no_such_process));
+  }
+  return contents;
+}
+
+// Reads /proc/<pid>/stat, or says why it could not, as read_proc() does.
+std::expected<Stat, std::error_code> stat_of(std::uint32_t pid) {
+  const std::expected<std::string, std::error_code> contents =
+      read_proc(std::to_string(pid) + "/stat");
+  if (!contents.has_value()) {
+    return std::unexpected(contents.error());
+  }
+  const std::string& line = *contents;
+  const auto malformed = [] {
+    return std::unexpected(std::make_error_code(std::errc::bad_message));
+  };
   // The command name, in parentheses, may itself hold spaces and
   // parentheses: the fields proper start after the last ')'.
   const std::size_t close = line.rfind(')');
   if (close == std::string::npos) {
-    return std::nullopt;
+    return malformed();
   }
   std::istringstream fields(line.substr(close + 1));
   std::string state;
@@ -67,14 +86,20 @@ std::optional<Stat> stat_of(std::uint32_t pid) {
   }
   std::uint64_t start_time = 0;
   if (!(fields >> start_time)) {
-    return std::nullopt;
+    return malformed();
   }
   return Stat{.parent = parent, .start_time = start_time};
 }
 
-// The process the thread @a thread belongs to, or nothing if it has gone.
-std::optional<std::uint32_t> process_of(std::uint32_t thread) {
-  std::ifstream status("/proc/" + std::to_string(thread) + "/status");
+// The process the thread @a thread belongs to, or why it could not be read,
+// as read_proc() says.
+std::expected<std::uint32_t, std::error_code> process_of(std::uint32_t thread) {
+  const std::expected<std::string, std::error_code> contents =
+      read_proc(std::to_string(thread) + "/status");
+  if (!contents.has_value()) {
+    return std::unexpected(contents.error());
+  }
+  std::istringstream status(*contents);
   std::string line;
   while (std::getline(status, line)) {
     constexpr std::string_view k_field = "Tgid:";
@@ -83,7 +108,7 @@ std::optional<std::uint32_t> process_of(std::uint32_t thread) {
           std::strtoul(line.c_str() + k_field.size(), nullptr, 10));
     }
   }
-  return std::nullopt;
+  return std::unexpected(std::make_error_code(std::errc::bad_message));
 }
 
 struct Record {
@@ -115,9 +140,9 @@ OsBuildProcessTracker::add(const std::filesystem::path& output,
                            const ProcessHandle& process) {
   // The process is parked before exec as our unreaped child, so its pid is
   // still its own while this reads it; the pidfd confirms it has not gone.
-  const std::optional<Stat> stat = stat_of(process.pid);
+  const std::expected<Stat, std::error_code> stat = stat_of(process.pid);
   if (!stat.has_value()) {
-    return std::unexpected(std::make_error_code(std::errc::no_such_process));
+    return std::unexpected(stat.error());
   }
   if (process.pidfd >= 0 &&
       ::syscall(SYS_pidfd_send_signal, process.pidfd, 0, nullptr, 0) != 0) {
@@ -144,15 +169,17 @@ std::optional<std::filesystem::path> OsBuildProcessTracker::find(
       return std::nullopt;
     }
   }
-  // FUSE names the thread; its process is where the walk starts.
-  std::optional<std::uint32_t> pid = process_of(requester_pid);
+  // FUSE names the thread; its process is where the walk starts. A lookup
+  // that fails - the process gone mid-walk, or /proc unreadable - is a miss,
+  // as find() can say nothing else.
+  std::expected<std::uint32_t, std::error_code> pid = process_of(requester_pid);
   const auto self = static_cast<std::uint32_t>(::getpid());
   for (int depth = 0;
        pid.has_value() && *pid > 1 && *pid != self && depth < k_max_depth;
        ++depth) {
-    const std::optional<Stat> stat = stat_of(*pid);
+    const std::expected<Stat, std::error_code> stat = stat_of(*pid);
     if (!stat.has_value()) {
-      return std::nullopt;  // Gone mid-walk: a miss.
+      return std::nullopt;
     }
     {
       const std::lock_guard lock(m_impl->mutex);
