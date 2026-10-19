@@ -17,6 +17,7 @@
 #include <bit>
 #include <cassert>
 #include <cerrno>
+#include <climits>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +38,7 @@
 #include <utility>
 #include <vector>
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/sched.h>
 #include <sched.h>
@@ -225,9 +227,9 @@ class Tracer {
   std::map<std::pair<dev_t, ino_t>, fuse_ino_t> m_by_dev_ino;
   fuse_ino_t m_next_ino = FUSE_ROOT_ID + 1;
 
-  // Every read's data, reused rather than allocated per read: a session
-  // serves one request at a time, so reads never overlap.
-  std::vector<char> m_read_buffer;
+  // The data of every read and listing, reused rather than allocated per
+  // reply: a session serves one request at a time, so replies never overlap.
+  std::vector<char> m_reply_buffer;
 
  public:
   // @pre @a root_fd is open on @a root.
@@ -332,21 +334,125 @@ class Tracer {
             size_t size,
             off_t off,
             fuse_file_info* fi) {
-    if (m_read_buffer.size() < size) {
-      m_read_buffer.resize(size);
+    if (m_reply_buffer.size() < size) {
+      m_reply_buffer.resize(size);
     }
     const ssize_t n =
-        ::pread(static_cast<int>(fi->fh), m_read_buffer.data(), size, off);
+        ::pread(static_cast<int>(fi->fh), m_reply_buffer.data(), size, off);
     if (n < 0) {
       fuse_reply_err(req, errno);
       return;
     }
-    fuse_reply_buf(req, m_read_buffer.data(), static_cast<std::size_t>(n));
+    fuse_reply_buf(req, m_reply_buffer.data(), static_cast<std::size_t>(n));
   }
 
   void release(fuse_req_t req, fuse_ino_t /*ino*/, fuse_file_info* fi) {
     ::close(static_cast<int>(fi->fh));
     fuse_reply_err(req, 0);
+  }
+
+  // Listing a directory - and reading a symlink, below - is not recorded as a
+  // read, as on Windows, whose hook skips directories and records a symlink's
+  // target rather than the link. Following a link inside the tree still opens
+  // its target here, which records that.
+  void opendir(fuse_req_t req, fuse_ino_t ino, fuse_file_info* fi) {
+    Inode* n = find(ino);
+    if (n == nullptr) {
+      fuse_reply_err(req, EIO);
+      return;
+    }
+    struct stat st {};
+    UniqueFd fd = reopen(*n, O_RDONLY | O_DIRECTORY, st);
+    if (!fd) {
+      fuse_reply_err(req, errno);
+      return;
+    }
+    DIR* const dir = ::fdopendir(fd.get());
+    if (dir == nullptr) {
+      fuse_reply_err(req, errno);
+      return;
+    }
+    fd.release();  // dir's now.
+
+    // The stream now belongs to fi->fh; Tracer::releasedir() closes it.
+    fi->fh = std::bit_cast<std::uintptr_t>(dir);
+    fuse_reply_open(req, fi);
+  }
+
+  // libfuse's signature.
+  // NOLINTBEGIN(bugprone-easily-swappable-parameters)
+  void readdir(fuse_req_t req,
+               fuse_ino_t /*ino*/,
+               size_t size,
+               off_t off,
+               fuse_file_info* fi) {
+    // NOLINTEND(bugprone-easily-swappable-parameters)
+    DIR* const dir = directory(fi);
+    // Offsets are those telldir() gave for an earlier batch, or 0.
+    if (off == 0) {
+      ::rewinddir(dir);
+    } else {
+      ::seekdir(dir, off);
+    }
+    if (m_reply_buffer.size() < size) {
+      m_reply_buffer.resize(size);
+    }
+    char* const buf = m_reply_buffer.data();
+    std::size_t used = 0;
+    while (true) {
+      errno = 0;
+      const dirent* const entry = ::readdir(dir);
+      if (entry == nullptr) {
+        if (errno != 0 && used == 0) {
+          fuse_reply_err(req, errno);
+          return;
+        }
+        break;
+      }
+      // Only the type and inode number are used, for d_type and d_ino.
+      const struct stat st {
+        .st_ino = entry->d_ino,
+        .st_mode = static_cast<mode_t>(entry->d_type) << 12,
+      };
+      const std::size_t needed = fuse_add_direntry(
+          req, buf + used, size - used, entry->d_name, &st, ::telldir(dir));
+      if (needed > size - used) {
+        break;  // The next batch starts here, at the offset it asks for.
+      }
+      used += needed;
+    }
+    fuse_reply_buf(req, buf, used);
+  }
+
+  void releasedir(fuse_req_t req, fuse_ino_t /*ino*/, fuse_file_info* fi) {
+    ::closedir(directory(fi));
+    fuse_reply_err(req, 0);
+  }
+
+  void readlink(fuse_req_t req, fuse_ino_t ino) {
+    Inode* n = find(ino);
+    if (n == nullptr) {
+      fuse_reply_err(req, EIO);
+      return;
+    }
+    struct stat st {};
+    const UniqueFd fd = reopen(*n, O_PATH, st);
+    if (!fd) {
+      fuse_reply_err(req, errno);
+      return;
+    }
+    std::array<char, PATH_MAX + 1> target{};
+    const ssize_t length =
+        ::readlinkat(fd.get(), "", target.data(), target.size());
+    if (length < 0) {
+      fuse_reply_err(req, errno);
+      return;
+    }
+    if (static_cast<std::size_t>(length) == target.size()) {
+      fuse_reply_err(req, ENAMETOOLONG);
+      return;
+    }
+    fuse_reply_readlink(req, target.data());
   }
 
   // Records that a request could not be handled.
@@ -382,6 +488,11 @@ class Tracer {
     }
     return fd;
   }
+
+  // The stream opendir() left in @a fi.
+  static DIR* directory(const fuse_file_info* fi) {
+    return std::bit_cast<DIR*>(static_cast<std::uintptr_t>(fi->fh));
+  }
 };
 
 // Turns a Tracer member function into a plain C fuse_lowlevel_ops callback via
@@ -416,9 +527,13 @@ constexpr fuse_lowlevel_ops k_ops = {
     .init = init_tracer,
     .lookup = trampoline<&Tracer::lookup>,
     .getattr = trampoline<&Tracer::getattr>,
+    .readlink = trampoline<&Tracer::readlink>,
     .open = trampoline<&Tracer::open>,
     .read = trampoline<&Tracer::read>,
     .release = trampoline<&Tracer::release>,
+    .opendir = trampoline<&Tracer::opendir>,
+    .readdir = trampoline<&Tracer::readdir>,
+    .releasedir = trampoline<&Tracer::releasedir>,
 };
 
 ssize_t custom_io_read(int fd, void* buf, size_t buf_len, void* /*userdata*/) {

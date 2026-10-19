@@ -27,6 +27,7 @@
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -215,6 +216,47 @@ TEST_F(ProcessUtil, TracesInputsWhenWorkingDirectoryIsSymlinked) {
                                            equivalent_ec);
       });
   EXPECT_TRUE(found) << "expected input.txt traced under a symlinked root";
+}
+
+// The working directory can be listed, as `ls` and shell globs do, through the
+// tracing mount.
+TEST_F(ProcessUtil, ListsTheWorkingDirectory) {
+  write_input("input.txt", "hello world");
+
+  const makebelieve::ProcessUtil::Result result = run("ls");
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->exit_status, 0);
+  EXPECT_EQ(result->standard_output, "input.txt\n");
+}
+
+TEST_F(ProcessUtil, ExpandsAGlobInTheWorkingDirectory) {
+  write_input("a.txt", "");
+  write_input("b.txt", "");
+  write_input("c.dat", "");
+
+  const makebelieve::ProcessUtil::Result result = run("echo *.txt");
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->standard_output, "a.txt b.txt\n");
+}
+
+// A symlink inside the working directory can be read through, and what is
+// traced is its target, as on Windows.
+TEST_F(ProcessUtil, ReadsThroughASymlinkAndTracesItsTarget) {
+  write_input("target.txt", "hello world");
+  std::error_code ec;
+  std::filesystem::create_symlink("target.txt", work / "link.txt", ec);
+  ASSERT_FALSE(ec) << ec.message();
+
+  const makebelieve::ProcessUtil::Result result = run("cat link.txt");
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->exit_status, 0);
+  EXPECT_EQ(result->standard_output, "hello world");
+  EXPECT_EQ(result->inputs,
+            std::vector<std::filesystem::path>{
+                std::filesystem::canonical(work) / "target.txt"});
 }
 #endif
 
