@@ -2,6 +2,7 @@
 #include "virtualfilesystem.hpp"
 
 #include "directorytree.hpp"
+#include "filesystemutil.hpp"
 #include "iocontext.hpp"
 #include "processinfo.hpp"
 #include "tracer.hpp"
@@ -22,11 +23,11 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -65,7 +66,9 @@ int to_errno(const std::error_code& error) {
 // that has gone between making the request and this lookup leaves only its own
 // id to go on.
 std::uint32_t process_of_thread(std::uint32_t thread) {
-  std::ifstream status("/proc/" + std::to_string(thread) + "/status");
+  std::istringstream status(
+      FileSystemUtil::read_file("/proc/" + std::to_string(thread) + "/status")
+          .value_or(""));
   std::string line;
   while (std::getline(status, line)) {
     constexpr std::string_view k_field = "Tgid:";

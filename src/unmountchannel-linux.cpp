@@ -257,7 +257,8 @@ class UnmountChannel::Impl {
   // request. Idempotent, so the watch keeps going to the end.
   void accept_pokes() noexcept {
     while (true) {
-      const int client = ::accept(m_listen.get(), nullptr, nullptr);
+      const int client =
+          ::accept4(m_listen.get(), nullptr, nullptr, SOCK_CLOEXEC);
       if (client < 0) {
         return;  // Drained (EAGAIN), or nothing more to be done.
       }

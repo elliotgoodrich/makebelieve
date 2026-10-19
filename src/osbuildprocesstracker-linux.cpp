@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 #include "osbuildprocesstracker.hpp"
 
+#include "filesystemutil.hpp"
+
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -47,9 +47,9 @@ struct Stat {
 
 // Reads /proc/<pid>/stat, or nothing if the process has gone.
 std::optional<Stat> stat_of(std::uint32_t pid) {
-  std::ifstream file("/proc/" + std::to_string(pid) + "/stat");
-  const std::string line((std::istreambuf_iterator<char>(file)),
-                         std::istreambuf_iterator<char>());
+  const std::string line =
+      FileSystemUtil::read_file("/proc/" + std::to_string(pid) + "/stat")
+          .value_or("");
   // The command name, in parentheses, may itself hold spaces and
   // parentheses: the fields proper start after the last ')'.
   const std::size_t close = line.rfind(')');
@@ -74,7 +74,9 @@ std::optional<Stat> stat_of(std::uint32_t pid) {
 
 // The process the thread @a thread belongs to, or nothing if it has gone.
 std::optional<std::uint32_t> process_of(std::uint32_t thread) {
-  std::ifstream status("/proc/" + std::to_string(thread) + "/status");
+  std::istringstream status(
+      FileSystemUtil::read_file("/proc/" + std::to_string(thread) + "/status")
+          .value_or(""));
   std::string line;
   while (std::getline(status, line)) {
     constexpr std::string_view k_field = "Tgid:";

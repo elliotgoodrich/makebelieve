@@ -3,8 +3,13 @@
 
 #include <gtest/gtest.h>
 
+#include <expected>
 #include <filesystem>
+#include <fstream>
+#include <ios>
+#include <string>
 #include <string_view>
+#include <system_error>
 
 namespace {
 
@@ -56,5 +61,64 @@ INSTANTIATE_TEST_SUITE_P(
         DisjointCase{rooted("source-tree"), rooted("src"), true},
         // Unrelated subtrees.
         DisjointCase{rooted("a/b"), rooted("c/d"), true}));
+
+// A path in the temporary directory named for the running test.
+std::filesystem::path temp_file() {
+  return std::filesystem::temp_directory_path() /
+         ("makebelieve-fsutil-" +
+          std::string(
+              ::testing::UnitTest::GetInstance()->current_test_info()->name()));
+}
+
+TEST(ReadFile, ReadsEveryByteOfAFileLargerThanOneRead) {
+  std::string contents;
+  for (int i = 0; i < 10000; ++i) {
+    contents += static_cast<char>(i % 256);  // NUL, CR and LF among them
+  }
+  const std::filesystem::path path = temp_file();
+  {
+    std::ofstream stream(path, std::ios::binary);
+    stream << contents;
+  }
+
+  const std::expected<std::string, std::error_code> read =
+      makebelieve::FileSystemUtil::read_file(path);
+  std::filesystem::remove(path);
+
+  ASSERT_TRUE(read.has_value()) << read.error().message();
+  EXPECT_EQ(*read, contents);
+}
+
+TEST(ReadFile, ReadsAnEmptyFile) {
+  const std::filesystem::path path = temp_file();
+  std::ofstream(path, std::ios::binary).close();
+
+  const std::expected<std::string, std::error_code> read =
+      makebelieve::FileSystemUtil::read_file(path);
+  std::filesystem::remove(path);
+
+  ASSERT_TRUE(read.has_value()) << read.error().message();
+  EXPECT_EQ(*read, "");
+}
+
+TEST(ReadFile, ReportsAMissingFile) {
+  const std::expected<std::string, std::error_code> read =
+      makebelieve::FileSystemUtil::read_file(temp_file());
+
+  ASSERT_FALSE(read.has_value());
+  EXPECT_EQ(read.error(), std::errc::no_such_file_or_directory);
+}
+
+#ifdef __linux__
+// /proc files report a size of 0, so only reading to the end finds what they
+// hold.
+TEST(ReadFile, ReadsAProcFile) {
+  const std::expected<std::string, std::error_code> read =
+      makebelieve::FileSystemUtil::read_file("/proc/self/status");
+
+  ASSERT_TRUE(read.has_value()) << read.error().message();
+  EXPECT_TRUE(read->starts_with("Name:")) << *read;
+}
+#endif
 
 }  // namespace
