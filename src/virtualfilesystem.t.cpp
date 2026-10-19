@@ -464,12 +464,15 @@ bool ChangeWatcher::pump(std::chrono::milliseconds timeout) {
   return true;
 }
 
+// O_DIRECT, so the read reaches the filesystem rather than the page cache: a
+// read the kernel makes to fill the cache - readahead, say - can fail as EIO
+// whatever the filesystem replied, as from Linux 7.0 it sometimes does.
 std::error_code read_error(const std::filesystem::path& path) {
-  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
   if (fd < 0) {
     return {errno, std::system_category()};
   }
-  std::array<char, 16> buffer{};
+  alignas(4096) std::array<char, 4096> buffer{};
   std::error_code result;
   if (::read(fd, buffer.data(), buffer.size()) < 0) {
     result = {errno, std::system_category()};

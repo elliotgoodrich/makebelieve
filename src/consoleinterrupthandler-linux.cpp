@@ -5,7 +5,6 @@
 
 #include <stdexec/execution.hpp>
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -98,34 +97,17 @@ bool drain_pipe() noexcept {
   return interrupted;
 }
 
-// Close-on-exec on both ends, since the daemon may exec build tools and this is
-// private plumbing. Non-blocking at both ends: a full pipe drops the byte
-// rather than stalling a signal handler, and draining it never stalls the
-// watch.
-bool configure_pipe(const int read_fd, const int write_fd) {
-  const auto configure = [](const int fd) {
-    const int fd_flags = ::fcntl(fd, F_GETFD);
-    const int status_flags = ::fcntl(fd, F_GETFL);
-    return fd_flags != -1 && status_flags != -1 &&
-           ::fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) == 0 &&
-           ::fcntl(fd, F_SETFL, status_flags | O_NONBLOCK) == 0;
-  };
-  return std::ranges::all_of(std::array{read_fd, write_fd}, configure);
-}
-
 // Throwing leaves g_pipe_created unset, so a later construction retries rather
 // than inheriting a half-built pipe.
 void create_wakeup_pipe() {
   std::array<int, 2> fds{};
-  // pipe() plus fcntl rather than pipe2(), which would need _GNU_SOURCE.
-  if (::pipe(fds.data()) != 0) {
-    throw std::system_error(errno, std::system_category(), "pipe");
-  }
-  if (!configure_pipe(fds[0], fds[1])) {
-    const int error = errno;
-    ::close(fds[0]);
-    ::close(fds[1]);
-    throw std::system_error(error, std::system_category(), "fcntl");
+  // Close-on-exec from the start, since the daemon may exec build tools and
+  // this is private plumbing - set any later and a command launched meanwhile
+  // could inherit it. Non-blocking at both ends: a full pipe drops the byte
+  // rather than stalling a signal handler, and draining it never stalls the
+  // watch.
+  if (::pipe2(fds.data(), O_CLOEXEC | O_NONBLOCK) != 0) {
+    throw std::system_error(errno, std::system_category(), "pipe2");
   }
   g_read_fd = fds[0];
   g_wakeup_fd.store(fds[1], std::memory_order_release);

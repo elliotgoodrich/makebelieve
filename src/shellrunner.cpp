@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "shellrunner.hpp"
 
+#include "filesystemutil.hpp"
 #include "iocontext.hpp"
 #include "manifest.hpp"
 #include "processutil.hpp"
@@ -12,11 +13,8 @@
 #include <cstddef>
 #include <expected>
 #include <filesystem>
-#include <fstream>
-#include <ios>
 #include <optional>
 #include <random>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -169,30 +167,28 @@ std::string expand_generated(std::string_view command,
   return result;
 }
 
-// Reads the whole of @a path, or the error that stopped it. ifstream does not
-// say why it would not open, so the filesystem is asked instead.
+// Reads the whole of @a path, or the error that stopped it - put as the same
+// error on every platform for the two a missing source gives.
 std::expected<std::string, std::error_code> read_file(
     const std::filesystem::path& path) {
-  const std::ifstream stream(path, std::ios::binary);
-  if (!stream) {
-    std::error_code ec;
-    const std::filesystem::file_status status =
-        std::filesystem::status(path, ec);
-    if (ec) {
-      return std::unexpected(ec);
-    }
-    if (!std::filesystem::exists(status)) {
-      return std::unexpected(
-          std::make_error_code(std::errc::no_such_file_or_directory));
-    }
-    if (std::filesystem::is_directory(status)) {
-      return std::unexpected(std::make_error_code(std::errc::is_a_directory));
-    }
-    return std::unexpected(std::make_error_code(std::errc::io_error));
+  std::expected<std::string, std::error_code> contents =
+      FileSystemUtil::read_file(path);
+  if (contents.has_value()) {
+    return contents;
   }
-  std::ostringstream buffer;
-  buffer << stream.rdbuf();
-  return buffer.str();
+  std::error_code ec;
+  const std::filesystem::file_status status = std::filesystem::status(path, ec);
+  if (ec) {
+    return std::unexpected(ec);
+  }
+  if (!std::filesystem::exists(status)) {
+    return std::unexpected(
+        std::make_error_code(std::errc::no_such_file_or_directory));
+  }
+  if (std::filesystem::is_directory(status)) {
+    return std::unexpected(std::make_error_code(std::errc::is_a_directory));
+  }
+  return contents;
 }
 
 // Recasts absolute traced input paths into paths relative to @a root, dropping

@@ -2,6 +2,7 @@
 #include "virtualfilesystem.hpp"
 
 #include "directorytree.hpp"
+#include "filesystemutil.hpp"
 #include "iocontext.hpp"
 #include "processinfo.hpp"
 #include "tracer.hpp"
@@ -20,13 +21,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <expected>
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -59,13 +61,19 @@ int to_errno(const std::error_code& error) {
   return EIO;
 }
 
-// The process the thread @a thread belongs to, read from `/proc`. FUSE names
-// the calling thread rather than the program behind it, and it is the program
-// a trace should group a request under, so its Tgid is what we want. A thread
-// that has gone between making the request and this lookup leaves only its own
-// id to go on.
-std::uint32_t process_of_thread(std::uint32_t thread) {
-  std::ifstream status("/proc/" + std::to_string(thread) + "/status");
+// The process the thread @a thread belongs to, read from `/proc`, or why it
+// could not be read: `std::errc::no_such_file_or_directory`, or
+// `std::errc::no_such_process` mid-read, if the thread has gone. FUSE names the
+// calling thread rather than the program behind it, and it is the program a
+// trace should group a request under, so its Tgid is what we want.
+std::expected<std::uint32_t, std::error_code> process_of_thread(
+    std::uint32_t thread) {
+  const std::expected<std::string, std::error_code> contents =
+      FileSystemUtil::read_file("/proc/" + std::to_string(thread) + "/status");
+  if (!contents.has_value()) {
+    return std::unexpected(contents.error());
+  }
+  std::istringstream status(*contents);
   std::string line;
   while (std::getline(status, line)) {
     constexpr std::string_view k_field = "Tgid:";
@@ -78,7 +86,7 @@ std::uint32_t process_of_thread(std::uint32_t thread) {
           std::strtoul(line.c_str() + start, nullptr, 10));
     }
   }
-  return thread;
+  return std::unexpected(std::make_error_code(std::errc::bad_message));
 }
 
 // As above, remembering each answer: a thread belongs to the same process for
@@ -95,7 +103,17 @@ std::uint32_t process_of_caller(std::uint32_t thread) {
   }
   // Outside the lock: two threads asking about the same caller at once only
   // means reading `/proc` twice.
-  const std::uint32_t process = process_of_thread(thread);
+  const std::expected<std::uint32_t, std::error_code> found =
+      process_of_thread(thread);
+  if (!found.has_value() &&
+      found.error() != std::errc::no_such_file_or_directory &&
+      found.error() != std::errc::no_such_process) {
+    // Perhaps passing - out of descriptors, say - so not remembered.
+    return thread;
+  }
+  // A thread that has gone between making the request and this lookup leaves
+  // only its own id to go on.
+  const std::uint32_t process = found.value_or(thread);
   const std::lock_guard<std::mutex> lock(mutex);
   processes.insert_or_assign(thread, process);
   return process;

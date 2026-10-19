@@ -436,14 +436,27 @@ constexpr fuse_custom_io k_io = {
     .splice_send = nullptr,
 };
 
-// Points stdout at the pipe and puts the command in its own process group, out
-// of reach of signals sent to ours - an interrupt at the terminal, say - which
-// makebelieve handles by stopping the run instead. Returns false on failure.
+// Points stdout at the pipe and stdin at /dev/null, and puts the command in its
+// own process group, out of reach of signals sent to ours - an interrupt at the
+// terminal, say - which makebelieve handles by stopping the run instead. In a
+// background group, a command reading our stdin - were it a terminal - would be
+// stopped by SIGTTIN for good. Returns false on failure.
 bool prepare_child_io(int stdout_fd) {
   if (::dup2(stdout_fd, STDOUT_FILENO) < 0) {
     return false;
   }
   ::close(stdout_fd);
+  const int null_fd = ::open("/dev/null", O_RDONLY);
+  if (null_fd < 0) {
+    return false;
+  }
+  if (null_fd != STDIN_FILENO) {
+    const bool redirected = ::dup2(null_fd, STDIN_FILENO) >= 0;
+    ::close(null_fd);
+    if (!redirected) {
+      return false;
+    }
+  }
   ::setpgid(0, 0);
   return true;
 }
