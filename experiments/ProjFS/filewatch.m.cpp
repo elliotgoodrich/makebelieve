@@ -89,13 +89,14 @@ int wmain(int argc, wchar_t* argv[]) {
     OVERLAPPED overlapped = {.hEvent = event};
     ::ResetEvent(event);
 
-    // LAST_WRITE alone, not also SIZE: projfs_experiment's updates always
-    // bump LastWriteTime, so that alone is enough to catch every change,
-    // and watching both filters would (on this system, empirically)
-    // double up into two separate notification records per single update.
+    // CREATION alone: projfs_experiment's updates always bump CreationTime,
+    // and it's the one filter that reports exactly one record per update.
+    // Newer Windows builds apply PrjUpdateFileIfNeeded by renaming a fresh
+    // file over the old one, which raises no LAST_WRITE notification at all,
+    // while ATTRIBUTES and SIZE also fire when a read hydrates the file.
     DWORD unused_bytes = 0;
     if (!::ReadDirectoryChangesW(dir_handle, buffer, kBufferSize, FALSE,
-                                 FILE_NOTIFY_CHANGE_LAST_WRITE, &unused_bytes,
+                                 FILE_NOTIFY_CHANGE_CREATION, &unused_bytes,
                                  &overlapped, nullptr)) {
       std::fwprintf(stderr, L"ReadDirectoryChangesW: error %lu\n",
                     ::GetLastError());
