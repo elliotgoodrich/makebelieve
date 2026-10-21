@@ -4,7 +4,6 @@
 #include "buildcoordinator.hpp"
 #include "buildpermits.hpp"
 #include "directorytreeutil.hpp"
-#include "filetask.hpp"
 #include "inmemorydirectorytree.hpp"
 #include "manifest.hpp"
 #include "processinfo.hpp"
@@ -1080,7 +1079,11 @@ std::expected<std::vector<TreeEntry>, std::error_code> BuildDirectoryTree::ls(
 
 OpenSender BuildDirectoryTree::open(const std::filesystem::path& path,
                                     const OpenContext& context) const {
-  return file_task(m_impl->open(path, context));
+  // Give the task a start scheduler before type erasure; inline leaves
+  // continuations on whichever thread completes them.
+  return stdexec::write_env(
+      m_impl->open(path, context),
+      stdexec::prop{stdexec::get_start_scheduler, stdexec::inline_scheduler{}});
 }
 
 ReadSender BuildDirectoryTree::read(const std::filesystem::path& path,
