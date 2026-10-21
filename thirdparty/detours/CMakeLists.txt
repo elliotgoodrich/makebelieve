@@ -37,7 +37,11 @@ add_library(detours STATIC
 target_include_directories(detours PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 # Detours' own headers rely on implicit int/pointer conversions and benign
 # sign-compare mismatches throughout; this is vendored, unmodified third-party
-# source, not code this project owns the warnings for.
+# source, not code this project owns the warnings for. The project-wide /W4
+# is dropped first, as cl warns (D9025) about every /W0 that overrides it.
+get_target_property(_detours_options detours COMPILE_OPTIONS)
+list(FILTER _detours_options EXCLUDE REGEX "/W4")
+set_target_properties(detours PROPERTIES COMPILE_OPTIONS "${_detours_options}")
 target_compile_options(detours PRIVATE
   $<$<CXX_COMPILER_ID:MSVC>:/W0>
 )
