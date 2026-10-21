@@ -36,6 +36,10 @@ target_compile_options(stdexec INTERFACE
   $<$<CXX_COMPILER_ID:MSVC>:/Zc:__cplusplus>
   $<$<CXX_COMPILER_ID:MSVC>:/Zc:externConstexpr>
   $<$<CXX_COMPILER_ID:MSVC>:/bigobj>
+  # stdexec marks its coroutine resume/destroy helpers __forceinline, and
+  # optimised builds report each one MSVC declines to inline (C4714). It is a
+  # code-generation warning, so the SYSTEM include above doesn't silence it.
+  $<$<CXX_COMPILER_ID:MSVC>:/wd4714>
 )
 
 enable_testing()
