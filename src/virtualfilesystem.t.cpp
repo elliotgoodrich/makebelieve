@@ -4,11 +4,12 @@
 #include "buildcoordinator.hpp"
 #include "directorytree.hpp"
 #include "directorytreeutil.hpp"
-#include "filetask.hpp"
 #include "inmemorydirectorytree.hpp"
 #include "scopeguard.hpp"
 
 #include <gtest/gtest.h>
+#include <exec/task.hpp>
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <array>
@@ -823,7 +824,9 @@ class ParkingTree : public makebelieve::DirectoryTree {
   [[nodiscard]] makebelieve::OpenSender open(
       const std::filesystem::path& path,
       const makebelieve::OpenContext& context) const override {
-    return makebelieve::file_task(open_task(path, context));
+    return stdexec::write_env(open_task(path, context),
+                              stdexec::prop{stdexec::get_start_scheduler,
+                                            stdexec::inline_scheduler{}});
   }
 
   [[nodiscard]] exec::task<
@@ -864,7 +867,9 @@ class ParkingTree : public makebelieve::DirectoryTree {
   [[nodiscard]] makebelieve::ReadSender read(const std::filesystem::path& path,
                                              makebelieve::Offset offset,
                                              std::size_t size) const override {
-    return makebelieve::file_task(read_task(path, offset, size));
+    return stdexec::write_env(read_task(path, offset, size),
+                              stdexec::prop{stdexec::get_start_scheduler,
+                                            stdexec::inline_scheduler{}});
   }
 
   [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
@@ -1006,7 +1011,9 @@ class GatedOpenTree : public makebelieve::DirectoryTree {
   [[nodiscard]] makebelieve::OpenSender open(
       const std::filesystem::path& path,
       const makebelieve::OpenContext& context) const override {
-    return makebelieve::file_task(open_task(path, context));
+    return stdexec::write_env(open_task(path, context),
+                              stdexec::prop{stdexec::get_start_scheduler,
+                                            stdexec::inline_scheduler{}});
   }
 
   [[nodiscard]] exec::task<
