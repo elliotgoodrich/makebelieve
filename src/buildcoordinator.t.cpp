@@ -1056,13 +1056,19 @@ TEST(BuildCoordinator, CancelingARequestDetachesOnlyThatWaiter) {
           stdexec::upon_error(
               [](const std::exception_ptr&) noexcept { ADD_FAILURE(); }),
       scope.get_token());
-  const auto deadline = std::chrono::steady_clock::now() + k_patience;
-  while (coordinator.stats().waits < 2 &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(1ms);
-  }
+  const auto wait_for = [&](std::size_t waits) {
+    const auto deadline = std::chrono::steady_clock::now() + k_patience;
+    while (coordinator.stats().waits != waits &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(1ms);
+    }
+  };
+  wait_for(2);
   EXPECT_EQ(coordinator.stats().waits, 2U);
   stop.request_stop();
+  // A wait is counted before it registers its stop callback, so a stop that
+  // lands in between detaches it later on the pool thread.
+  wait_for(1);
   EXPECT_EQ(coordinator.stats().waits, 1U);
   coordinator.complete(target, {});
   stdexec::sync_wait(scope.join());
