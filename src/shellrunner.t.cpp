@@ -318,6 +318,54 @@ TEST_F(ShellRunnerTest, ExpandsAnOutputAlreadyInsideQuotes) {
   EXPECT_EQ(built.result->bytes, "spaced");
 }
 
+// Writes, in @a directory, a program that copies the file its first argument
+// names to its second, and returns its path.
+std::filesystem::path write_copy_program(
+    const std::filesystem::path& directory) {
+  std::filesystem::create_directories(directory);
+#ifdef _WIN32
+  const std::filesystem::path program = directory / "copy.cmd";
+  std::ofstream(program) << "@copy /b %1 %2 > nul\n";
+#else
+  const std::filesystem::path program = directory / "copy";
+  std::ofstream(program) << "#!/bin/sh\ncp \"$1\" \"$2\"\n";
+  std::filesystem::permissions(program, std::filesystem::perms::owner_exec,
+                               std::filesystem::perm_options::add);
+#endif
+  return program;
+}
+
+// A program named by a quoted path - whether or not it needs the quotes -
+// runs alongside the quoted paths `@/` and `%out` expand to, which cmd would
+// otherwise mangle by stripping the first and last quote on the line.
+TEST_F(ShellRunnerTest, RunsAProgramNamedByAQuotedPath) {
+  write_generated("generated.txt", "generated");
+  for (const std::string_view directory : {"tools", "my tools"}) {
+    const std::filesystem::path program = write_copy_program(work / directory);
+    const Built built =
+        build({.output = "output.txt",
+               .action = Manifest::Action::Run,
+               .text = "\"" + program.string() + "\" @/generated.txt %out"});
+    ASSERT_TRUE(built.result.has_value())
+        << directory << ": " << built.result.error().message();
+    EXPECT_EQ(built.result->bytes, "generated") << directory;
+  }
+}
+
+// Quoted arguments after an unquoted program keep working too.
+TEST_F(ShellRunnerTest, RunsAProgramWithQuotedArguments) {
+  write_generated("my file.txt", "spaced");
+  const std::filesystem::path program = write_copy_program(work / "tools");
+  const std::filesystem::path relative =
+      std::filesystem::relative(program, work);
+  const Built built =
+      build({.output = "output.txt",
+             .action = Manifest::Action::Run,
+             .text = relative.string() + " \"@/my file.txt\" %out"});
+  ASSERT_TRUE(built.result.has_value()) << built.result.error().message();
+  EXPECT_EQ(built.result->bytes, "spaced");
+}
+
 // A command reading an output through the mount builds on whatever it finds
 // there; one that is missing fails the command like any missing file.
 TEST_F(ShellRunnerTest, FailsACommandReadingAMissingOutput) {
