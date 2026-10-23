@@ -851,8 +851,11 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
   if (!wcommand.has_value()) {
     co_return std::unexpected(wcommand.error());
   }
-  // CreateProcessW takes a mutable command line.
-  std::wstring command_line = L"cmd.exe /c " + *wcommand;
+  // CreateProcessW takes a mutable command line. Without /s, cmd strips the
+  // first and last quote of a command that starts with one, so a quoted
+  // program followed by a quoted argument loses both; with /s it strips only
+  // the extra pair wrapped around the command here.
+  std::wstring command_line = L"cmd.exe /s /c \"" + *wcommand + L"\"";
 
   // The command's record in the tracker, once added. Removed only once the
   // command, and everything it started, has gone - declared before the child
