@@ -6,6 +6,7 @@
 #include "iocontext.hpp"
 
 #include <gtest/gtest.h>
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -484,6 +485,58 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<ReadFailureCase>& info) {
       return std::string(info.param.label);
     });
+
+std::expected<makebelieve::FileContent, std::error_code> read_whole(
+    const makebelieve::DirectoryTree& tree,
+    const std::filesystem::path& path) {
+  auto result = stdexec::sync_wait(tree.read_whole(path));
+  return std::get<0>(std::move(result).value());
+}
+
+// A file taken whole is what status() and read() say it is.
+TEST_F(RealDirectoryTree, ReadWholeMatchesStatusAndRead) {
+  for (const char* const path :
+       {"hello.txt", "empty.txt", "binary.bin", "sub/nested.txt"}) {
+    SCOPED_TRACE(path);
+    const auto whole = read_whole(tree(), path);
+    const auto status = tree().status(path);
+    const auto read =
+        makebelieve::DirectoryTreeUtil::read(tree(), path, 0, 1U << 20U);
+    ASSERT_TRUE(whole.has_value()) << whole.error().message();
+    ASSERT_TRUE(status.has_value());
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(*whole->bytes, *read);
+    const auto& file = std::get<makebelieve::FileInfo>(*status);
+    EXPECT_EQ(whole->info.size, file.size);
+    EXPECT_EQ(whole->info.mtime, file.mtime);
+  }
+}
+
+// A file larger than any one read takes several to drain.
+TEST_F(RealDirectoryTree, ReadWholeReadsALargeFile) {
+  std::string large(3U << 20U, '\0');
+  for (std::size_t i = 0; i < large.size(); ++i) {
+    large[i] = static_cast<char>('a' + ((i * 7 + (i >> 13)) % 26));
+  }
+  write_file(root() / "large.bin", large);
+  const auto whole = read_whole(tree(), "large.bin");
+  ASSERT_TRUE(whole.has_value()) << whole.error().message();
+  EXPECT_TRUE(*whole->bytes == large);
+  EXPECT_EQ(whole->info.size, large.size());
+}
+
+TEST_F(RealDirectoryTree, ReadWholeFailsAsReadDoes) {
+  EXPECT_EQ(read_whole(tree(), "missing.txt").error(),
+            std::errc::no_such_file_or_directory);
+  EXPECT_EQ(read_whole(tree(), "missing/nested.txt").error(),
+            std::errc::no_such_file_or_directory);
+  EXPECT_EQ(read_whole(tree(), "..").error(),
+            std::errc::no_such_file_or_directory);
+  // As with read(), the platforms report a directory differently.
+  const auto directory = read_whole(tree(), "sub");
+  ASSERT_FALSE(directory.has_value());
+  EXPECT_TRUE(static_cast<bool>(directory.error()));
+}
 
 // Collects the diffs a tree reports, for a test to wait on.
 class ChangeLog {

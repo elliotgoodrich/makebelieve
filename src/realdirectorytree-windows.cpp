@@ -73,6 +73,18 @@ std::chrono::file_clock::time_point to_file_time(const FILETIME& time) {
           combine(time.dwHighDateTime, time.dwLowDateTime))));
 }
 
+// How many times read_whole() reads a file that changes under it before
+// handing out what it last read.
+constexpr int k_read_whole_attempts = 8;
+
+bool same_version(const BY_HANDLE_FILE_INFORMATION& a,
+                  const BY_HANDLE_FILE_INFORMATION& b) {
+  return a.nFileSizeHigh == b.nFileSizeHigh &&
+         a.nFileSizeLow == b.nFileSizeLow &&
+         a.ftLastWriteTime.dwHighDateTime == b.ftLastWriteTime.dwHighDateTime &&
+         a.ftLastWriteTime.dwLowDateTime == b.ftLastWriteTime.dwLowDateTime;
+}
+
 // Builds an EntryInfo from the fields both WIN32_FIND_DATAW and
 // WIN32_FILE_ATTRIBUTE_DATA carry, so ls() and status() cannot drift apart.
 EntryInfo make_info(DWORD attributes,
@@ -230,6 +242,8 @@ class RealDirectoryTree::Impl {
       const std::filesystem::path& path,
       Offset offset,
       std::size_t size) const;
+  [[nodiscard]] std::expected<FileContent, std::error_code> read_whole(
+      const std::filesystem::path& path) const;
   [[nodiscard]] Subscription subscribe_to_changes(
       const std::function<void(const DirectoryTreeDiff&)>& callback) const;
 
@@ -565,6 +579,85 @@ ReadSender RealDirectoryTree::read(const std::filesystem::path& path,
   return stdexec::just() | stdexec::then([this, path, offset, size] {
            return m_impl->read(path, offset, size);
          });
+}
+
+std::expected<FileContent, std::error_code> RealDirectoryTree::Impl::read_whole(
+    const std::filesystem::path& path) const {
+  const std::optional<std::filesystem::path> resolved = resolve(path);
+  if (!resolved.has_value()) {
+    return std::unexpected(
+        std::make_error_code(std::errc::no_such_file_or_directory));
+  }
+  // Shared every way, as read() is, for the same reason.
+  const HANDLE file =
+      CreateFileW(resolved->c_str(), GENERIC_READ,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    return std::unexpected(last_error_code());
+  }
+  const ScopeGuard close_file([file] { CloseHandle(file); });
+
+  FileContent latest;
+  for (int attempt = 0; attempt < k_read_whole_attempts; ++attempt) {
+    BY_HANDLE_FILE_INFORMATION before{};
+    if (!GetFileInformationByHandle(file, &before)) {
+      return std::unexpected(last_error_code());
+    }
+    if ((before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+      return std::unexpected(std::make_error_code(std::errc::is_a_directory));
+    }
+    const std::uint64_t size =
+        combine(before.nFileSizeHigh, before.nFileSizeLow);
+
+    // One byte more than the file should hold, so a read that fills the
+    // buffer is never mistaken for the end of it.
+    std::string contents(static_cast<std::size_t>(size) + 1, '\0');
+    std::size_t total = 0;
+    for (;;) {
+      if (total == contents.size()) {
+        contents.resize(contents.size() * 2);
+      }
+      // A positioned read on a synchronous handle, as in read().
+      const auto position = static_cast<std::uint64_t>(total);
+      OVERLAPPED overlapped{};
+      overlapped.Offset = static_cast<DWORD>(position & 0xFFFFFFFFULL);
+      overlapped.OffsetHigh = static_cast<DWORD>(position >> 32);
+      const auto chunk = static_cast<DWORD>(
+          std::min<std::uint64_t>(contents.size() - total, k_read_chunk_bytes));
+      DWORD read_bytes = 0;
+      if (!ReadFile(file, contents.data() + total, chunk, &read_bytes,
+                    &overlapped)) {
+        if (GetLastError() == ERROR_HANDLE_EOF) {
+          break;
+        }
+        return std::unexpected(last_error_code());
+      }
+      if (read_bytes == 0) {
+        break;
+      }
+      total += read_bytes;
+    }
+    contents.resize(total);
+
+    BY_HANDLE_FILE_INFORMATION after{};
+    if (!GetFileInformationByHandle(file, &after)) {
+      return std::unexpected(last_error_code());
+    }
+    latest = {
+        .bytes = std::make_shared<const std::string>(std::move(contents)),
+        .info = {.size = total, .mtime = to_file_time(before.ftLastWriteTime)}};
+    if (same_version(before, after) && total == size) {
+      break;
+    }
+  }
+  return latest;
+}
+
+ReadWholeSender RealDirectoryTree::read_whole(
+    const std::filesystem::path& path) const {
+  return stdexec::just() |
+         stdexec::then([this, path] { return m_impl->read_whole(path); });
 }
 
 Subscription RealDirectoryTree::subscribe_to_changes(

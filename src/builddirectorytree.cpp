@@ -418,6 +418,11 @@ class BuildDirectoryTree::Impl {
     return m_structure.read(path, offset, size);
   }
 
+  [[nodiscard]] ReadWholeSender read_whole(
+      const std::filesystem::path& path) const {
+    return m_structure.read_whole(path);
+  }
+
   // Waits, through the coordinator, for the build of a declared output that
   // brings it up to date - joining the one under way unless the output has
   // changed since it started, otherwise the next, which is started here if the
@@ -1090,6 +1095,11 @@ ReadSender BuildDirectoryTree::read(const std::filesystem::path& path,
                                     Offset offset,
                                     std::size_t size) const {
   return m_impl->read(path, offset, size);
+}
+
+ReadWholeSender BuildDirectoryTree::read_whole(
+    const std::filesystem::path& path) const {
+  return m_impl->read_whole(path);
 }
 
 Subscription BuildDirectoryTree::subscribe_to_changes(

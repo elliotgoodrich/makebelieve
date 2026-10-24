@@ -20,8 +20,10 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -32,6 +34,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -164,6 +167,14 @@ class FileMapper {
   std::expected<std::string, std::error_code> map(
       const std::filesystem::path& path,
       Mapping mapping_kind);
+
+  // Maps @a path, copies the view out, calls @a between while the view is
+  // still mapped, then copies the same view out again. @a between must not
+  // change the file's size: a view past the end of a file faults.
+  std::expected<std::pair<std::string, std::string>, std::error_code>
+  map_across(const std::filesystem::path& path,
+             Mapping mapping_kind,
+             const std::function<void()>& between);
 
 #ifndef _WIN32
  private:
@@ -359,6 +370,53 @@ std::error_code native_io_error() {
   return {ERROR_IO_DEVICE, std::system_category()};
 }
 
+// Forces every page this process has mapped out of memory, so the next touch
+// of one reads it back through its filesystem: out of the working set first,
+// which leaves them on the standby list, then off that list. Purging it needs
+// SeProfileSingleProcessPrivilege, which only an elevated process holds, and
+// drops every standby page on the machine. Returns why it could not, if not.
+std::optional<std::string> evict_mapped_pages() {
+  HANDLE token = nullptr;
+  if (::OpenProcessToken(::GetCurrentProcess(),
+                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token) == 0) {
+    return "could not open this process's token";
+  }
+  const ScopeGuard close_token([token] { ::CloseHandle(token); });
+  TOKEN_PRIVILEGES privileges{.PrivilegeCount = 1};
+  privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+  if (::LookupPrivilegeValueW(nullptr, L"SeProfileSingleProcessPrivilege",
+                              &privileges.Privileges[0].Luid) == 0 ||
+      ::AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr) ==
+          0 ||
+      ::GetLastError() == ERROR_NOT_ALL_ASSIGNED) {
+    return "purging the standby list needs an elevated process";
+  }
+
+  using SetSystemInformation = LONG(NTAPI*)(ULONG, PVOID, ULONG);
+  const auto set_information =
+      reinterpret_cast<SetSystemInformation>(::GetProcAddress(
+          ::GetModuleHandleW(L"ntdll.dll"), "NtSetSystemInformation"));
+  if (set_information == nullptr) {
+    return "NtSetSystemInformation is missing";
+  }
+  // SystemMemoryListInformation and MemoryPurgeStandbyList, which the SDK
+  // headers do not define.
+  constexpr ULONG k_memory_list_information = 80;
+  ULONG purge_standby_list = 4;
+  if (::SetProcessWorkingSetSize(::GetCurrentProcess(), static_cast<SIZE_T>(-1),
+                                 static_cast<SIZE_T>(-1)) == 0) {
+    return "could not empty this process's working set";
+  }
+  if (const LONG status =
+          set_information(k_memory_list_information, &purge_standby_list,
+                          sizeof(purge_standby_list));
+      status < 0) {
+    return std::format("purging the standby list failed: {:#x}",
+                       static_cast<ULONG>(status));
+  }
+  return std::nullopt;
+}
+
 // How an open refused for want of a dispatcher thread to park reaches the
 // caller: STATUS_INSUFFICIENT_RESOURCES, as Win32 reports it.
 
@@ -370,6 +428,15 @@ FileMapper::~FileMapper() = default;
 std::expected<std::string, std::error_code> FileMapper::map(
     const std::filesystem::path& path,
     Mapping mapping_kind) {
+  return map_across(path, mapping_kind, [] {}).transform([](auto copies) {
+    return std::move(copies.first);
+  });
+}
+
+std::expected<std::pair<std::string, std::string>, std::error_code>
+FileMapper::map_across(const std::filesystem::path& path,
+                       Mapping mapping_kind,
+                       const std::function<void()>& between) {
   const bool shared = mapping_kind == Mapping::shared;
   const auto last_error = [] {
     return std::unexpected(std::error_code(static_cast<int>(::GetLastError()),
@@ -382,7 +449,7 @@ std::expected<std::string, std::error_code> FileMapper::map(
     return last_error();
   }
   const ScopeGuard close_file([file] { ::CloseHandle(file); });
-  std::expected<std::string, std::error_code> result;
+  std::expected<std::pair<std::string, std::string>, std::error_code> result;
   LARGE_INTEGER size{};
   if (::GetFileSizeEx(file, &size) == 0) {
     result = last_error();
@@ -399,8 +466,13 @@ std::expected<std::string, std::error_code> FileMapper::map(
       result = last_error();
     } else {
       const ScopeGuard unmap_view([view] { ::UnmapViewOfFile(view); });
-      result = std::string(static_cast<const char*>(view),
+      const auto copy = [&] {
+        return std::string(static_cast<const char*>(view),
                            static_cast<std::size_t>(size.QuadPart));
+      };
+      std::string first = copy();
+      between();
+      result = std::pair{std::move(first), copy()};
     }
   }
   return result;
@@ -494,8 +566,11 @@ std::error_code native_io_error() {
 constexpr std::size_t k_max_request = 4096;
 constexpr std::size_t k_max_mapped = 1U << 20;
 
+// With hold set, the helper keeps the view mapped after sending it, waits for
+// a byte on the request pipe, then sends the same view again.
 struct MapRequest {
   std::uint32_t shared;
+  std::uint32_t hold;
   std::uint32_t path_size;
 };
 
@@ -560,11 +635,16 @@ bool write_exactly(int fd, const char* data, std::size_t size) {
                                  : MapReply{.size = size};
     }
     // Copying out of the view is what faults the pages in, here in the helper.
-    const bool sent =
+    bool sent =
         write_exactly(replies, reinterpret_cast<const char*>(&reply),
                       sizeof(reply)) &&
         (view == MAP_FAILED ||
          write_exactly(replies, static_cast<const char*>(view), reply.size));
+    if (sent && view != MAP_FAILED && request.hold != 0) {
+      char go_ahead = 0;
+      sent = read_exactly(requests, &go_ahead, 1) &&
+             write_exactly(replies, static_cast<const char*>(view), reply.size);
+    }
     if (view != MAP_FAILED) {
       ::munmap(view, reply.size);
     }
@@ -615,36 +695,73 @@ FileMapper::~FileMapper() {
   }
 }
 
-std::expected<std::string, std::error_code> FileMapper::map(
+std::unexpected<std::error_code> broken_pipe() {
+  return std::unexpected(std::make_error_code(std::errc::broken_pipe));
+}
+
+// Sends one request to the helper on @a requests and reads back the view it
+// sends first.
+std::expected<std::string, std::error_code> request_map(
+    int requests,
+    int replies,
     const std::filesystem::path& path,
-    Mapping mapping_kind) {
-  const auto broken = [] {
-    return std::unexpected(std::make_error_code(std::errc::broken_pipe));
-  };
+    Mapping mapping_kind,
+    bool hold) {
   const std::string& name = path.native();
   const MapRequest request{
       .shared = mapping_kind == Mapping::shared ? 1U : 0U,
+      .hold = hold ? 1U : 0U,
       .path_size = static_cast<std::uint32_t>(name.size())};
-  if (m_pid <= 0 || name.size() >= k_max_request ||
-      !write_exactly(m_requests, reinterpret_cast<const char*>(&request),
+  if (name.size() >= k_max_request ||
+      !write_exactly(requests, reinterpret_cast<const char*>(&request),
                      sizeof(request)) ||
-      !write_exactly(m_requests, name.data(), name.size())) {
-    return broken();
+      !write_exactly(requests, name.data(), name.size())) {
+    return broken_pipe();
   }
   MapReply reply{};
-  if (!read_exactly(m_replies, reinterpret_cast<char*>(&reply),
-                    sizeof(reply))) {
-    return broken();
+  if (!read_exactly(replies, reinterpret_cast<char*>(&reply), sizeof(reply))) {
+    return broken_pipe();
   }
   if (reply.error != 0) {
     return std::unexpected(
         std::error_code(reply.error, std::system_category()));
   }
   std::string content(reply.size, '\0');
-  if (!read_exactly(m_replies, content.data(), content.size())) {
-    return broken();
+  if (!read_exactly(replies, content.data(), content.size())) {
+    return broken_pipe();
   }
   return content;
+}
+
+std::expected<std::string, std::error_code> FileMapper::map(
+    const std::filesystem::path& path,
+    Mapping mapping_kind) {
+  if (m_pid <= 0) {
+    return broken_pipe();
+  }
+  return request_map(m_requests, m_replies, path, mapping_kind, false);
+}
+
+std::expected<std::pair<std::string, std::string>, std::error_code>
+FileMapper::map_across(const std::filesystem::path& path,
+                       Mapping mapping_kind,
+                       const std::function<void()>& between) {
+  if (m_pid <= 0) {
+    return broken_pipe();
+  }
+  std::expected<std::string, std::error_code> first =
+      request_map(m_requests, m_replies, path, mapping_kind, true);
+  if (!first) {
+    return std::unexpected(first.error());
+  }
+  between();
+  const char go_ahead = 1;
+  std::string second(first->size(), '\0');
+  if (!write_exactly(m_requests, &go_ahead, 1) ||
+      !read_exactly(m_replies, second.data(), second.size())) {
+    return broken_pipe();
+  }
+  return std::pair{std::move(*first), std::move(second)};
 }
 
 #endif
@@ -683,6 +800,13 @@ class FailingReadTree : public makebelieve::DirectoryTree {
       std::size_t /*size*/) const override {
     return stdexec::just(
         std::expected<std::string, std::error_code>(std::unexpected(m_error)));
+  }
+
+  [[nodiscard]] makebelieve::ReadWholeSender read_whole(
+      const std::filesystem::path& /*path*/) const override {
+    return stdexec::just(
+        std::expected<makebelieve::FileContent, std::error_code>(
+            std::unexpected(m_error)));
   }
 
   [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
@@ -731,6 +855,11 @@ class FailingStatusTree : public makebelieve::DirectoryTree {
     return m_inner.read(path, offset, size);
   }
 
+  [[nodiscard]] makebelieve::ReadWholeSender read_whole(
+      const std::filesystem::path& path) const override {
+    return m_inner.read_whole(path);
+  }
+
   [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
       const std::function<void(const makebelieve::DirectoryTreeDiff&)>&
           callback) const override {
@@ -774,6 +903,11 @@ class SettleOnOpenTree : public makebelieve::DirectoryTree {
                                              makebelieve::Offset offset,
                                              std::size_t size) const override {
     return m_inner.read(path, offset, size);
+  }
+
+  [[nodiscard]] makebelieve::ReadWholeSender read_whole(
+      const std::filesystem::path& path) const override {
+    return m_inner.read_whole(path);
   }
 
   [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
@@ -872,6 +1006,28 @@ class ParkingTree : public makebelieve::DirectoryTree {
                                             stdexec::inline_scheduler{}});
   }
 
+  exec::task<std::expected<makebelieve::FileContent, std::error_code>>
+  read_whole_task(std::filesystem::path path) const {
+    if (path.filename().string().starts_with("readpark")) {
+      {
+        const std::lock_guard lock(m_mutex);
+        ++m_parked;
+      }
+      m_changed.notify_all();
+      if (auto error = co_await m_coordinator.wait(m_attempt)) {
+        co_return std::unexpected(error);
+      }
+    }
+    co_return co_await m_inner.read_whole(path);
+  }
+
+  [[nodiscard]] makebelieve::ReadWholeSender read_whole(
+      const std::filesystem::path& path) const override {
+    return stdexec::write_env(read_whole_task(path),
+                              stdexec::prop{stdexec::get_start_scheduler,
+                                            stdexec::inline_scheduler{}});
+  }
+
   [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
       const std::function<void(const makebelieve::DirectoryTreeDiff&)>&
           callback) const override {
@@ -962,6 +1118,13 @@ class InlineStopTree : public makebelieve::DirectoryTree {
     }
     return m_inner.read(path, offset, size);
   }
+  makebelieve::ReadWholeSender read_whole(
+      const std::filesystem::path& path) const override {
+    if (m_read && path == "pending") {
+      return InlineStopSender<makebelieve::FileContent>{&started, m_stopped};
+    }
+    return m_inner.read_whole(path);
+  }
   makebelieve::Subscription subscribe_to_changes(
       const std::function<void(const makebelieve::DirectoryTreeDiff&)>&
           callback) const override {
@@ -1038,6 +1201,11 @@ class GatedOpenTree : public makebelieve::DirectoryTree {
                                              makebelieve::Offset offset,
                                              std::size_t size) const override {
     return m_inner.read(path, offset, size);
+  }
+
+  [[nodiscard]] makebelieve::ReadWholeSender read_whole(
+      const std::filesystem::path& path) const override {
+    return m_inner.read_whole(path);
   }
 
   [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
@@ -1185,12 +1353,15 @@ TEST_F(VirtualFileSystem, ListsEntriesWithTheirKindsSizesAndTimes) {
   EXPECT_EQ(std::filesystem::last_write_time(mountpoint() / "a.txt"), mtime);
   EXPECT_EQ(std::filesystem::last_write_time(mountpoint() / "sub"), mtime);
 
-  // Files advertise that they are read-only on both platforms.
+  // Files advertise that they are read-only on both platforms, and executable,
+  // so that a generated program can be run.
   const auto perms =
       std::filesystem::status(mountpoint() / "a.txt").permissions();
   EXPECT_EQ(perms & std::filesystem::perms::owner_write,
             std::filesystem::perms::none);
   EXPECT_NE(perms & std::filesystem::perms::owner_read,
+            std::filesystem::perms::none);
+  EXPECT_NE(perms & std::filesystem::perms::owner_exec,
             std::filesystem::perms::none);
 }
 
@@ -1716,27 +1887,180 @@ TEST_F(VirtualFileSystem, ReflectsTreeChangesAfterMounting) {
   EXPECT_FALSE(std::filesystem::exists(mountpoint() / "sub" / "new.txt"));
 }
 
-// OpenFile deliberately keeps the path rather than a snapshot, so that a
-// reader holding a file open while the build fills it in sees the result.
-TEST_F(VirtualFileSystem, OpenHandleSeesTheTreeAsItIsNow) {
-  tree().write_file("a.txt", "old");
+// A handle keeps reading the content it opened, however the file changes
+// after, as it would if a build replaced the file on disk: a reader part way
+// through never gets the rest of a different build. Opened afresh, the file is
+// the new content.
+TEST_F(VirtualFileSystem, OpenHandleKeepsTheContentItOpened) {
+  const std::string old_content = large_contents();
+  tree().write_file("a.txt", old_content);
   mount();
   std::ifstream in(mountpoint() / "a.txt", std::ios::binary);
   ASSERT_TRUE(in);
-  ASSERT_EQ(read_rest(in), "old");
+  std::string first_half(old_content.size() / 2, '\0');
+  ASSERT_TRUE(in.read(first_half.data(),
+                      static_cast<std::streamsize>(first_half.size())));
+
+  tree().write_file("a.txt", "new and shorter",
+                    std::chrono::file_clock::now() + 1s);
+  EXPECT_EQ(read_file(mountpoint() / "a.txt"), "new and shorter");
+  EXPECT_TRUE(first_half + read_rest(in) == old_content);
+
+  tree().write_file("a.txt", "NEW AND SHORTER",
+                    std::chrono::file_clock::now() + 2s);
+  EXPECT_EQ(read_file(mountpoint() / "a.txt"), "NEW AND SHORTER");
+  in.clear();
+  in.seekg(0);
+  EXPECT_TRUE(read_rest(in) == old_content);
+}
+
+// What a mapping taken while an earlier version of the file is still mapped
+// sees. On Linux, the new version. On Windows, WinFsp keeps one file node -
+// and so one section - per name, whose pages it cannot drop while any view of
+// them is mapped, so it may be the earlier version still (see COMPAT.md); but
+// always one whole version, never a mix.
+void expect_fresh_mapping(
+    const std::expected<std::string, std::error_code>& mapped,
+    const std::string& old_content,
+    const std::string& new_content) {
+  ASSERT_TRUE(mapped.has_value()) << mapped.error().message();
+#ifdef _WIN32
+  EXPECT_TRUE(*mapped == new_content || *mapped == old_content);
+#else
+  EXPECT_TRUE(*mapped == new_content);
+  static_cast<void>(old_content);
+#endif
+}
+
+// The same for a memory mapping, which on both platforms is served through the
+// kernel's page cache rather than by reads of the handle - so it is the cache
+// that must not change under a mapping when the file does, even once a fresh
+// open has asked for the new content.
+TEST_F(VirtualFileSystem, MappingKeepsTheContentItMapped) {
+  const std::string old_content = large_contents();
+  std::string new_content = old_content;
+  std::ranges::reverse(new_content);
+  tree().write_file("a.bin", old_content);
+  FileMapper mapper;
+  FileMapper fresh;
+  mount();
+
+  for (const Mapping mapping : {Mapping::shared, Mapping::copy_on_write}) {
+    SCOPED_TRACE(mapping == Mapping::shared ? "shared" : "copy-on-write");
+    tree().write_file("a.bin", old_content,
+                      std::chrono::file_clock::now() + 1s);
+    const auto copies = mapper.map_across(mountpoint() / "a.bin", mapping, [&] {
+      tree().write_file("a.bin", new_content,
+                        std::chrono::file_clock::now() + 2s);
+      EXPECT_TRUE(read_file(mountpoint() / "a.bin") == new_content);
+      expect_fresh_mapping(fresh.map(mountpoint() / "a.bin", mapping),
+                           old_content, new_content);
+    });
+    ASSERT_TRUE(copies.has_value()) << copies.error().message();
+    EXPECT_TRUE(copies->first == old_content);
+    EXPECT_TRUE(copies->second == old_content);
+    // With the earlier mapping gone, nothing holds the old version. On Windows
+    // that is only so because FileMapper closes its handle after unmapping its
+    // view: closed while still mapped, as a program loader does, the old pages
+    // could stay until the file next changed.
+    EXPECT_TRUE(fresh.map(mountpoint() / "a.bin", mapping) == new_content);
+  }
+}
+
+#ifdef _WIN32
+// The same, once the mapping's pages have left memory. Windows keeps one
+// section per file, shared by everyone mapping it, and reads a page that has
+// left memory back through the filesystem - so this is where a mapping could
+// be handed a later version of its file, or a mix of two. Forcing pages out
+// takes an elevated process, so elsewhere this is skipped.
+TEST_F(VirtualFileSystem, MappingKeepsItsContentWhenItsPagesAreReadAgain) {
+  const std::string old_content = large_contents();
+  std::string new_content = old_content;
+  std::ranges::reverse(new_content);
+  tree().write_file("a.bin", old_content);
+  FileMapper mapper;
+  FileMapper fresh;
+  mount();
+
+  std::optional<std::string> skipped;
+  const auto copies =
+      mapper.map_across(mountpoint() / "a.bin", Mapping::shared, [&] {
+        tree().write_file("a.bin", new_content,
+                          std::chrono::file_clock::now() + 1s);
+        expect_fresh_mapping(fresh.map(mountpoint() / "a.bin", Mapping::shared),
+                             old_content, new_content);
+        skipped = evict_mapped_pages();
+      });
+  if (skipped) {
+    GTEST_SKIP() << *skipped;
+  }
+  ASSERT_TRUE(copies.has_value()) << copies.error().message();
+  EXPECT_TRUE(copies->first == old_content);
+  EXPECT_TRUE(copies->second == old_content);
+  // With the earlier mapping gone, nothing holds the old version - see above.
+  EXPECT_TRUE(fresh.map(mountpoint() / "a.bin", Mapping::shared) ==
+              new_content);
+}
+#endif
+
+#ifndef _WIN32
+// A handle can be opened again through /proc/self/fd, which opens the very file
+// the handle has rather than looking the name up: that is the content the
+// handle opened, not what the name now holds.
+TEST_F(VirtualFileSystem, ReopeningAHandleThroughProcGetsItsContent) {
+  tree().write_file("a.txt", "old");
+  mount();
+  const int fd = ::open((mountpoint() / "a.txt").c_str(), O_RDONLY | O_CLOEXEC);
+  ASSERT_GE(fd, 0) << std::strerror(errno);
+  const ScopeGuard close_fd([fd] { ::close(fd); });
 
   tree().write_file("a.txt", "new and longer",
                     std::chrono::file_clock::now() + 1s);
-  in.clear();
-  in.seekg(0);
-  EXPECT_EQ(read_rest(in), "new and longer");
-
-  tree().write_file("a.txt", "NEW AND LONGER",
-                    std::chrono::file_clock::now() + 2s);
-  in.clear();
-  in.seekg(0);
-  EXPECT_EQ(read_rest(in), "NEW AND LONGER");
+  EXPECT_EQ(read_file(mountpoint() / "a.txt"), "new and longer");
+  EXPECT_EQ(read_file("/proc/self/fd/" + std::to_string(fd)), "old");
 }
+
+// Running a file that an open settles, as a build does, must work every time.
+// The open that settles it also queues the announcement of that change, and
+// announcing a change on Linux means opening the file for writing through the
+// mount - while the kernel refuses to run a file that is open for writing. So
+// the announcement may never overlap the run. Each round is one chance to lose
+// that race.
+TEST_F(VirtualFileSystem, RunsAFileAsItIsSettled) {
+  constexpr int k_rounds = 30;
+  for (int i = 0; i < k_rounds; ++i) {
+    tree().write_file("run" + std::to_string(i), "x");
+  }
+  const SettleOnOpenTree settling(tree(), "#!/bin/sh\nexit 0\n");
+  const makebelieve::VirtualFileSystem vfs(settling, mountpoint(), notifier());
+
+  constexpr int k_text_file_busy = 100;
+  int busy = 0;
+  std::vector<int> others;
+  for (int i = 0; i < k_rounds; ++i) {
+    // Prepared before the fork: the child of a threaded process must not
+    // allocate.
+    const std::string program = mountpoint() / ("run" + std::to_string(i));
+    const pid_t pid = ::fork();
+    ASSERT_GE(pid, 0) << std::strerror(errno);
+    if (pid == 0) {
+      ::execl(program.c_str(), program.c_str(), nullptr);
+      ::_exit(errno == ETXTBSY ? k_text_file_busy : 101);
+    }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == k_text_file_busy) {
+      ++busy;
+    } else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      others.push_back(status);
+    }
+  }
+  EXPECT_EQ(busy, 0) << "rounds out of " << k_rounds
+                     << " failed with 'Text file busy'";
+  EXPECT_TRUE(others.empty()) << testing::PrintToString(others);
+}
+#endif
 
 // --- Change notifications --------------------------------------------------
 
@@ -1845,6 +2169,8 @@ TEST_F(VirtualFileSystem, NotifiesWhenAFileIsRemoved) {
   EXPECT_TRUE(watcher.wait_for("a.txt", Change::removed));
 }
 
+// A handle outlives its file being removed, the kernel forgetting it and a new
+// file taking its name - and still reads the content it opened.
 TEST_F(VirtualFileSystem, OpenHandleSurvivesEntryRecreation) {
   tree().write_file("recreated.txt", "old");
   mount();
@@ -1858,7 +2184,7 @@ TEST_F(VirtualFileSystem, OpenHandleSurvivesEntryRecreation) {
   ASSERT_EQ(read_file(mountpoint() / "recreated.txt"), "new contents");
   reader.clear();
   reader.seekg(0);
-  EXPECT_EQ(read_rest(reader), "new contents");
+  EXPECT_EQ(read_rest(reader), "old");
 }
 
 // --- Concurrency and teardown ----------------------------------------------

@@ -13,6 +13,7 @@
 #include <expected>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -47,6 +48,15 @@ struct FileInfo {
 /// Describes a directory in a DirectoryTree.
 struct DirectoryInfo {
   std::chrono::file_clock::time_point mtime;
+};
+
+/// \class FileContent
+/// The whole of a file, and what it was when read, taken as one.
+struct FileContent {
+  /// Never changes, and shared so that a tree holding its files in memory can
+  /// hand one out without copying it.
+  std::shared_ptr<const std::string> bytes;
+  FileInfo info;
 };
 
 /// \class EntryInfo
@@ -145,6 +155,9 @@ using OpenSender = FileSender<FileInfo>;
 /// An asynchronous read yielding file bytes or an error.
 using ReadSender = FileSender<std::string>;
 
+/// An asynchronous read of a whole file yielding its content or an error.
+using ReadWholeSender = FileSender<FileContent>;
+
 /// @class DirectoryTree
 /// An abstract base class to describe an observable directory tree.
 class DirectoryTree {
@@ -179,6 +192,16 @@ class DirectoryTree {
   [[nodiscard]] virtual ReadSender read(const std::filesystem::path& path,
                                         Offset offset,
                                         std::size_t size) const = 0;
+
+  /// Returns the whole of the file at @a path and what it was when read, the
+  /// two taken as one: never bytes, or a size or time, from two versions of
+  /// the file. Fails as read() does, and with `is_a_directory` for a
+  /// directory. Await @link open first for final contents. Waiting
+  /// implementations suspend without occupying a dispatcher thread.
+  /// Cancellation comes from the receiver's stop token. Completion follows the
+  /// @link FileSender threading contract.
+  [[nodiscard]] virtual ReadWholeSender read_whole(
+      const std::filesystem::path& path) const = 0;
 
   /// Subscribes to changes in this object by calling @a callback and returns an
   /// RAII guard that will unsubscribe on destruction.

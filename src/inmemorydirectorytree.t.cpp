@@ -4,12 +4,14 @@
 #include "directorytreeutil.hpp"
 
 #include <gtest/gtest.h>
+#include <stdexec/execution.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <expected>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -590,3 +592,50 @@ TEST_F(InMemoryDirectoryTree, ConcurrentReadersAndWritersStayConsistent) {
 }
 
 }  // namespace
+
+namespace {
+
+std::expected<makebelieve::FileContent, std::error_code> read_whole(
+    const makebelieve::DirectoryTree& tree,
+    const std::filesystem::path& path) {
+  auto result = stdexec::sync_wait(tree.read_whole(path));
+  return std::get<0>(std::move(result).value());
+}
+
+}  // namespace
+
+// A file's content and info come as one, and are the tree's own content
+// rather than a copy of it: taking a file whole shares its buffer.
+TEST_F(InMemoryDirectoryTree, ReadWholeSharesTheFilesContent) {
+  const auto mtime = std::chrono::file_clock::now();
+  tree().write_file("whole.txt", "whole", mtime);
+  const auto first = read_whole(tree(), "whole.txt");
+  const auto second = read_whole(tree(), "whole.txt");
+  ASSERT_TRUE(first.has_value()) << first.error().message();
+  ASSERT_TRUE(second.has_value()) << second.error().message();
+  EXPECT_EQ(*first->bytes, "whole");
+  EXPECT_EQ(first->info.size, 5U);
+  EXPECT_EQ(first->info.mtime, mtime);
+  EXPECT_EQ(first->bytes, second->bytes);
+}
+
+// Writing a file replaces its content rather than changing it, so content
+// already taken is left as it was.
+TEST_F(InMemoryDirectoryTree, ReadWholeContentOutlivesAWrite) {
+  const auto before = read_whole(tree(), "hello.txt");
+  tree().write_file("hello.txt", "goodbye");
+  const auto after = read_whole(tree(), "hello.txt");
+  ASSERT_TRUE(before.has_value());
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(*before->bytes, "hello world");
+  EXPECT_EQ(*after->bytes, "goodbye");
+  EXPECT_EQ(after->info.size, 7U);
+}
+
+TEST_F(InMemoryDirectoryTree, ReadWholeFailsAsReadDoes) {
+  EXPECT_EQ(read_whole(tree(), "missing.txt").error(),
+            std::errc::no_such_file_or_directory);
+  EXPECT_EQ(read_whole(tree(), "sub").error(), std::errc::is_a_directory);
+  EXPECT_EQ(read_whole(tree(), "../escape.txt").error(),
+            std::errc::no_such_file_or_directory);
+}

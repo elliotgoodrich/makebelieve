@@ -62,6 +62,14 @@ class RealDirectoryTree : public DirectoryTree {
                                 Offset offset,
                                 std::size_t size) const override;
 
+  /// Returns the whole of @a path, read through one handle, with the size and
+  /// time that handle reports. Something outside the tree may be writing the
+  /// file meanwhile: if the handle reports a different size or time after the
+  /// read than before it, the file is read again, a few times, and then handed
+  /// out as last read.
+  [[nodiscard]] ReadWholeSender read_whole(
+      const std::filesystem::path& path) const override;
+
   /// Subscribes to changes in this object by calling @a callback and returns an
   /// RAII guard that will unsubscribe on destruction. Changes made once this
   /// returns are reported.

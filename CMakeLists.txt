@@ -171,4 +171,17 @@ if(BUILD_TESTING)
       -DJOBS_AFTER_MOUNTPOINT=ON
       -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_dependency_test.cmake")
   set_tests_properties(makebelieve_dependencies_jobs_after_mountpoint PROPERTIES TIMEOUT 300)
+
+  # Outputs run as programs rather than read
+  add_executable(makebelieve_hello integration/executable/hello.m.cpp)
+  makebelieve_apply_clang_tidy(makebelieve_hello)
+  add_test(NAME makebelieve_executable
+    COMMAND "${CMAKE_COMMAND}"
+      "-DMAKEBELIEVE_EXE=$<TARGET_FILE:makebelieve>"
+      "-DHELLO_EXE=$<TARGET_FILE:makebelieve_hello>"
+      "-DREPLACEMENT_EXE=${CMAKE_COMMAND}"
+      "-DFIXTURE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/integration/executable"
+      "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/integration/executable-work"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_executable_test.cmake")
+  set_tests_properties(makebelieve_executable PROPERTIES TIMEOUT 300)
 endif()

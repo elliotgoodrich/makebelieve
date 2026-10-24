@@ -2,6 +2,7 @@
 #include "virtualfilesystem.hpp"
 
 #include "directorytree.hpp"
+#include "filesnapshots.hpp"
 #include "filesystemutil.hpp"
 #include "iocontext.hpp"
 #include "processinfo.hpp"
@@ -24,6 +25,7 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -130,6 +132,15 @@ TraceProcess calling_process(std::uint32_t thread) {
                       : ProcessInfo::name_of(process)};
 }
 
+// The mode every file is served with: read-only, and executable so that a
+// generated program can be run. The kernel checks the execute bit before it
+// opens a file, so it must be there before we know what a build will produce.
+constexpr mode_t k_file_mode = S_IFREG | 0555;
+
+bool same(const FileInfo& a, const FileInfo& b) {
+  return a.size == b.size && a.mtime == b.mtime;
+}
+
 // Converts an EntryInfo mtime to the timespec a struct stat carries.
 timespec to_timespec(std::chrono::file_clock::time_point time) {
   const auto system_time =
@@ -197,6 +208,9 @@ class VirtualFileSystem::Impl {
   mutable TraceLanePool m_reader_lanes{"reader"};
 
   const DirectoryTree& m_tree;
+  // What every open reads from: the version of its file it opened, which a
+  // later change to the file leaves alone.
+  FileSnapshots m_snapshots;
   std::filesystem::path m_mountpoint;
 
   // Where notifier passes run.
@@ -209,17 +223,31 @@ class VirtualFileSystem::Impl {
   struct FileHandle {
     std::filesystem::path path;
     std::vector<std::string> names;
+    // Set for a file opened to be read, and what all its reads are served
+    // from.
+    std::shared_ptr<const FileSnapshot> snapshot;
   };
   // Unmount may discard kernel handles without sending release callbacks.
   std::mutex m_handle_mutex;
   std::uint64_t m_last_handle = 0;
   std::unordered_map<std::uint64_t, std::unique_ptr<FileHandle>> m_handles;
+  // Each name's inode as of its latest lookup. A file's inode becomes one
+  // version of it once an open has read it, as a file a build replaces on disk
+  // is: when the file moves on, its name gets a new inode, and the old one
+  // serves its version to whoever still has it - a running program, a mapping,
+  // a reader part way through - until the kernel forgets it.
   std::mutex m_inode_mutex;
   std::unordered_map<std::filesystem::path, fuse_ino_t> m_ids{
       {{}, FUSE_ROOT_ID}};
   struct Node {
     std::filesystem::path path;
     std::uint64_t lookups = 0;
+    // Set by the first open to read the file, fixing which version this inode
+    // is: its attributes, its generation, and while anyone holds it, its
+    // content.
+    std::optional<FileInfo> opened;
+    std::uint64_t generation = 0;
+    std::weak_ptr<const FileSnapshot> snapshot;
   };
   std::unordered_map<fuse_ino_t, Node> m_paths{
       {FUSE_ROOT_ID, Node{.path = {}, .lookups = 1}}};
@@ -262,6 +290,20 @@ class VirtualFileSystem::Impl {
   bool m_everything_dirty = false;
   bool m_stopping = false;
   bool m_notifying = false;
+
+  // The newest generation of each file the notifier has announced, and of
+  // every file at once, for an "everything changed".
+  std::unordered_map<std::filesystem::path, std::uint64_t> m_announced;
+  std::uint64_t m_announced_everything = 0;
+
+  // Replies to opens held back until a generation of their file has been
+  // announced (see reply_when_announced()).
+  struct HeldOpen {
+    std::filesystem::path path;
+    std::uint64_t generation;
+    std::move_only_function<void()> reply;
+  };
+  std::vector<HeldOpen> m_held_opens;
 
   // gettid() of the thread running a notifier pass, and 0 between passes,
   // which is never a valid tid.
@@ -338,6 +380,16 @@ class VirtualFileSystem::Impl {
     }
     stdexec::sync_wait(m_notifications.join());
 
+    // Nothing more will be announced, so nothing more is worth waiting for.
+    std::vector<HeldOpen> held;
+    {
+      const std::lock_guard<std::mutex> lock(m_notify_mutex);
+      held = std::exchange(m_held_opens, {});
+    }
+    for (HeldOpen& open : held) {
+      open.reply();
+    }
+
     if (m_fuse != nullptr) {
       m_request_stop.request_stop();
       stdexec::sync_wait(m_requests.join());
@@ -374,6 +426,7 @@ class VirtualFileSystem::Impl {
       // as the mount lives, by which time the process's working directory may
       // have moved on from whatever made a relative path meaningful.
       : m_tree(tree),
+        m_snapshots(tree),
         m_mountpoint(std::filesystem::absolute(mountpoint)),
         m_scheduler(scheduler) {
     create_mountpoint(m_mountpoint);
@@ -408,21 +461,67 @@ class VirtualFileSystem::Impl {
       conn->want &= ~FUSE_CAP_EXPLICIT_INVAL_DATA;
     }
   }
-  // Lookup references belong to the kernel. Open handles own their path
-  // separately, so forgetting a lookup never invalidates an existing handle.
-  fuse_ino_t inode(const std::filesystem::path& name) {
+  // The inode @a name is now, given what it is now: @a file for a file, empty
+  // for a directory. Its inode so far, unless an open has fixed that to a
+  // version of the file it has since moved on from.
+  //
+  // Lookup references belong to the kernel. Open handles own their path and
+  // content separately, so forgetting a lookup never invalidates an existing
+  // handle.
+  fuse_ino_t inode(const std::filesystem::path& name,
+                   const std::optional<FileInfo>& file) {
+    const std::uint64_t generation = file ? m_snapshots.generation(name) : 0;
     const std::lock_guard lock(m_inode_mutex);
-    auto [it, inserted] = m_ids.try_emplace(name, m_next_inode + 1);
-    if (inserted) {
-      try {
-        m_paths.emplace(++m_next_inode, Node{.path = name});
-      } catch (...) {
-        m_ids.erase(it);
-        throw;
+    if (const auto it = m_ids.find(name); it != m_ids.end()) {
+      Node& node = m_paths.at(it->second);
+      if (!node.opened || (file && node.generation == generation &&
+                           same(*node.opened, *file))) {
+        ++node.lookups;
+        return it->second;
       }
     }
-    ++m_paths.at(it->second).lookups;
-    return it->second;
+    const fuse_ino_t id = m_next_inode + 1;
+    m_paths.emplace(id, Node{.path = name, .lookups = 1});
+    try {
+      m_ids.insert_or_assign(name, id);
+    } catch (...) {
+      m_paths.erase(id);
+      throw;
+    }
+    m_next_inode = id;
+    return id;
+  }
+
+  // The version of its file an open of @a ino serves, given that @a current
+  // is the file as the open found it - or null if the inode's version is gone.
+  // The first open fixes the version: whatever the file is by then, which for
+  // a file being built is the build that open waited for. Later ones get that
+  // same version: an open the kernel makes of this inode rather than by name
+  // (reopening /proc/self/fd/N, say), or a lookup that raced a change.
+  std::shared_ptr<const FileSnapshot> version_for(
+      fuse_ino_t ino,
+      std::shared_ptr<const FileSnapshot> current) {
+    const std::lock_guard lock(m_inode_mutex);
+    const auto found = m_paths.find(ino);
+    if (found == m_paths.end()) {
+      return current;
+    }
+    Node& node = found->second;
+    if (!node.opened) {
+      node.opened = current->info();
+      node.generation = current->generation;
+      node.snapshot = current;
+      return current;
+    }
+    if (std::shared_ptr<const FileSnapshot> held = node.snapshot.lock()) {
+      return held;
+    }
+    if (node.generation == current->generation &&
+        same(*node.opened, current->info())) {
+      node.snapshot = current;
+      return current;
+    }
+    return nullptr;
   }
   std::filesystem::path path(fuse_ino_t ino) {
     const std::lock_guard lock(m_inode_mutex);
@@ -438,7 +537,11 @@ class VirtualFileSystem::Impl {
     }
     found->second.lookups -= std::min(count, found->second.lookups);
     if (found->second.lookups == 0) {
-      m_ids.erase(found->second.path);
+      // The name may have a newer inode by now, which stays.
+      if (const auto it = m_ids.find(found->second.path);
+          it != m_ids.end() && it->second == ino) {
+        m_ids.erase(it);
+      }
       m_paths.erase(found);
     }
   }
@@ -460,6 +563,11 @@ class VirtualFileSystem::Impl {
     const std::lock_guard lock(m_handle_mutex);
     return *m_handles.at(handle);
   }
+  std::shared_ptr<const FileSnapshot> snapshot_of(std::uint64_t handle) {
+    const std::lock_guard lock(m_handle_mutex);
+    const auto it = m_handles.find(handle);
+    return it != m_handles.end() ? it->second->snapshot : nullptr;
+  }
   // May run after fuse_reply_open has consumed the request. Never unwind into
   // the bridge and cause a second reply if cleanup cannot take its lock.
   void drop(std::uint64_t handle) noexcept {
@@ -470,9 +578,22 @@ class VirtualFileSystem::Impl {
     drop(info->fh);
     fuse_reply_err(req, 0);
   }
+  static void file_attributes(const FileInfo& file, struct stat* out) {
+    std::memset(out, 0, sizeof(*out));
+    out->st_mode = k_file_mode;
+    out->st_nlink = 1;
+    out->st_size = static_cast<off_t>(file.size);
+    const timespec time = to_timespec(file.mtime);
+    out->st_atim = time;
+    out->st_mtim = time;
+    out->st_ctim = time;
+  }
+  // The attributes of @a relative as the tree has it, and in @a file, what it
+  // is if a file.
   int attributes(fuse_req_t req,
                  const std::filesystem::path& relative,
-                 struct stat* out) {
+                 struct stat* out,
+                 std::optional<FileInfo>* file = nullptr) {
     std::memset(out, 0, sizeof(*out));
     const Pretence pretence =
         is_self_request(req) ? pretence_for(relative) : Pretence::none;
@@ -488,7 +609,7 @@ class VirtualFileSystem::Impl {
       // attributes - a size of 0 - would be what everyone else read too.
       switch (pretence) {
         case Pretence::present_file:
-          out->st_mode = S_IFREG | 0444;
+          out->st_mode = k_file_mode;
           out->st_nlink = 1;
           return 0;
         case Pretence::present_directory:
@@ -503,14 +624,11 @@ class VirtualFileSystem::Impl {
     // Every watch starts with a lookup, and entry caching is off, so every such
     // lookup lands here.
     remember(relative, std::holds_alternative<DirectoryInfo>(*status));
-    if (const auto* file = std::get_if<FileInfo>(&*status)) {
-      out->st_mode = S_IFREG | 0444;
-      out->st_nlink = 1;
-      out->st_size = static_cast<off_t>(file->size);
-      const timespec time = to_timespec(file->mtime);
-      out->st_atim = time;
-      out->st_mtim = time;
-      out->st_ctim = time;
+    if (const auto* info = std::get_if<FileInfo>(&*status)) {
+      file_attributes(*info, out);
+      if (file != nullptr) {
+        *file = *info;
+      }
       return 0;
     }
 
@@ -528,12 +646,13 @@ class VirtualFileSystem::Impl {
              const std::filesystem::path& name,
              fuse_file_info* fi = nullptr) {
     fuse_entry_param value{};
-    const int error = attributes(req, name, &value.attr);
+    std::optional<FileInfo> file;
+    const int error = attributes(req, name, &value.attr, &file);
     if (error) {
       fuse_reply_err(req, -error);
       return;
     }
-    value.ino = inode(name);
+    value.ino = inode(name, file);
     value.generation = 1;
     value.attr.st_ino = value.ino;
     const int replied =
@@ -545,8 +664,28 @@ class VirtualFileSystem::Impl {
   void lookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
     entry(req, path(parent) / name);
   }
+  // The version of the file an inode or handle is fixed to, if it is, or
+  // otherwise the tree as it is now.
   void getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info* handle) {
     struct stat value {};
+    std::optional<FileInfo> fixed;
+    if (handle && handle->fh) {
+      if (const auto snapshot = snapshot_of(handle->fh)) {
+        fixed = snapshot->info();
+      }
+    }
+    if (!fixed) {
+      const std::lock_guard lock(m_inode_mutex);
+      if (const auto it = m_paths.find(ino); it != m_paths.end()) {
+        fixed = it->second.opened;
+      }
+    }
+    if (fixed) {
+      file_attributes(*fixed, &value);
+      value.st_ino = ino;
+      fuse_reply_attr(req, &value, 0);
+      return;
+    }
     const auto name =
         handle && handle->fh ? file_handle(handle->fh).path : path(ino);
     const int error = attributes(req, name, &value);
@@ -604,7 +743,11 @@ class VirtualFileSystem::Impl {
       return std::exchange(req, nullptr);
     }
   };
+  // Opens @a ino, named @a name, to be read: waits for the tree to settle the
+  // file, takes the version of it this inode serves, and replies once that
+  // version has been announced.
   exec::task<void> open_file(std::shared_ptr<Request> request,
+                             fuse_ino_t ino,
                              std::filesystem::path name,
                              fuse_file_info info,
                              std::uint32_t caller) {
@@ -613,19 +756,39 @@ class VirtualFileSystem::Impl {
       trace.open(m_reader_lanes, calling_process(caller), name);
     }
     try {
-      auto handle = std::make_unique<FileHandle>(FileHandle{.path = name});
+      const stdexec::prop stop{stdexec::get_stop_token,
+                               request->stop.get_token()};
       auto opened = co_await stdexec::write_env(
           m_tree.open(name, OpenContext{.requester_pid = caller,
                                         .trace_lane = trace.lane()}),
-          stdexec::prop{stdexec::get_stop_token, request->stop.get_token()});
+          stop);
       if (!opened) {
         request->reply_error(to_errno(opened.error()));
-      } else {
-        info.fh = retain(std::move(handle));
-        if (fuse_reply_open(request->take(), &info) != 0) {
-          drop(info.fh);
-        }
+        co_return;
       }
+      auto current = co_await stdexec::write_env(m_snapshots.take(name), stop);
+      if (!current) {
+        request->reply_error(to_errno(current.error()));
+        co_return;
+      }
+      std::shared_ptr<const FileSnapshot> version =
+          version_for(ino, std::move(*current));
+      if (!version) {
+        // The kernel takes this to mean its idea of the name is out of date,
+        // and looks the name up again - finding the file's new inode - before
+        // trying the open once more.
+        request->reply_error(ESTALE);
+        co_return;
+      }
+      const std::uint64_t generation = version->generation;
+      info.fh = retain(std::make_unique<FileHandle>(
+          FileHandle{.path = name, .snapshot = std::move(version)}));
+      reply_when_announced(name, generation,
+                           [this, request, info]() mutable noexcept {
+                             if (fuse_reply_open(request->take(), &info) != 0) {
+                               drop(info.fh);
+                             }
+                           });
     } catch (...) {
       request->reply_error(EIO);
     }
@@ -647,8 +810,9 @@ class VirtualFileSystem::Impl {
     // reply.
     try {
       stdexec::spawn(
-          stdexec::starts_on(m_file_io.get_scheduler(),
-                             open_file(request, std::move(name), *fi, caller)) |
+          stdexec::starts_on(
+              m_file_io.get_scheduler(),
+              open_file(request, ino, std::move(name), *fi, caller)) |
               stdexec::upon_error([](const std::exception_ptr&) noexcept {}),
           m_requests.get_token());
     } catch (...) {
@@ -681,6 +845,16 @@ class VirtualFileSystem::Impl {
             off_t offset,
             fuse_file_info* info) {
     // NOLINTEND(bugprone-easily-swappable-parameters)
+    if (info->fh) {
+      if (const auto snapshot = snapshot_of(info->fh)) {
+        const std::string& content = snapshot->content();
+        const std::size_t start =
+            std::min(content.size(), static_cast<std::size_t>(offset));
+        fuse_reply_buf(req, content.data() + start,
+                       std::min(size, content.size() - start));
+        return;
+      }
+    }
     auto name = info->fh ? file_handle(info->fh).path : path(ino);
     auto request = std::make_shared<Request>(req, m_request_stop.get_token());
     try {
@@ -844,6 +1018,9 @@ class VirtualFileSystem::Impl {
   // stall that thread and its own event queue is what overflows.
   void on_tree_changed(const DirectoryTreeDiff& diff) {
     const std::lock_guard<std::mutex> lock(m_notify_mutex);
+    // Under the same lock as the queueing below, so that every generation
+    // there is of a file is either announced or on its way to it.
+    m_snapshots.changed(diff);
     if (m_stopping) {
       return;
     }
@@ -866,6 +1043,62 @@ class VirtualFileSystem::Impl {
       merge_changes(m_pending, changes);
     }
     start_notifying();
+  }
+
+  // The newest generation of @a path announced so far.
+  // @pre m_notify_mutex is held.
+  [[nodiscard]] std::uint64_t announced(
+      const std::filesystem::path& path) const {
+    const auto it = m_announced.find(path);
+    return std::max(m_announced_everything,
+                    it != m_announced.end() ? it->second : 0);
+  }
+
+  // Calls @a reply, to an open of generation @a generation of @a path, now -
+  // or once the notifier has announced that generation, if it has yet to.
+  // Announcing a change opens the file for writing through the mount (see
+  // poke()), and the kernel refuses to run a file that is open for writing,
+  // so a program started from this open must not overlap that write. The wait
+  // always ends: every generation comes from a change that queued its
+  // announcement under the same lock.
+  void reply_when_announced(const std::filesystem::path& path,
+                            std::uint64_t generation,
+                            std::move_only_function<void()> reply) {
+    {
+      const std::lock_guard<std::mutex> lock(m_notify_mutex);
+      if (!m_stopping && generation > announced(path)) {
+        m_held_opens.push_back({.path = path,
+                                .generation = generation,
+                                .reply = std::move(reply)});
+        start_notifying();
+        return;
+      }
+    }
+    reply();
+  }
+
+  // Records that the notifier has announced generation @a generation of
+  // @a path, or of everything if @a path is empty, and takes the held opens
+  // that were waiting for it.
+  // @pre m_notify_mutex is held.
+  std::vector<HeldOpen> mark_announced(
+      const std::optional<std::filesystem::path>& path,
+      std::uint64_t generation) {
+    if (path) {
+      std::uint64_t& announced_so_far = m_announced[*path];
+      announced_so_far = std::max(announced_so_far, generation);
+    } else {
+      m_announced_everything = std::max(m_announced_everything, generation);
+    }
+    std::vector<HeldOpen> ready;
+    std::erase_if(m_held_opens, [&](HeldOpen& open) {
+      if (open.generation > announced(open.path)) {
+        return false;
+      }
+      ready.push_back(std::move(open));
+      return true;
+    });
+    return ready;
   }
 
   // Starts a pass announcing the queued changes, unless one is under way or we
@@ -900,7 +1133,9 @@ class VirtualFileSystem::Impl {
     try {
       while (!m_stopping && (m_everything_dirty || !m_pending.empty())) {
         Changes batch;
+        std::optional<std::uint64_t> everything;
         if (m_everything_dirty) {
+          everything = m_snapshots.latest();
           // The tree lost track of what changed, so everything we have handed
           // out could be stale. Announce the paths we know the kernel has seen
           // rather than walking the mount: an enumeration of our own
@@ -915,14 +1150,36 @@ class VirtualFileSystem::Impl {
         } else {
           batch = std::exchange(m_pending, {});
         }
+        // What each announcement covers: every change to a path moved its
+        // generation on before queueing it, under this lock.
+        std::unordered_map<std::filesystem::path, std::uint64_t> generations;
+        for (const auto& [path, kind] : batch) {
+          generations.emplace(path, m_snapshots.generation(path));
+        }
 
         // Unlocked for the announcements themselves, so a change arriving
         // mid-batch simply queues up for the next round.
         lock.unlock();
         for (const auto& [path, kind] : batch) {
           announce(path, kind);
+          lock.lock();
+          std::vector<HeldOpen> ready =
+              mark_announced(path, generations.at(path));
+          lock.unlock();
+          for (HeldOpen& open : ready) {
+            open.reply();
+          }
         }
         lock.lock();
+        if (everything) {
+          std::vector<HeldOpen> ready =
+              mark_announced(std::nullopt, *everything);
+          lock.unlock();
+          for (HeldOpen& open : ready) {
+            open.reply();
+          }
+          lock.lock();
+        }
       }
     } catch (...) {  // NOLINT(bugprone-empty-catch)
       if (!lock.owns_lock()) {
@@ -930,9 +1187,18 @@ class VirtualFileSystem::Impl {
       }
     }
 
+    // Every change queued by now has been announced, so nothing should still
+    // be held; anything that is - its announcement lost to a failure above -
+    // waits no longer.
+    std::vector<HeldOpen> held = std::exchange(m_held_opens, {});
+
     // Released before the next pass can start, which only this lets happen.
     m_notifier_tid.store(0, std::memory_order_relaxed);
     m_notifying = false;
+    lock.unlock();
+    for (HeldOpen& open : held) {
+      open.reply();
+    }
   }
 
   // Makes the kernel raise the inotify event that describes one change. FUSE
@@ -968,7 +1234,7 @@ class VirtualFileSystem::Impl {
     if (is_directory) {
       static_cast<void>(::mkdir(mounted.c_str(), 0555));
     } else {
-      static_cast<void>(::mknod(mounted.c_str(), S_IFREG | 0444, 0));
+      static_cast<void>(::mknod(mounted.c_str(), k_file_mode, 0));
     }
     pretend(path, Pretence::none);
     remember(path, is_directory);

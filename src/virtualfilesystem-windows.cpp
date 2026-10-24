@@ -2,6 +2,7 @@
 #include "virtualfilesystem.hpp"
 
 #include "directorytree.hpp"
+#include "filesnapshots.hpp"
 #include "iocontext.hpp"
 #include "processinfo.hpp"
 #include "tracer.hpp"
@@ -454,6 +455,7 @@ class VirtualFileSystem::Impl {
        exec::static_thread_pool::scheduler scheduler,
        Unstarted)
       : m_tree(tree),
+        m_snapshots(tree),
         m_mountpoint(normalize_mountpoint(mountpoint)),
         m_root(m_mountpoint.wstring()),
         m_scheduler(scheduler) {
@@ -510,6 +512,11 @@ class VirtualFileSystem::Impl {
   // opened - which is the whole point of a build that fills the file in later.
   struct OpenFile {
     std::filesystem::path path;
+
+    // Set once an open to read the file completes, and what its reads - and
+    // the paging reads of a mapping or running program made through it - are
+    // served from, however the file changes after.
+    std::shared_ptr<const FileSnapshot> snapshot;
 
     // WinFsp's directory buffer: filled on the first ReadDirectory for this
     // handle, then read back from in sorted, resumable order.
@@ -732,7 +739,7 @@ class VirtualFileSystem::Impl {
       pending->unopened = handle;
       stdexec::spawn(
           stdexec::starts_on(self->m_file_io.get_scheduler(),
-                             self->finish_open(pending, handle->path, caller)) |
+                             self->finish_open(pending, handle, caller)) |
               stdexec::upon_error([](std::exception_ptr) noexcept {}),
           self->m_requests.get_token());
       return STATUS_PENDING;
@@ -745,23 +752,33 @@ class VirtualFileSystem::Impl {
     }
   }
   exec::task<void> finish_open(std::shared_ptr<PendingResponse> pending,
-                               std::filesystem::path path,
+                               OpenFile* handle,
                                std::uint32_t caller) {
+    // Owned by the pending response until it replies, which is below.
+    const std::filesystem::path path = handle->path;
     TraceAsyncScope trace;
     if (g_tracer) {
       trace.open(m_reader_lanes, calling_process(caller), path);
     }
     try {
+      const stdexec::prop stop{stdexec::get_stop_token,
+                               m_request_stop.get_token()};
       auto result = co_await stdexec::write_env(
           m_tree.open(path, OpenContext{.requester_pid = caller,
                                         .trace_lane = trace.lane()}),
-          stdexec::prop{stdexec::get_stop_token, m_request_stop.get_token()});
+          stop);
       if (!result) {
         pending->send(to_ntstatus(result.error()));
         co_return;
       }
+      auto snapshot = co_await stdexec::write_env(m_snapshots.take(path), stop);
+      if (!snapshot) {
+        pending->send(to_ntstatus(snapshot.error()));
+        co_return;
+      }
       pending->storage.get()->Rsp.Create.Opened.FileInfo =
-          make_file_info(*result);
+          make_file_info((*snapshot)->info());
+      handle->snapshot = std::move(*snapshot);
       pending->send(STATUS_SUCCESS);
     } catch (const std::system_error& e) {
       pending->send(to_ntstatus(e.code()));
@@ -821,11 +838,21 @@ class VirtualFileSystem::Impl {
                 UINT64 offset,
                 ULONG length,
                 PULONG bytes_transferred) {
-    static_cast<void>(bytes_transferred);
     auto* response = FspFileSystemGetOperationContext()->Response;
+    const auto* handle = static_cast<const OpenFile*>(file_context);
+    if (handle->snapshot) {
+      const std::string& content = handle->snapshot->content();
+      if (offset >= content.size()) {
+        return STATUS_END_OF_FILE;
+      }
+      const auto count =
+          static_cast<ULONG>(std::min<UINT64>(length, content.size() - offset));
+      std::memcpy(buffer, content.data() + offset, count);
+      *bytes_transferred = count;
+      return STATUS_SUCCESS;
+    }
     auto pending = std::make_shared<PendingResponse>(*this, *response);
     try {
-      const auto* handle = static_cast<const OpenFile*>(file_context);
       stdexec::spawn(
           stdexec::starts_on(
               m_file_io.get_scheduler(),
@@ -868,6 +895,10 @@ class VirtualFileSystem::Impl {
   // 0, so Windows asks every time rather than trusting a cached answer.
   NTSTATUS get_file_info(PVOID file_context, FSP_FSCTL_FILE_INFO* file_info) {
     const auto* handle = static_cast<const OpenFile*>(file_context);
+    if (handle->snapshot) {
+      *file_info = make_file_info(handle->snapshot->info());
+      return STATUS_SUCCESS;
+    }
     const std::expected<EntryInfo, std::error_code> status =
         m_tree.status(handle->path);
     if (!status.has_value()) {
@@ -976,6 +1007,7 @@ class VirtualFileSystem::Impl {
   // the filesystem call into WinFsp in the middle of servicing a WinFsp
   // request. Handing it to the notifier defers it until read() has returned.
   void on_tree_changed(const DirectoryTreeDiff& diff) {
+    m_snapshots.changed(diff);
     const std::lock_guard<std::mutex> lock(m_notify_mutex);
     if (m_stopping) {
       return;
@@ -1199,6 +1231,9 @@ class VirtualFileSystem::Impl {
   mutable TraceLanePool m_reader_lanes{"reader"};
 
   const DirectoryTree& m_tree;
+  // What every open to read reads from: the version of its file it opened,
+  // which a later change to the file leaves alone.
+  FileSnapshots m_snapshots;
   const std::filesystem::path m_mountpoint;
 
   // The mount point as WinFsp wants it: its own buffer, because
