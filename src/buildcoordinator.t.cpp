@@ -136,7 +136,7 @@ class CountingQueue {
   explicit CountingQueue(Queue& queue) : m_queue(&queue) {}
 
   template <class MakeWork>
-  auto schedule_leased(MakeWork make) {
+  auto schedule_leased(MakeWork make, QueueTicket* ticket) {
     return m_queue->schedule_leased(
         [this, make = std::move(make)](auto& lease) mutable {
           using Lease = std::remove_reference_t<decltype(lease)>;
@@ -144,8 +144,11 @@ class CountingQueue {
                  ex::let_value([&make](CountingLease<Lease>& counting) {
                    return make(counting);
                  });
-        });
+        },
+        ticket);
   }
+
+  void promote(QueueTicket& ticket) { m_queue->promote(ticket); }
 };
 
 // Fake commands, each a little script run on threads of its own:
@@ -161,7 +164,8 @@ class FakeCommands {
   std::condition_variable m_changed;
   std::set<std::string> m_signals;
   std::map<std::string, int> m_runs;
-  int m_active = 0;  // attempts with a thread outside an open
+  std::vector<std::string> m_started;  // each run's output, as it started
+  int m_active = 0;                    // attempts with a thread outside an open
   int m_most_active = 0;
   int m_stopped = 0;  // commands that saw a stop
   std::atomic<std::uint32_t> m_last_pid = 1000;
@@ -343,6 +347,7 @@ class FakeCommands {
       {
         const std::lock_guard lock(m_run.commands->m_mutex);
         ++m_run.commands->m_runs[m_run.output];
+        m_run.commands->m_started.push_back(m_run.output);
       }
       // Its own thread, detached: it completes from there, never from within
       // a stop callback, and touches nothing of this once it has.
@@ -382,6 +387,12 @@ class FakeCommands {
   int runs(const std::string& output) {
     const std::lock_guard lock(m_mutex);
     return m_runs[output];
+  }
+
+  // The outputs of the commands run so far, in the order they started.
+  std::vector<std::string> started() {
+    const std::lock_guard lock(m_mutex);
+    return m_started;
   }
 
   int most_active() {
@@ -975,6 +986,73 @@ TEST(BuildCoordinator, StoppingAnAttemptEndsItsWaitsButNotItsDependencies) {
   EXPECT_TRUE(ended_alone) << "the stopped attempt waited on b regardless";
   EXPECT_EQ(other.get(), "ok");
   EXPECT_EQ(fixture.commands.runs("b"), 1);
+}
+
+// An open from outside every build overtakes the builds nobody has asked for -
+// here, everything materialized at once - though not one holding a permit.
+TEST(BuildCoordinator, AnOpenOvertakesBuildsNobodyWaitsOn) {
+  Fixture fixture(1);
+  fixture.declare(
+      "@/a = run wait go\n@/b = run signal b\n@/c = run signal c\n");
+  fixture.tree->materialize_all();
+  ASSERT_TRUE(fixture.until([&](const auto& stats) {
+    return stats.held == 1 && fixture.commands.runs("a") == 1;
+  }));
+
+  Fixture::Opening c(fixture, "c");
+  ASSERT_TRUE(
+      fixture.until([](const auto& stats) { return stats.waits == 1; }));
+  fixture.commands.raise("go");
+  EXPECT_EQ(c.get(), "ok");
+  EXPECT_EQ(outcome(fixture.open("b")), "ok");
+  EXPECT_EQ(fixture.commands.started(),
+            (std::vector<std::string>{"a", "c", "b"}));
+}
+
+// What a hurried build goes on to open is hurried too, so the reader is not
+// left waiting behind background work for a dependency it turns out to need.
+TEST(BuildCoordinator, AHurriedBuildHurriesWhatItOpens) {
+  Fixture fixture(1);
+  fixture.declare(
+      "@/a = run wait go\n@/b = run signal b\n@/c = run open d\n"
+      "@/d = run signal d\n");
+  fixture.tree->materialize_all();
+  ASSERT_TRUE(fixture.until([&](const auto& stats) {
+    return stats.held == 1 && fixture.commands.runs("a") == 1;
+  }));
+
+  Fixture::Opening c(fixture, "c");
+  ASSERT_TRUE(
+      fixture.until([](const auto& stats) { return stats.waits == 1; }));
+  fixture.commands.raise("go");
+  EXPECT_EQ(c.get(), "ok");
+  EXPECT_EQ(fixture.content("c"), "d=ok ");
+  EXPECT_EQ(outcome(fixture.open("b")), "ok");
+  EXPECT_EQ(fixture.commands.started(),
+            (std::vector<std::string>{"a", "c", "d", "b"}));
+}
+
+// Hurrying a build that already waits on another hurries that one too.
+TEST(BuildCoordinator, HurryingABuildHurriesWhatItAlreadyWaitsOn) {
+  Fixture fixture(1);
+  fixture.declare(
+      "@/a = run open d\n@/b = run wait go\n@/c = run signal c\n"
+      "@/d = run signal d\n");
+  // a starts, waits on d and gives its permit back, which b takes.
+  fixture.tree->materialize_all();
+  ASSERT_TRUE(fixture.until([&](const auto& stats) {
+    return stats.edges == 1 && stats.held == 1 &&
+           fixture.commands.runs("b") == 1;
+  }));
+
+  Fixture::Opening a(fixture, "a");
+  ASSERT_TRUE(
+      fixture.until([](const auto& stats) { return stats.waits == 2; }));
+  fixture.commands.raise("go");
+  EXPECT_EQ(a.get(), "ok");
+  EXPECT_EQ(outcome(fixture.open("c")), "ok");
+  EXPECT_EQ(fixture.commands.started(),
+            (std::vector<std::string>{"a", "b", "d", "c"}));
 }
 
 TEST(BuildCoordinator, InterruptedRequestRestoresItsCommandsPermit) {

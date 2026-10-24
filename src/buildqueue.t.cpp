@@ -99,8 +99,12 @@ class Held {
 };
 
 template <class Queue>
-void spawn_held(Queue& queue, ex::counting_scope& scope, Held& held, int who) {
-  ex::spawn(queue.schedule(held.work(who)) |
+void spawn_held(Queue& queue,
+                ex::counting_scope& scope,
+                Held& held,
+                int who,
+                QueueTicket* ticket = nullptr) {
+  ex::spawn(queue.schedule(held.work(who), ticket) |
                 ex::upon_stopped([&held]() noexcept { held.stopped(); }) |
                 ex::upon_error([](const auto&) noexcept {}),
             scope.get_token());
@@ -305,6 +309,96 @@ TEST(BuildQueue, StartsWaitingWorkInTheOrderItWasScheduled) {
   }
   ex::sync_wait(scope.join());
   EXPECT_EQ(held.started(), (std::vector<int>{1, 2, 3, 4}));
+}
+
+// Promoted work goes ahead of work that was not, whenever it was queued, in
+// the order it was promoted.
+TEST(BuildQueue, StartsPromotedWorkFirstInTheOrderItWasPromoted) {
+  exec::static_thread_pool pool(1);
+  BuildQueue queue(1, pool.get_scheduler());
+  Held held;
+  ex::counting_scope scope;
+  QueueTicket fourth;
+  QueueTicket fifth;
+  spawn_held(queue, scope, held, 1);
+  ASSERT_TRUE(held.wait_until(1));
+  spawn_held(queue, scope, held, 2);
+  spawn_held(queue, scope, held, 3);
+  spawn_held(queue, scope, held, 4, &fourth);
+  spawn_held(queue, scope, held, 5, &fifth);
+  queue.promote(fifth);
+  queue.promote(fourth);
+  queue.promote(fifth);  // Already promoted, so it keeps its place.
+
+  const std::vector<int> expected{1, 5, 4, 2, 3};
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    ASSERT_TRUE(held.wait_until(i + 1));
+    ASSERT_EQ(held.started().back(), expected[i]);
+    held.release(expected[i]);
+  }
+  ex::sync_wait(scope.join());
+  EXPECT_EQ(held.started(), expected);
+  expect_slots(queue, 1);
+}
+
+// Work whose ticket was promoted before it was queued waits promoted, and
+// promoting work that already has its slot changes nothing.
+TEST(BuildQueue, PromotingWorkBeforeOrAfterItWaitsIsHarmless) {
+  exec::static_thread_pool pool(1);
+  BuildQueue queue(1, pool.get_scheduler());
+  Held held;
+  ex::counting_scope scope;
+  QueueTicket first;
+  QueueTicket third;
+  queue.promote(third);
+  spawn_held(queue, scope, held, 1, &first);
+  ASSERT_TRUE(held.wait_until(1));
+  queue.promote(first);
+  spawn_held(queue, scope, held, 2);
+  spawn_held(queue, scope, held, 3, &third);
+
+  held.release(1);
+  ASSERT_TRUE(held.wait_until(2));
+  held.release(3);
+  ASSERT_TRUE(held.wait_until(3));
+  held.release(2);
+  ex::sync_wait(scope.join());
+  EXPECT_EQ(held.started(), (std::vector<int>{1, 3, 2}));
+  expect_slots(queue, 1);
+}
+
+// Promoted work stopped while it waits leaves the queue like any other.
+TEST(BuildQueue, PromotedWorkStoppedWhileWaitingLeavesTheQueue) {
+  exec::static_thread_pool pool(1);
+  BuildQueue queue(1, pool.get_scheduler());
+  Held held;
+  ex::counting_scope scope;
+  spawn_held(queue, scope, held, 1);
+  ASSERT_TRUE(held.wait_until(1));
+
+  QueueTicket ticket;
+  ex::inplace_stop_source stop;
+  std::thread waiter([&] {
+    static_cast<void>(ex::sync_wait(
+        ex::write_env(queue.schedule(held.work(2), &ticket),
+                      ex::prop{ex::get_stop_token, stop.get_token()}) |
+        ex::upon_stopped([]() noexcept {})));
+  });
+  std::this_thread::sleep_for(50ms);
+  queue.promote(ticket);
+  spawn_held(queue, scope, held, 3);
+
+  stop.request_stop();
+  waiter.join();
+  // Out of line, so promoting it again finds nothing to move.
+  queue.promote(ticket);
+
+  held.release(1);
+  ASSERT_TRUE(held.wait_until(2));
+  EXPECT_EQ(held.started(), (std::vector<int>{1, 3}));
+  held.release(3);
+  ex::sync_wait(scope.join());
+  expect_slots(queue, 1);
 }
 
 // Work stopped while it waits leaves the queue without starting, completes

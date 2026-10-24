@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include "buildqueue.hpp"
 #include "commandrunner.hpp"
 
 #include <exec/any_sender_of.hpp>
@@ -13,7 +14,8 @@
 
 // How a `BuildCoordinator` sees the permits that cap how many build attempts
 // run at once: any provider of leases that can be given back and taken again,
-// such as a `BuildQueue`, type-erased so the coordinator depends on none.
+// and of a line for them that an attempt can be promoted in, such as a
+// `BuildQueue`, type-erased so the coordinator depends on none.
 
 namespace makebelieve {
 
@@ -172,32 +174,53 @@ class PermitLease {
   }
 };
 
-/// Runs the work its argument makes, given a lease on a permit, once a permit
-/// is free; completes as that work does, the permit given back by then.
-using PermitProvider = std::function<AttemptSender(
-    std::move_only_function<AttemptSender(PermitLease)> make_work)>;
+/// Where build attempts get their permits.
+struct PermitProvider {
+  /// What runs once a permit is free, given a lease on it.
+  using MakeWork = std::move_only_function<AttemptSender(PermitLease)>;
+
+  /// Runs the work its argument makes, given a lease on a permit, once a
+  /// permit is free - waiting in line under the ticket, which no other work
+  /// uses and which outlives the wait - and completes as that work does, the
+  /// permit given back by then.
+  std::function<AttemptSender(QueueTicket& ticket, MakeWork make_work)>
+      schedule;
+
+  /// Moves the work waiting under the ticket - or that will - ahead of work
+  /// not promoted. Runs nothing, so it may be called holding a lock.
+  std::function<void(QueueTicket& ticket)> promote;
+};
 
 /// A provider whose permits come from @a queue - a `BuildQueue`, or anything
-/// else whose `schedule_leased` behaves like it.
+/// else whose `schedule_leased` and `promote` behave like it.
 /// @pre @a queue outlives the provider and everything it runs.
 template <class Queue>
 [[nodiscard]] PermitProvider permits_from(Queue& queue) {
-  return [&queue](std::move_only_function<AttemptSender(PermitLease)> make)
-             -> AttemptSender {
-    return queue.schedule_leased([make = std::move(make)](auto& lease) mutable {
-      return make(PermitLease(lease));
-    });
+  return {
+      .schedule = [&queue](QueueTicket& ticket,
+                           PermitProvider::MakeWork make) -> AttemptSender {
+        return queue.schedule_leased(
+            [make = std::move(make)](auto& lease) mutable {
+              return make(PermitLease(lease));
+            },
+            &ticket);
+      },
+      .promote = [&queue](QueueTicket& ticket) { queue.promote(ticket); },
   };
 }
 
-/// A provider with no limit: every attempt starts at once.
+/// A provider with no limit: every attempt starts at once, so there is no line
+/// to promote anything in.
 [[nodiscard]] inline PermitProvider unlimited_permits() {
-  return [](std::move_only_function<AttemptSender(PermitLease)> make)
-             -> AttemptSender {
-    return stdexec::just() |
-           stdexec::let_value([make = std::move(make)]() mutable {
-             return make(PermitLease::unlimited());
-           });
+  return {
+      .schedule = [](QueueTicket& /*ticket*/,
+                     PermitProvider::MakeWork make) -> AttemptSender {
+        return stdexec::just() |
+               stdexec::let_value([make = std::move(make)]() mutable {
+                 return make(PermitLease::unlimited());
+               });
+      },
+      .promote = [](QueueTicket& /*ticket*/) {},
   };
 }
 
