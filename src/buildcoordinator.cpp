@@ -100,6 +100,7 @@ class BuildCoordinator::Impl {
   void stop_attempt(Attempt& attempt, Effects& effects);
   void remove_edge(Attempt& from, Attempt& to);
   void unlink(Wait& wait);
+  void hurry(Attempt& attempt) const;
   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
   [[nodiscard]] std::vector<Attempt*> path_to(Attempt& from, Attempt& to);
 
@@ -153,6 +154,14 @@ class BuildCoordinator::Attempt
 
   // On a cycle: fails with dependency_cycle whatever its work produced.
   bool doomed = false;
+
+  // Something outside every build waits on it, directly or through other
+  // attempts, so it goes ahead of attempts nobody does in the line for a
+  // permit.
+  bool hurried = false;
+
+  // Its place in that line. Guarded by the permit provider, not m_mutex.
+  QueueTicket ticket;
 
   // Set by complete(): what every wait on this attempt gets.
   std::optional<std::error_code> result;
@@ -357,6 +366,31 @@ void BuildCoordinator::Impl::unlink(Wait& wait) {
   }
   erase_one(wait.target->waits_on_me, &wait);
   erase_one(m_waits, &wait);
+}
+
+void BuildCoordinator::Impl::hurry(Attempt& attempt) const {
+  // Along the same edges path_to follows: what each attempt waits on, and,
+  // not yet started, the attempt it waits behind.
+  std::vector<Attempt*> stack{&attempt};
+  while (!stack.empty()) {
+    Attempt* const node = stack.back();
+    stack.pop_back();
+    if (std::exchange(node->hurried, true)) {
+      continue;
+    }
+    // Under the lock, as it runs nothing; once the attempt has its permit it
+    // changes nothing, and an attempt not yet queued is promoted when it is.
+    if (m_permits.promote) {
+      m_permits.promote(node->ticket);
+    }
+    for (const auto& [next, count] : node->edges_out) {
+      stack.push_back(next);
+    }
+    if (node->phase == Attempt::Phase::pending &&
+        node->predecessor != nullptr) {
+      stack.push_back(node->predecessor.get());
+    }
+  }
 }
 
 void BuildCoordinator::Impl::answer(Wait& wait,
@@ -592,6 +626,11 @@ exec::task<std::error_code> BuildCoordinator::Impl::wait(
     unlink(wait);
     throw;
   }
+  // A request from outside every build is someone waiting - a reader - and so
+  // is one from an attempt that is itself hurried for one.
+  if (wait.requester == nullptr || wait.requester->hurried) {
+    hurry(*target);
+  }
   if (wait.requester != nullptr) {
     block(*wait.requester, effects);
   }
@@ -766,8 +805,14 @@ AttemptSender BuildCoordinator::Impl::run(AttemptPtr attempt,
     // It is started only once the attempt it waited behind has ended.
     attempt->predecessor.reset();
   }
-  return m_permits([this, attempt = std::move(attempt), work = std::move(work)](
-                       PermitLease lease) mutable -> AttemptSender {
+  // Waits in line under the attempt's own ticket, through which it is
+  // hurried.
+  const auto in_line =
+      [this, &ticket = attempt->ticket](PermitProvider::MakeWork make) {
+        return m_permits.schedule(ticket, std::move(make));
+      };
+  return in_line([this, attempt = std::move(attempt), work = std::move(work)](
+                     PermitLease lease) mutable -> AttemptSender {
     on_permit(*attempt, lease);
     return stdexec::read_env(stdexec::get_stop_token) |
            stdexec::let_value([this, attempt, work = std::move(work)](

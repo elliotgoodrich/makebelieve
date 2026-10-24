@@ -20,11 +20,14 @@
 #include <charconv>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <optional>
 #include <print>
 #include <semaphore>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -54,11 +57,12 @@ void raise_open_file_limit() {
 }
 
 int usage(const char* program) {
-  std::println(stderr,
-               "usage: {0} mount [-j <builds>] <mountpoint>\n"
-               "       {0} mount <mountpoint> [-j <builds>]\n"
-               "       {0} unmount <mountpoint>",
-               program);
+  std::println(
+      stderr,
+      "usage: {0} mount [-j <builds>] [--build=requested|all] <mountpoint>\n"
+      "       {0} unmount <mountpoint>\n"
+      "mount's options may also follow the mountpoint",
+      program);
   return 1;
 }
 
@@ -85,9 +89,73 @@ int wait_for_stop(const Reasons&... reasons) {
       {(reasons.token.stop_requested() ? reasons.exit_status : 0)...});
 }
 
-// Serves the manifest's outputs at `mountpoint`, with at most @a jobs builds
-// holding a permit at once (one per core if 0), blocking until torn down.
-int mount(const char* mountpoint_arg, unsigned jobs) {
+// Which outputs a mount keeps built without being asked.
+enum class BuildMode : std::uint8_t {
+  requested,  // those that have been opened
+  all,        // every output, from the moment the mount is up
+};
+
+// How `mount` was asked to serve.
+struct MountOptions {
+  const char* mountpoint = nullptr;
+  // At most this many builds hold a permit at once; one per core if 0.
+  unsigned jobs = 0;
+  // Which outputs to keep built; `requested` if not given.
+  std::optional<BuildMode> build;
+};
+
+// The mode @a name names, as `--build=` spells it, if any.
+std::optional<BuildMode> parse_build_mode(std::string_view name) {
+  if (name == "requested") {
+    return BuildMode::requested;
+  }
+  if (name == "all") {
+    return BuildMode::all;
+  }
+  return std::nullopt;
+}
+
+// Reads `mount`'s arguments - @a args, those after the command - or nothing if
+// they are not one mountpoint and options, each given at most once.
+std::optional<MountOptions> parse_mount(std::span<char* const> args) {
+  constexpr std::string_view k_build_option = "--build=";
+  MountOptions options;
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    const std::string_view arg = args[i];
+    if (arg == "-j") {
+      if (++i == args.size() || options.jobs != 0) {
+        return std::nullopt;
+      }
+      const std::string_view text = args[i];
+      const auto [end, error] =
+          std::from_chars(text.data(), text.data() + text.size(), options.jobs);
+      if (error != std::errc() || end != text.data() + text.size() ||
+          options.jobs == 0) {
+        return std::nullopt;
+      }
+    } else if (arg.starts_with(k_build_option)) {
+      const std::optional<BuildMode> mode =
+          parse_build_mode(arg.substr(k_build_option.size()));
+      if (!mode.has_value() || options.build.has_value()) {
+        return std::nullopt;
+      }
+      options.build = mode;
+    } else if (arg.starts_with('-') || options.mountpoint != nullptr) {
+      return std::nullopt;
+    } else {
+      options.mountpoint = args[i];
+    }
+  }
+  if (options.mountpoint == nullptr) {
+    return std::nullopt;
+  }
+  return options;
+}
+
+// Serves the manifest's outputs as @a options asks, blocking until torn down.
+int mount(const MountOptions& options) {
+  const char* const mountpoint_arg = options.mountpoint;
+  const unsigned jobs = options.jobs;
   // Always recording, so a `tracing` rule added to the manifest at any point
   // shows the history leading up to it. Installed before anything below starts
   // a thread that records, and uninstalled only once they are all gone.
@@ -160,6 +228,12 @@ int mount(const char* mountpoint_arg, unsigned jobs) {
   // Constructed after the mount so the mount root exists to canonicalize.
   const UnmountChannel unmount_channel(mountpoint, io);
 
+  // Only once the mount is up, as a command may read another output through
+  // it the moment its build starts.
+  if (options.build == BuildMode::all) {
+    build_tree.materialize_all();
+  }
+
   std::println(stderr,
                "makebelieve serving [{}], press Ctrl+C or run "
                "`makebelieve unmount {}` to stop",
@@ -203,23 +277,14 @@ int main(int argc, char** argv) {
     }
 
     const std::string_view command = argv[1];
-    if (command == "mount" && argc == 3) {
-      return mount(argv[2], 0);
-    }
-    if (command == "mount" && argc == 5) {
-      const bool jobs_first = std::string_view(argv[2]) == "-j";
-      if (!jobs_first && std::string_view(argv[3]) != "-j") {
+    if (command == "mount") {
+      const std::optional<MountOptions> options = parse_mount(
+          std::span<char* const>(argv, static_cast<std::size_t>(argc))
+              .subspan(2));
+      if (!options.has_value()) {
         return usage(argv[0]);
       }
-      const std::string_view text = argv[jobs_first ? 3 : 4];
-      unsigned jobs = 0;
-      const auto [end, error] =
-          std::from_chars(text.data(), text.data() + text.size(), jobs);
-      if (error != std::errc() || end != text.data() + text.size() ||
-          jobs == 0) {
-        return usage(argv[0]);
-      }
-      return mount(argv[jobs_first ? 4 : 2], jobs);
+      return mount(*options);
     }
     if (command == "unmount" && argc == 3) {
       return unmount(argv[2]);

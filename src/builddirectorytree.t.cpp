@@ -1054,6 +1054,47 @@ TEST_F(BuildDirectoryTreeTest, ChangingACommandLeavesAnUnopenedOutputLazy) {
   EXPECT_EQ(read_output(tree, "a.txt"), "ran a2 %out");
 }
 
+// Materializing everything builds every output at once, as though each had
+// been opened - except a trace, which each open takes afresh anyway - and an
+// open afterwards finds it built.
+TEST_F(BuildDirectoryTreeTest, MaterializingAllBuildsEveryOutputButATrace) {
+  write_manifest(
+      "@/a.txt = run a %out\n@/dir/b.txt = run b %out\n"
+      "@/trace.json = tracing\n");
+  std::vector<std::string> commands;
+  const BuildDirectoryTree tree(source, echoing(commands));
+  EXPECT_TRUE(commands.empty());
+
+  tree.materialize_all();
+
+  std::ranges::sort(commands);
+  EXPECT_EQ(commands, (std::vector<std::string>{"a %out", "b %out"}));
+  EXPECT_EQ(output_size(tree, "dir/b.txt"), 10U);
+  EXPECT_EQ(read_output(tree, "a.txt"), "ran a %out");
+  EXPECT_EQ(commands.size(), 2U);
+}
+
+// Once everything is materialized, an output declared later is built as soon
+// as it appears, and one never opened is still rebuilt when an input changes.
+TEST_F(BuildDirectoryTreeTest, MaterializingAllCoversLaterOutputsAndChanges) {
+  source.write_file("input.txt", "v1");
+  write_manifest("@/output.txt = run build input.txt %out\n");
+  int runs = 0;
+  const BuildDirectoryTree tree(source,
+                                counting_with_inputs(runs, {"input.txt"}));
+  tree.materialize_all();
+  EXPECT_EQ(runs, 1);
+
+  source.write_file("input.txt", "v2");
+  EXPECT_EQ(runs, 2);
+
+  write_manifest(
+      "@/output.txt = run build input.txt %out\n"
+      "@/later.txt = run build input.txt %out\n");
+  EXPECT_EQ(runs, 3);
+  EXPECT_EQ(output_size(tree, "later.txt"), std::string("build 3").size());
+}
+
 // A build that finishes after its rule was removed does not bring the output
 // back, and the open waiting on it reports it missing.
 TEST_F(BuildDirectoryTreeTest, ABuildFinishingAfterItsRuleIsRemovedIsDropped) {

@@ -13,12 +13,41 @@
 
 namespace makebelieve {
 
+template <stdexec::scheduler Handoff>
+class BuildQueue;
+
+/// @class QueueTicket
+/// One piece of work's place in line for a `BuildQueue` slot, through which
+/// `BuildQueue::promote` moves it ahead of every piece of work not promoted.
+/// Made by whoever schedules the work, and handed to `schedule_leased()`; it
+/// may be promoted before the work is queued, while it waits, or after it has
+/// its slot, when promoting it does nothing. Used with one queue only.
+/// @pre It outlives its work's wait for a first slot.
+class QueueTicket {
+  template <stdexec::scheduler Handoff>
+  friend class BuildQueue;
+
+  // Both guarded by the lock of the queue it is used with: whether it has been
+  // promoted, and the waiter in line under it, if one is.
+  bool m_promoted = false;
+  void* m_waiter = nullptr;
+
+ public:
+  QueueTicket() = default;
+  QueueTicket(const QueueTicket&) = delete;
+  QueueTicket& operator=(const QueueTicket&) = delete;
+  QueueTicket(QueueTicket&&) = delete;
+  QueueTicket& operator=(QueueTicket&&) = delete;
+  ~QueueTicket() = default;
+};
+
 /// @class BuildQueue
 /// Runs work at most a fixed number of senders at a time. `schedule()`
 /// starts the work once fewer than that are running and holds its slot until
 /// it completes; the rest wait their turn in the order they were scheduled,
-/// from one queue, so that a later ordering - by priority, say - has one place
-/// to change. It knows nothing about what the work is.
+/// except that work promoted through its @link QueueTicket goes ahead of all
+/// work that was not, in the order it was promoted. It knows nothing about
+/// what the work is, nor why one piece is promoted over another.
 ///
 /// The count is cooperative accounting, not a limit on the CPU: it limits how
 /// many leases hold a slot, not what runs. Work started through
@@ -56,12 +85,20 @@ class BuildQueue {
   class Lease;
 
  private:
+  // One piece of work in line for a slot: what to call once it is handed one,
+  // and the ticket it waits under, if any.
+  struct Waiter {
+    IntrusiveTask task;
+    QueueTicket* ticket = nullptr;
+    Waiter* next = nullptr;
+  };
+
   // One queue of waiters, oldest first, linked through each one's `next`.
   struct Waiters {
-    IntrusiveTask* first = nullptr;
-    IntrusiveTask* last = nullptr;
+    Waiter* first = nullptr;
+    Waiter* last = nullptr;
 
-    void push(IntrusiveTask& waiter) noexcept {
+    void push(Waiter& waiter) noexcept {
       waiter.next = nullptr;
       if (last == nullptr) {
         first = &waiter;
@@ -71,8 +108,8 @@ class BuildQueue {
       last = &waiter;
     }
 
-    IntrusiveTask* pop() noexcept {
-      IntrusiveTask* const waiter = first;
+    Waiter* pop() noexcept {
+      Waiter* const waiter = first;
       if (waiter != nullptr) {
         first = waiter->next;
         if (first == nullptr) {
@@ -83,9 +120,9 @@ class BuildQueue {
     }
 
     // Removes @a waiter if it is queued here, reporting whether it was.
-    bool remove(IntrusiveTask& waiter) noexcept {
-      IntrusiveTask* previous = nullptr;
-      for (IntrusiveTask* it = first; it != nullptr; it = it->next) {
+    bool remove(Waiter& waiter) noexcept {
+      Waiter* previous = nullptr;
+      for (Waiter* it = first; it != nullptr; it = it->next) {
         if (it == &waiter) {
           (previous == nullptr ? first : previous->next) = it->next;
           if (last == it) {
@@ -99,14 +136,15 @@ class BuildQueue {
     }
   };
 
-  // Guards everything below.
+  // Guards everything below, and every ticket used with this queue.
   std::mutex m_mutex;
   std::size_t m_free;
 
   // Leases taking their slot back, served before new work.
   Waiters m_reacquiring;
 
-  // New work waiting for a slot.
+  // New work waiting for a slot: promoted, served first, and the rest.
+  Waiters m_promoted;
   Waiters m_waiting;
 
   Handoff m_handoff;
@@ -120,32 +158,72 @@ class BuildQueue {
     return true;
   }
 
-  // The queue a waiter of that kind waits in. @pre m_mutex is held.
-  Waiters& waiters(bool reacquire) noexcept {
-    return reacquire ? m_reacquiring : m_waiting;
+  // Puts @a waiter in line: a lease taking its slot back (@a reacquire), or
+  // new work, promoted if its ticket is. @pre m_mutex is held.
+  void enqueue(Waiter& waiter, bool reacquire) noexcept {
+    if (reacquire) {
+      m_reacquiring.push(waiter);
+      return;
+    }
+    QueueTicket* const ticket = waiter.ticket;
+    if (ticket != nullptr) {
+      ticket->m_waiter = &waiter;
+    }
+    (ticket != nullptr && ticket->m_promoted ? m_promoted : m_waiting)
+        .push(waiter);
+  }
+
+  // Takes @a waiter out of line, if it is still in it, reporting whether it
+  // was. @pre m_mutex is held.
+  bool dequeue(Waiter& waiter, bool reacquire) noexcept {
+    if (reacquire) {
+      return m_reacquiring.remove(waiter);
+    }
+    if (!m_promoted.remove(waiter) && !m_waiting.remove(waiter)) {
+      return false;
+    }
+    left_line(waiter);
+    return true;
+  }
+
+  // Forgets, in @a waiter's ticket, that it is in line. @pre m_mutex is held.
+  static void left_line(Waiter& waiter) noexcept {
+    if (waiter.ticket != nullptr) {
+      waiter.ticket->m_waiter = nullptr;
+    }
   }
 
   // Gives a slot back: to the oldest lease taking one back, else to the
-  // oldest new work, which then resumes on m_handoff, or to the free slots.
+  // oldest promoted work, else to the oldest new work, which then resumes on
+  // m_handoff, or to the free slots.
   void release() noexcept {
-    IntrusiveTask* waiter = nullptr;
+    Waiter* waiter = nullptr;
     {
       const std::lock_guard lock(m_mutex);
       waiter = m_reacquiring.pop();
       if (waiter == nullptr) {
-        waiter = m_waiting.pop();
+        waiter = m_promoted.pop();
+        if (waiter == nullptr) {
+          waiter = m_waiting.pop();
+        }
+        if (waiter != nullptr) {
+          left_line(*waiter);
+        }
       }
       if (waiter == nullptr) {
         ++m_free;
         return;
       }
     }
-    (*waiter)();
+    waiter->task();
   }
 
   // A sender that completes with a Slot once one is free - at once if one
-  // already is - or stopped if a stop is requested first.
-  [[nodiscard]] SlotSender take() noexcept { return SlotSender(*this); }
+  // already is - or stopped if a stop is requested first. Waits under
+  // @a ticket, if given.
+  [[nodiscard]] SlotSender take(QueueTicket* ticket) noexcept {
+    return SlotSender(*this, ticket);
+  }
 
  public:
   /// Creates a queue running at most @a concurrency pieces of work at a time,
@@ -165,12 +243,15 @@ class BuildQueue {
   /// the slot back, if the lease holds it then, as the work completes and
   /// before passing on how it completed, and whenever the operation itself is
   /// destroyed. Stopped before a slot is free, it leaves the queue and
-  /// completes stopped without calling @a make.
+  /// completes stopped without calling @a make. Given a @a ticket, it waits
+  /// in line under it, so it can be promoted.
   /// @pre The work does not complete while a `Lease::reacquire()` it started is
   /// still under way.
+  /// @pre @a ticket, if given, is used for no other work.
   template <class MakeWork>
-  [[nodiscard]] auto schedule_leased(MakeWork make) {
-    return take() |
+  [[nodiscard]] auto schedule_leased(MakeWork make,
+                                     QueueTicket* ticket = nullptr) {
+    return take(ticket) |
            stdexec::let_value([make = std::move(make)](Slot& slot) mutable {
              return stdexec::just(Lease(slot)) |
                     stdexec::let_value([&make](Lease& lease) {
@@ -191,11 +272,27 @@ class BuildQueue {
   /// does, giving the slot back as @a work completes - before passing on how
   /// it completed, and whenever the operation itself is destroyed. Stopped
   /// before a slot is free, it leaves the queue and completes stopped without
-  /// starting @a work.
+  /// starting @a work. Given a @a ticket, it waits in line under it.
+  /// @pre @a ticket, if given, is used for no other work.
   template <stdexec::sender Work>
-  [[nodiscard]] auto schedule(Work work) {
+  [[nodiscard]] auto schedule(Work work, QueueTicket* ticket = nullptr) {
     return schedule_leased(
-        [work = std::move(work)](Lease&) mutable { return std::move(work); });
+        [work = std::move(work)](Lease&) mutable { return std::move(work); },
+        ticket);
+  }
+
+  /// Moves the work waiting under @a ticket - or that will wait under it, if
+  /// not yet in line - ahead of all work that was not promoted, behind work
+  /// promoted before it. Runs nothing, so it may be called holding a lock.
+  void promote(QueueTicket& ticket) noexcept {
+    const std::lock_guard lock(m_mutex);
+    if (std::exchange(ticket.m_promoted, true)) {
+      return;
+    }
+    if (auto* const waiter = static_cast<Waiter*>(ticket.m_waiter);
+        waiter != nullptr && m_waiting.remove(*waiter)) {
+      m_promoted.push(*waiter);
+    }
   }
 };
 
@@ -336,7 +433,7 @@ class BuildQueue<Handoff>::SlotOperation {
   BuildQueue* m_queue;
   Lease* m_lease;  // the lease taking a slot back, if Reacquire
   Receiver m_receiver;
-  IntrusiveTask m_waiting{*this};
+  Waiter m_waiting;
   std::optional<stdexec::stop_callback_for_t<Token, OnStop>> m_on_stop;
   std::optional<ResumeOperation> m_resume;
 
@@ -355,7 +452,7 @@ class BuildQueue<Handoff>::SlotOperation {
   void on_stop() noexcept {
     {
       const std::lock_guard lock(m_queue->m_mutex);
-      if (!m_queue->waiters(Reacquire).remove(m_waiting)) {
+      if (!m_queue->dequeue(m_waiting, Reacquire)) {
         m_stopped_early = true;  // Not queued yet, or already given a slot.
         return;
       }
@@ -384,8 +481,14 @@ class BuildQueue<Handoff>::SlotOperation {
  public:
   using operation_state_concept = stdexec::operation_state_t;
 
-  SlotOperation(BuildQueue& queue, Lease* lease, Receiver receiver)
-      : m_queue(&queue), m_lease(lease), m_receiver(std::move(receiver)) {}
+  SlotOperation(BuildQueue& queue,
+                Lease* lease,
+                QueueTicket* ticket,
+                Receiver receiver)
+      : m_queue(&queue),
+        m_lease(lease),
+        m_receiver(std::move(receiver)),
+        m_waiting{.task = IntrusiveTask(*this), .ticket = ticket} {}
 
   SlotOperation(const SlotOperation&) = delete;
   SlotOperation& operator=(const SlotOperation&) = delete;
@@ -410,7 +513,7 @@ class BuildQueue<Handoff>::SlotOperation {
       } else {
         // Once queued, a release on another thread may give this a slot and
         // destroy it at any moment, so nothing below touches it.
-        m_queue->waiters(Reacquire).push(m_waiting);
+        m_queue->enqueue(m_waiting, Reacquire);
       }
     }
     if (stopped) {
@@ -424,6 +527,7 @@ class BuildQueue<Handoff>::SlotOperation {
 template <stdexec::scheduler Handoff>
 class BuildQueue<Handoff>::SlotSender {
   BuildQueue* m_queue;
+  QueueTicket* m_ticket;
 
  public:
   using sender_concept = stdexec::sender_t;
@@ -431,11 +535,12 @@ class BuildQueue<Handoff>::SlotSender {
       stdexec::completion_signatures<stdexec::set_value_t(Slot),
                                      stdexec::set_stopped_t()>;
 
-  explicit SlotSender(BuildQueue& queue) noexcept : m_queue(&queue) {}
+  SlotSender(BuildQueue& queue, QueueTicket* ticket) noexcept
+      : m_queue(&queue), m_ticket(ticket) {}
 
   template <class Receiver>
   SlotOperation<Receiver, false> connect(Receiver receiver) const {
-    return SlotOperation<Receiver, false>(*m_queue, nullptr,
+    return SlotOperation<Receiver, false>(*m_queue, nullptr, m_ticket,
                                           std::move(receiver));
   }
 };
@@ -454,7 +559,7 @@ class BuildQueue<Handoff>::ReacquireSender {
 
   template <class Receiver>
   SlotOperation<Receiver, true> connect(Receiver receiver) const {
-    return SlotOperation<Receiver, true>(*m_lease->m_queue, m_lease,
+    return SlotOperation<Receiver, true>(*m_lease->m_queue, m_lease, nullptr,
                                          std::move(receiver));
   }
 };

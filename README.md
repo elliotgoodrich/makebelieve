@@ -46,6 +46,10 @@ hello world
 Listing or `stat`-ing a file never waits: until it has been built a
 file reports a size of 1, and after that the size of its last build.
 
+To build everything up front instead, in the background, mount with
+`makebelieve mount --build=all ../output`; opening a file still waits for it,
+and goes ahead of the background builds (see [`DOCS.md`](DOCS.md)).
+
 To stop serving, press Ctrl+C in the terminal running `makebelieve
 mount`, or from another terminal run,
 

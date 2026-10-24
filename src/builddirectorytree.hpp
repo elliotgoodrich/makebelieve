@@ -123,6 +123,20 @@ class BuildDirectoryTree : public DirectoryTree {
   /// @a context says it cannot let wait.
   [[nodiscard]] OpenSender open(const std::filesystem::path& path,
                                 const OpenContext& context = {}) const override;
+  /// From now on treats every declared output as already opened: starts
+  /// building each that is not up to date, so it is in place before anyone
+  /// opens it, and does the same for every output declared later - by a
+  /// changed manifest, or a file a wildcard comes to match - and rebuilds any
+  /// whose inputs change, as it would an output that had been opened. A
+  /// `tracing` output is left alone, since each open takes a fresh trace
+  /// anyway. Returns once the builds are started, without waiting for them.
+  ///
+  /// These builds are nobody's request, so builds that someone does open
+  /// overtake them in the coordinator's line for a permit. Call this only once
+  /// whatever serves the outputs to the commands that read them - the mount -
+  /// is up, as their builds may open those outputs at once.
+  void materialize_all() const;
+
   /// Returns a sender reading up to @a size bytes at @a offset from @a path's
   /// last published build. Does not build; await @link open first.
   [[nodiscard]] ReadSender read(const std::filesystem::path& path,
