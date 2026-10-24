@@ -185,7 +185,32 @@ By default, at most one build per core holds a place to run at a time;
 makebelieve mount -j 2 <mountpoint>
 ```
 
-The option may also follow the mountpoint: `makebelieve mount <mountpoint> -j 2`.
+Options may also follow the mountpoint: `makebelieve mount <mountpoint> -j 2`.
+
+Opening an output always builds it if it is not up to date, and waits.
+`--build=<mode>` sets which outputs are kept built without being asked:
+
+- `requested`, the default: those that have been opened. Nothing is built
+  until it is first opened; after that it is rebuilt whenever one of its
+  inputs changes.
+- `all`: every output, from the moment the mount is up.
+
+```sh
+makebelieve mount --build=all <mountpoint>
+```
+
+With `--build=all`, every output is treated as already opened: outputs
+added later - by an edit to the manifest, or a new file a wildcard matches -
+are built as they appear, and an output is rebuilt whenever its inputs
+change, whether or not anything has read it. A `tracing` output is the
+exception, since every open takes a fresh trace anyway. Giving `--build`
+more than once is an error, even with the same mode.
+
+Builds that something is waiting for go first. Opening an output whose build
+has yet to start moves it ahead of every build nobody is waiting for - those
+of `--build=all`, or rebuilds started only because an input changed - and so
+does every output that build then reads, however deep. A build that already
+holds a place keeps it, so an open can still wait for one of those to finish.
 
 A build's command may itself read other outputs through the mount - a PDF
 built from generated Markdown, say. While it waits for one to build, its

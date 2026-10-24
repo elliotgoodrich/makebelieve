@@ -73,10 +73,21 @@ namespace makebelieve {
 /// its command's process tree - waits holding no permit and giving none back,
 /// and can deadlock on permits as before; there is no timeout.
 ///
+/// Attempts that someone outside every build waits on are hurried: they go
+/// ahead, in the line for a permit, of every attempt that nobody does - such
+/// as a rebuild started only because an input changed. A request from no
+/// attempt hurries the attempt it waits on, and everything that attempt waits
+/// on, directly or through others, or waits behind; a request from a hurried
+/// attempt hurries its target likewise. So a reader's build, and every
+/// dependency it turns out to need, overtakes background work queued before
+/// it, though never work already holding a permit. An attempt stays hurried
+/// for the rest of its life. A request the tracker misses counts as being
+/// from no attempt.
+///
 /// State changes happen under one lock, which is never held while anything
-/// outside is called other than a permit's release (which runs nothing on the
-/// calling thread) and so it may be taken while holding a lock of the tree
-/// that owns it.
+/// outside is called other than a permit's release or promotion (each of which
+/// runs nothing on the calling thread) and so it may be taken while holding a
+/// lock of the tree that owns it.
 class BuildCoordinator {
  public:
   /// Schedules completions on an executor that outlives this coordinator.
@@ -153,7 +164,8 @@ class BuildCoordinator {
   /// known it will never run.
   void complete(const AttemptPtr& attempt, std::error_code result);
 
-  /// Suspends until the target completes and the requester's permit is back.
+  /// Suspends until the target completes and the requester's permit is back,
+  /// hurrying the target if the requester is no attempt or a hurried one.
   /// Cancellation comes from the receiver environment and detaches this waiter.
   [[nodiscard]] exec::task<std::error_code> wait(
       AttemptPtr target,

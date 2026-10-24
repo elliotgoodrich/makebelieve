@@ -14,6 +14,8 @@
 #   FIXTURE_DIR       integration/dependencies
 #   WORK_DIR          scratch directory this script owns exclusively
 #   JOBS_AFTER_MOUNTPOINT  optional: exercise `mount <mountpoint> -j 1`
+#   BUILD_ALL         optional: mount with `--build=all`, and first check
+#                     that every output gets built without anything opening it
 
 set(SRC "${WORK_DIR}/src")
 set(MNT "${WORK_DIR}/mnt")
@@ -42,6 +44,9 @@ if(WIN32)
   else()
     set(mount_arguments "'mount','-j','1','${MNT}'")
   endif()
+  if(BUILD_ALL)
+    string(APPEND mount_arguments ",'--build=all'")
+  endif()
   execute_process(
     COMMAND powershell -NoProfile -ExecutionPolicy Bypass -Command
     "$ErrorActionPreference='Stop'; Start-Process -FilePath '${MAKEBELIEVE_EXE}' -ArgumentList ${mount_arguments} -WorkingDirectory '${SRC}' -WindowStyle Hidden")
@@ -50,6 +55,9 @@ else()
     set(mount_arguments "mount \"${MNT}\" -j 1")
   else()
     set(mount_arguments "mount -j 1 \"${MNT}\"")
+  endif()
+  if(BUILD_ALL)
+    string(APPEND mount_arguments " --build=all")
   endif()
   execute_process(
     COMMAND sh -c
@@ -82,7 +90,35 @@ endforeach()
 
 if(NOT MOUNTED)
   list(APPEND FAILURES "daemon did not mount within the timeout")
-else()
+elseif(BUILD_ALL)
+  # Built without being opened: listing or stat-ing never builds, and an
+  # unbuilt output reports a size of 1, so its size reaching its content's
+  # shows its build ran unasked. The 80-command chain takes longest.
+  # Sized on disk: file(READ) drops the carriage returns of a Windows checkout.
+  file(SIZE "${SRC}/leaf.txt" leaf_size)
+  file(SIZE "${SRC}/shared-leaf.txt" shared_leaf_size)
+  foreach(entry chain1.txt:${leaf_size} copied.txt:${leaf_size}
+                deep1.txt:${leaf_size} first.txt:${leaf_size}
+                fan1.txt:${shared_leaf_size} fan4.txt:${shared_leaf_size})
+    string(REPLACE ":" ";" entry "${entry}")
+    list(GET entry 0 output)
+    list(GET entry 1 expected_size)
+    set(size 0)
+    foreach(attempt RANGE 1 600)
+      file(SIZE "${MNT}/${output}" size)
+      if(size EQUAL expected_size)
+        break()
+      endif()
+      execute_process(COMMAND "${CMAKE_COMMAND}" -E sleep 0.1)
+    endforeach()
+    if(NOT size EQUAL expected_size)
+      list(APPEND FAILURES
+           "${output} was ${size} bytes, not ${expected_size}, without being opened")
+    endif()
+  endforeach()
+endif()
+
+if(MOUNTED)
   # The copy of the chain's head, opened first: it holds the only permit until
   # it waits on the chain, which then builds as below.
   read_output(copied.txt copied)

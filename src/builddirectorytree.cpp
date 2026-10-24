@@ -298,6 +298,10 @@ class BuildDirectoryTree::Impl {
   // Outputs opened at least once, which an input change rebuilds eagerly.
   std::set<std::filesystem::path> m_materialized;
 
+  // Whether every output but a trace counts as opened, as soon as it is
+  // declared: set by materialize_all().
+  bool m_materialize_all = false;
+
   // The id of the last build started, which ties the arrow drawn from the open
   // that asked for it to the build itself.
   std::uint64_t m_last_build_id = 0;
@@ -461,6 +465,25 @@ class BuildDirectoryTree::Impl {
       co_return std::unexpected(error);
     }
     co_return co_await DirectoryTreeUtil::open_by_status(m_structure, path);
+  }
+
+  void materialize_all() {
+    std::vector<std::filesystem::path> outputs;
+    {
+      const std::lock_guard lock(m_mutex);
+      m_materialize_all = true;
+      for (const auto& [output, command] : m_commands) {
+        if (command.action != Manifest::Action::Tracing) {
+          m_materialized.insert(output);
+          outputs.push_back(output);
+        }
+      }
+    }
+    // Unlocked: a build that completes inline calls finish_build from inside.
+    // Nothing traced asked for these, so no arrow leads to them.
+    for (const std::filesystem::path& output : outputs) {
+      start_build(output, std::nullopt);
+    }
   }
 
   // Passes on every change but the rewrite of a `tracing` output. Reading the
@@ -926,6 +949,12 @@ class BuildDirectoryTree::Impl {
           if (it == m_commands.end()) {
             added.push_back(output);
             m_stale.insert(output);
+            if (m_materialize_all &&
+                command.action != Manifest::Action::Tracing) {
+              m_materialized.insert(output);
+              // Invalidated below, which builds it as it is now materialized.
+              changed.push_back(output);
+            }
           } else if (it->second != command) {
             changed.push_back(output);
           }
@@ -1080,6 +1109,10 @@ std::expected<EntryInfo, std::error_code> BuildDirectoryTree::status(
 std::expected<std::vector<TreeEntry>, std::error_code> BuildDirectoryTree::ls(
     const std::filesystem::path& path) const {
   return m_impl->ls(path);
+}
+
+void BuildDirectoryTree::materialize_all() const {
+  m_impl->materialize_all();
 }
 
 OpenSender BuildDirectoryTree::open(const std::filesystem::path& path,
