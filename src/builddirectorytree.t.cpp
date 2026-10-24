@@ -1147,6 +1147,14 @@ class FlakyTree : public DirectoryTree {
     }
     return inner.read(path, offset, size);
   }
+  [[nodiscard]] makebelieve::ReadWholeSender read_whole(
+      const std::filesystem::path& path) const override {
+    if (fail_reads) {
+      return stdexec::just(std::expected<FileContent, std::error_code>(
+          std::unexpected(std::make_error_code(std::errc::permission_denied))));
+    }
+    return inner.read_whole(path);
+  }
   [[nodiscard]] Subscription subscribe_to_changes(
       const std::function<void(const DirectoryTreeDiff&)>& callback)
       const override {

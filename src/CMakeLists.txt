@@ -36,6 +36,7 @@ add_library(makebelieve_core STATIC
   builddirectorytree.cpp
   consoleinterrupthandler-${MAKEBELIEVE_PLATFORM}.cpp
   directorytreeutil.cpp
+  filesnapshots.cpp
   filesystemutil.cpp
   inmemorydirectorytree.cpp
   iocontext.cpp
@@ -168,6 +169,7 @@ if(BUILD_TESTING)
   makebelieve_add_test(linkednode)
   makebelieve_add_test(nativehandlepoller)
   makebelieve_add_test(directorytreeutil)
+  makebelieve_add_test(filesnapshots)
   makebelieve_add_test(virtualfilesystem)
   if(WIN32)
     makebelieve_add_test(tracingenvironment)

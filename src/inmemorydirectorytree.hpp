@@ -87,6 +87,9 @@ class InMemoryDirectoryTree : public DirectoryTree {
                                 Offset offset,
                                 std::size_t size) const override;
 
+  [[nodiscard]] ReadWholeSender read_whole(
+      const std::filesystem::path& path) const override;
+
   [[nodiscard]] Subscription subscribe_to_changes(
       const std::function<void(const DirectoryTreeDiff&)>& callback)
       const override;

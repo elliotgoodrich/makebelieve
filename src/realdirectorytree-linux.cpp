@@ -77,6 +77,15 @@ EntryInfo make_info(const struct stat& info) {
 
 using UniqueDir = std::unique_ptr<DIR, int (*)(DIR*)>;
 
+// How many times read_whole() reads a file that changes under it before
+// handing out what it last read.
+constexpr int k_read_whole_attempts = 8;
+
+bool same_version(const struct stat& a, const struct stat& b) {
+  return a.st_size == b.st_size && a.st_mtim.tv_sec == b.st_mtim.tv_sec &&
+         a.st_mtim.tv_nsec == b.st_mtim.tv_nsec;
+}
+
 }  // namespace
 
 class RealDirectoryTree::Impl {
@@ -138,6 +147,8 @@ class RealDirectoryTree::Impl {
       const std::filesystem::path& path,
       Offset offset,
       std::size_t size) const;
+  [[nodiscard]] std::expected<FileContent, std::error_code> read_whole(
+      const std::filesystem::path& path) const;
   [[nodiscard]] Subscription subscribe_to_changes(
       const std::function<void(const DirectoryTreeDiff&)>& callback) const;
 
@@ -532,6 +543,73 @@ ReadSender RealDirectoryTree::read(const std::filesystem::path& path,
   return stdexec::just() | stdexec::then([this, path, offset, size] {
            return m_impl->read(path, offset, size);
          });
+}
+
+std::expected<FileContent, std::error_code> RealDirectoryTree::Impl::read_whole(
+    const std::filesystem::path& path) const {
+  const std::optional<std::filesystem::path> resolved = resolve(path);
+  if (!resolved.has_value()) {
+    return std::unexpected(
+        std::make_error_code(std::errc::no_such_file_or_directory));
+  }
+  const int fd = ::open(resolved->c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return std::unexpected(last_error_code());
+  }
+  const ScopeGuard closer([fd] { ::close(fd); });
+
+  FileContent latest;
+  for (int attempt = 0; attempt < k_read_whole_attempts; ++attempt) {
+    struct stat before {};
+    if (::fstat(fd, &before) != 0) {
+      return std::unexpected(last_error_code());
+    }
+    if (S_ISDIR(before.st_mode)) {
+      return std::unexpected(std::make_error_code(std::errc::is_a_directory));
+    }
+
+    // One byte more than the file should hold, so a read that fills the
+    // buffer is never mistaken for the end of it.
+    std::string contents(static_cast<std::size_t>(before.st_size) + 1, '\0');
+    std::size_t total = 0;
+    for (;;) {
+      if (total == contents.size()) {
+        contents.resize(contents.size() * 2);
+      }
+      const ssize_t read_bytes =
+          ::pread(fd, contents.data() + total, contents.size() - total,
+                  static_cast<off_t>(total));
+      if (read_bytes < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        return std::unexpected(last_error_code());
+      }
+      if (read_bytes == 0) {
+        break;
+      }
+      total += static_cast<std::size_t>(read_bytes);
+    }
+    contents.resize(total);
+
+    struct stat after {};
+    if (::fstat(fd, &after) != 0) {
+      return std::unexpected(last_error_code());
+    }
+    latest = {.bytes = std::make_shared<const std::string>(std::move(contents)),
+              .info = {.size = total, .mtime = to_file_time(before.st_mtim)}};
+    if (same_version(before, after) &&
+        total == static_cast<std::size_t>(before.st_size)) {
+      break;
+    }
+  }
+  return latest;
+}
+
+ReadWholeSender RealDirectoryTree::read_whole(
+    const std::filesystem::path& path) const {
+  return stdexec::just() |
+         stdexec::then([this, path] { return m_impl->read_whole(path); });
 }
 
 Subscription RealDirectoryTree::subscribe_to_changes(

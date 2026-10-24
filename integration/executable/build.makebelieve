@@ -1,0 +1,10 @@
+# Outputs that are run rather than read, each taking a second to build, so
+# running one asks for its build. hello.exe is the test's helper executable,
+# copied in by the test.
+@/hello.exe = run cmake -E sleep 1 && cmake -E copy hello.exe %out
+@/hello.cmd = run cmake -E sleep 1 && cmake -E copy hello.cmd %out
+@/hello.sh = run cmake -E sleep 1 && cmake -E copy hello.sh %out
+
+# Rebuilt by the test while a copy of it is running. waiter-input.exe starts
+# as another copy of the helper executable.
+@/waiter.exe = run cmake -E copy waiter-input.exe %out

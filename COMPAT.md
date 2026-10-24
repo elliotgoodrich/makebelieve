@@ -87,3 +87,29 @@ Correct in the experiment, but run on its own straight after mounting it has
 repeatedly left a 1-byte copy and still exited 0, after reporting
 `ERROR 1 (0x00000001) Changing File Attributes` on the destination directory.
 The cause is not known.
+
+## Rebuilt outputs still in use
+
+On both platforms, a program that has an output open, mapped or running when
+it is rebuilt keeps the version it opened, as it would if the build had
+replaced the file on disk. Anything opening the output afterwards gets the new
+version - with one exception on Windows.
+
+WinFsp shares one file node, and with it one memory section, between
+everything that has the same path open at once. So on Windows, once an earlier
+version of an output has been memory-mapped - which includes running it as a
+program or loading it as a DLL - a new mapping of that output can get the
+earlier version: starting the program again, loading the DLL in another
+process, or a tool that maps its inputs, such as `link.exe` or a compiler
+loading a precompiled header. Plain reads are not affected: they never go
+through that section.
+
+This can last after the program holding the earlier version has exited.
+WinFsp cannot drop a section's pages while any view of them is mapped, and
+makebelieve only asks it to when the output changes, so pages left from before
+a rebuild can stay until the output is next rebuilt, or until Windows reclaims
+the memory.
+
+A build command that maps an output it reads can therefore build from the
+earlier version, and nothing rebuilds it, since its input has not changed
+since. Linux is not affected.

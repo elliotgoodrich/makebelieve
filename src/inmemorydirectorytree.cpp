@@ -12,6 +12,7 @@
 #include <functional>
 #include <list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -62,7 +63,9 @@ bool is_within(const std::filesystem::path& entry,
 class InMemoryDirectoryTree::Impl {
   struct Node {
     EntryInfo info;
-    std::string content;  // Only set when this node is a file.
+    // Only set when this node is a file. Replaced rather than changed when the
+    // file is written, so read_whole() can hand it out as it is.
+    std::shared_ptr<const std::string> content;
   };
 
   std::map<std::filesystem::path, Node> m_entries{
@@ -105,7 +108,7 @@ class InMemoryDirectoryTree::Impl {
       }
       m_entries[*normalized] =
           Node{.info = FileInfo{.size = content.size(), .mtime = mtime},
-               .content = std::string(content)};
+               .content = std::make_shared<const std::string>(content)};
     }
     notify_subscribers(diff);
   }
@@ -249,11 +252,34 @@ class InMemoryDirectoryTree::Impl {
       return std::unexpected(std::make_error_code(std::errc::is_a_directory));
     }
 
-    const std::string& content = it->second.content;
+    const std::string& content = *it->second.content;
     if (static_cast<std::size_t>(offset) >= content.size()) {
       return std::string{};
     }
     return content.substr(static_cast<std::size_t>(offset), size);
+  }
+
+  // The file's content and its info come from one look at the node, under
+  // one lock, so they always match - and the content is shared, not copied.
+  [[nodiscard]] std::expected<FileContent, std::error_code> read_whole(
+      const std::filesystem::path& path) const {
+    const std::optional<std::filesystem::path> normalized = normalize(path);
+    if (!normalized.has_value()) {
+      return std::unexpected(
+          std::make_error_code(std::errc::no_such_file_or_directory));
+    }
+
+    const std::shared_lock lock(m_mutex);
+    const auto it = m_entries.find(*normalized);
+    if (it == m_entries.end()) {
+      return std::unexpected(
+          std::make_error_code(std::errc::no_such_file_or_directory));
+    }
+    const auto* file = std::get_if<FileInfo>(&it->second.info);
+    if (file == nullptr) {
+      return std::unexpected(std::make_error_code(std::errc::is_a_directory));
+    }
+    return FileContent{.bytes = it->second.content, .info = *file};
   }
 
   [[nodiscard]] Subscription subscribe_to_changes(
@@ -340,6 +366,12 @@ ReadSender InMemoryDirectoryTree::read(const std::filesystem::path& path,
   return stdexec::just() | stdexec::then([this, path, offset, size] {
            return m_impl->read(path, offset, size);
          });
+}
+
+ReadWholeSender InMemoryDirectoryTree::read_whole(
+    const std::filesystem::path& path) const {
+  return stdexec::just() |
+         stdexec::then([this, path] { return m_impl->read_whole(path); });
 }
 
 Subscription InMemoryDirectoryTree::subscribe_to_changes(

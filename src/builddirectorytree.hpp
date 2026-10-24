@@ -38,7 +38,9 @@ class BuildCoordinator;
 /// before it finishes; if it has changed, the open waits for the build after
 /// it instead. (This is deliberate, and new: an open used to wait on through
 /// build after build for as long as the output kept changing.) Content read
-/// afterwards may already be a later build's: reads are not snapshotted.
+/// afterwards may already be a later build's: reads are not snapshotted here,
+/// but by the filesystem serving the tree, which takes a @link FileSnapshot
+/// of each file as it is opened.
 /// Opens made by a build's own command (as the coordinator tells them apart)
 /// give its permit back while they wait, and one that would wait on a cycle of
 /// builds fails with `std::errc::resource_deadlock_would_occur`.
@@ -126,6 +128,9 @@ class BuildDirectoryTree : public DirectoryTree {
   [[nodiscard]] ReadSender read(const std::filesystem::path& path,
                                 Offset offset,
                                 std::size_t size) const override;
+
+  [[nodiscard]] ReadWholeSender read_whole(
+      const std::filesystem::path& path) const override;
 
   [[nodiscard]] Subscription subscribe_to_changes(
       const std::function<void(const DirectoryTreeDiff&)>& callback)
