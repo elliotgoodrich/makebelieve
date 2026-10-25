@@ -225,3 +225,33 @@ reading its own output - fails with `EDEADLK`, and every build on the cycle
 fails. Pending opens suspend as coroutines and consume no dispatcher
 thread, so there is no 64-open limit. Linux uses low-level FUSE replies;
 Windows defers WinFsp transactions. Unmount cancels pending requests.
+
+## Resuming
+
+Every successful build is kept in a directory beside the mountpoint, named
+after it with `.makebelieve` added - mounting at `../output` keeps builds in
+`../output.makebelieve`. With each output it keeps the command that built it
+and what each input it read looked like: a source file's modification time
+and size, or the content of an output read through the mount.
+
+When `mount` starts, an output is served as already built, without running
+anything, if
+
+- its rule is still in the manifest, with the same command;
+- every source file it read has the same modification time and size; and
+- every output it read is itself served as already built, with the content
+  it read.
+
+Every other output is built on its next open, as usual, and its old build is
+discarded, as is the build of any output no longer in the manifest. The
+same goes for an output that went out of date while served but was not
+rebuilt before **makebelieve** stopped - however it stopped, a crash
+included. A `tracing` output is never kept.
+
+Two mounts can never share one of these directories: mounting where another
+running **makebelieve** keeps its builds fails. Deleting the directory while
+nothing is mounted is always safe, and just means building everything afresh.
+
+Files outside the manifest's directory - compilers, system headers - are not
+tracked, here as anywhere else, so a toolchain upgrade does not rebuild
+anything kept; delete the directory to start afresh.

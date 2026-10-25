@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+#include "buildcache.hpp"
 #include "buildcoordinator.hpp"
 #include "builddirectorytree.hpp"
 #include "buildpermits.hpp"
@@ -64,6 +65,18 @@ int usage(const char* program) {
       "mount's options may also follow the mountpoint",
       program);
   return 1;
+}
+
+// Where builds served at @a mountpoint are kept between runs: beside it, under
+// its name with `.makebelieve` added.
+std::filesystem::path cache_directory_for(std::filesystem::path mountpoint) {
+  mountpoint = std::filesystem::absolute(mountpoint).lexically_normal();
+  // `mnt/` names the same directory as `mnt`.
+  if (!mountpoint.has_filename()) {
+    mountpoint = mountpoint.parent_path();
+  }
+  mountpoint += ".makebelieve";
+  return mountpoint;
 }
 
 // A reason to stop: a token, and the exit status to end with once a stop is
@@ -192,6 +205,20 @@ int mount(const MountOptions& options) {
     return 1;
   }
 
+  // Its writes must not reach the source's change notifications, nor be taken
+  // for what a build read.
+  const std::filesystem::path cache_directory =
+      cache_directory_for(mountpoint_arg);
+  if (!FileSystemUtil::are_disjoint(cache_directory, source)) {
+    std::println(stderr,
+                 "makebelieve: the build cache [{}] must not overlap the "
+                 "source directory [{}]",
+                 cache_directory.string(), source.string());
+    return 1;
+  }
+  // Outlives the build tree, which keeps its builds here.
+  BuildCache cache(cache_directory);
+
   const RealDirectoryTree tree(source, io);
 
   // Tracks which build each process the runner launches belongs to: the
@@ -214,9 +241,11 @@ int mount(const MountOptions& options) {
   BuildCoordinator coordinator(permits_from(builds), tracker,
                                workers.get_scheduler());
 
-  // Presents the manifest's declared outputs, building each lazily.
+  // Presents the manifest's declared outputs, building each lazily - except
+  // those the cache still holds up to date, which it serves at once.
   const BuildDirectoryTree build_tree(
-      tree, run, coordinator, [](const std::string& problems) {
+      tree, run, coordinator,
+      [](const std::string& problems) {
         // Best-effort, as this runs on the IoContext's thread.
         try {
           std::println(stderr,
@@ -225,7 +254,8 @@ int mount(const MountOptions& options) {
                        problems);
         } catch (...) {  // NOLINT(bugprone-empty-catch)
         }
-      });
+      },
+      &cache);
 
   const VirtualFileSystem vfs(build_tree, mountpoint_arg,
                               workers.get_scheduler());

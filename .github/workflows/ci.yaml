@@ -14,12 +14,12 @@ jobs:
         # The runner already has g++-14 but not clang-19. Debug builds with
         # Clang need its sanitizer runtimes, which clang-19 only recommends.
         include:
-          - {os: ubuntu-24.04,   compiler: Clang, cpp: clang++-19, apt: clang-19 libclang-rt-19-dev, build_type: Debug}
-          - {os: ubuntu-24.04,   compiler: Clang, cpp: clang++-19, apt: clang-19,                    build_type: Release}
-          - {os: ubuntu-24.04,   compiler: GCC,   cpp: g++-14,                                       build_type: Debug}
-          - {os: ubuntu-24.04,   compiler: GCC,   cpp: g++-14,                                       build_type: Release}
-          - {os: windows-latest, compiler: MSVC,  cpp: cl,                                           build_type: Debug}
-          - {os: windows-latest, compiler: MSVC,  cpp: cl,                                           build_type: Release}
+          - {os: ubuntu-24.04,   compiler: Clang, c: clang-19, cpp: clang++-19, apt: clang-19 libclang-rt-19-dev, build_type: Debug}
+          - {os: ubuntu-24.04,   compiler: Clang, c: clang-19, cpp: clang++-19, apt: clang-19,                    build_type: Release}
+          - {os: ubuntu-24.04,   compiler: GCC,   c: gcc-14,   cpp: g++-14,                                       build_type: Debug}
+          - {os: ubuntu-24.04,   compiler: GCC,   c: gcc-14,   cpp: g++-14,                                       build_type: Release}
+          - {os: windows-latest, compiler: MSVC,  c: cl,       cpp: cl,                                           build_type: Debug}
+          - {os: windows-latest, compiler: MSVC,  c: cl,       cpp: cl,                                           build_type: Release}
     name: ${{ matrix.compiler }} (${{ matrix.build_type }})
     runs-on: ${{ matrix.os }}
     steps:
@@ -60,11 +60,12 @@ jobs:
           if ($before[$name] -ne $value) { "$name=$value" }
         } | Add-Content $env:GITHUB_ENV
     # Ninja on every platform: the default generators (Make, MSBuild) run one
-    # compile at a time. The compiler is named explicitly because the Windows
-    # runner also has MinGW's g++ on PATH.
+    # compile at a time. The compilers are named explicitly because the Windows
+    # runner also has MinGW's gcc and g++ on PATH. C is only for SQLite.
     - name: Configure CMake
       run: >
         cmake -B build -G Ninja
+        -DCMAKE_C_COMPILER=${{ matrix.c }}
         -DCMAKE_CXX_COMPILER=${{ matrix.cpp }}
         -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
     - name: Build
@@ -87,6 +88,7 @@ jobs:
       # it here pins clang-tidy to the same release as the compiler.
       run: >
         cmake -B build -G Ninja
+        -DCMAKE_C_COMPILER=clang-19
         -DCMAKE_CXX_COMPILER=clang++-19
         -DENABLE_CLANG_TIDY=ON
         -DCLANG_TIDY_EXE=/usr/bin/clang-tidy-19

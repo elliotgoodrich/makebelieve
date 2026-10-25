@@ -11,6 +11,7 @@
 #include <expected>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 #ifdef _WIN32
@@ -83,6 +84,48 @@ std::expected<std::string, std::error_code> FileSystemUtil::read_file(
   }
 #endif
   return contents;
+}
+
+std::error_code FileSystemUtil::write_file(const std::filesystem::path& path,
+                                           std::string_view contents) {
+#ifdef _WIN32
+  // Not inheritable, as no SECURITY_ATTRIBUTES asks for it to be.
+  const HANDLE file =
+      CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                  FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    return {static_cast<int>(GetLastError()), std::system_category()};
+  }
+  const ScopeGuard close_file([file] { CloseHandle(file); });
+  while (!contents.empty()) {
+    // WriteFile takes at most a DWORD's worth at a time.
+    const DWORD chunk = static_cast<DWORD>(
+        std::min<std::size_t>(contents.size(), DWORD{1} << 30U));
+    DWORD n = 0;
+    if (!WriteFile(file, contents.data(), chunk, &n, nullptr)) {
+      return {static_cast<int>(GetLastError()), std::system_category()};
+    }
+    contents.remove_prefix(n);
+  }
+#else
+  const int fd =
+      ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+  if (fd < 0) {
+    return {errno, std::system_category()};
+  }
+  const ScopeGuard close_file([fd] { ::close(fd); });
+  while (!contents.empty()) {
+    const ssize_t n = ::write(fd, contents.data(), contents.size());
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return {errno, std::system_category()};
+    }
+    contents.remove_prefix(static_cast<std::size_t>(n));
+  }
+#endif
+  return {};
 }
 
 }  // namespace makebelieve
