@@ -175,6 +175,11 @@ int mount(const MountOptions& options) {
 
   const ConsoleInterruptHandler interrupt(io);
 
+  // Holds `makebelieve unmount` until it is destroyed, so it is declared before
+  // - and outlives - everything a mount tears down. Listens once the mount is
+  // up, below.
+  UnmountChannel unmount_channel;
+
   const std::filesystem::path source = std::filesystem::current_path();
   const std::filesystem::path mountpoint =
       std::filesystem::absolute(mountpoint_arg);
@@ -225,8 +230,8 @@ int mount(const MountOptions& options) {
   const VirtualFileSystem vfs(build_tree, mountpoint_arg,
                               workers.get_scheduler());
 
-  // Constructed after the mount so the mount root exists to canonicalize.
-  const UnmountChannel unmount_channel(mountpoint, io);
+  // Only after the mount, so the mount root exists to canonicalize.
+  unmount_channel.listen(mountpoint, io);
 
   // Only once the mount is up, as a command may read another output through
   // it the moment its build starts.
@@ -255,12 +260,6 @@ int unmount(const char* mountpoint_arg) {
       return 0;
     case UnmountChannel::Result::not_mounted:
       std::println(stderr, "makebelieve: nothing is mounted at [{}]",
-                   mountpoint_arg);
-      return 1;
-    case UnmountChannel::Result::teardown_timeout:
-      std::println(stderr,
-                   "makebelieve: [{}] was told to unmount but had not torn "
-                   "down after 5 seconds",
                    mountpoint_arg);
       return 1;
   }

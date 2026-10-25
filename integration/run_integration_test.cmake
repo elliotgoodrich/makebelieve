@@ -172,11 +172,12 @@ else()
   endif()
 endif()
 
-# Ask the daemon to unmount, which blocks until it has torn down. A clean stop
-# matters on Windows: a hard kill would orphan the ProjFS placeholders, which
-# then resist the next run's file(REMOVE_RECURSE).
+# Ask the daemon to unmount, which blocks until it has torn down, however long
+# that takes. The timeout turns a teardown that hangs into a failure here,
+# within the test's own TIMEOUT for everything before it as well.
 execute_process(COMMAND "${MAKEBELIEVE_EXE}" unmount "${MNT}"
-                RESULT_VARIABLE unmount_result OUTPUT_QUIET ERROR_QUIET)
+                RESULT_VARIABLE unmount_result OUTPUT_QUIET ERROR_QUIET
+                TIMEOUT 30)
 if(NOT unmount_result EQUAL 0)
   list(APPEND FAILURES "unmount did not report success (was ${unmount_result})")
 endif()

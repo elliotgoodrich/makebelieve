@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: MIT
 #include "unmountchannel.hpp"
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <stop_token>
 #include <string>
-#include <system_error>
-#include <thread>
 
 namespace makebelieve {
 
@@ -46,18 +44,8 @@ std::string UnmountChannel::endpoint_id(const std::filesystem::path& key) {
   return id;
 }
 
-bool UnmountChannel::wait_until_gone(const std::filesystem::path& mountpoint) {
-  const std::filesystem::path absolute = std::filesystem::absolute(mountpoint);
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (std::chrono::steady_clock::now() < deadline) {
-    std::error_code error;
-    if (!std::filesystem::exists(absolute, error)) {
-      return true;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
+std::stop_token UnmountChannel::token() const {
+  return m_source.get_token();
 }
 
 }  // namespace makebelieve

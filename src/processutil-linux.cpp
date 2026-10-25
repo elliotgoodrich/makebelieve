@@ -600,11 +600,10 @@ int shell_status(int status) noexcept {
 // for: as init, a shell could not even `kill $$`.
 [[noreturn]] void run_as_init(const std::filesystem::path& cwd,
                               const std::string& command) {
-  // This process never execs, so it would otherwise go on holding every
-  // descriptor it was cloned with, close-on-exec or not - the parent's, and
-  // so those of other commands running at the time - for as long as the
-  // command ran. It keeps only the command's standard streams, for the shell
-  // to inherit.
+  // This process never execs, so it would go on holding every descriptor it
+  // was cloned with, close-on-exec or not, for as long as the command ran.
+  // run_traced_child() has already closed all but the standard streams; this
+  // makes sure only those are left for the shell to inherit.
   ::close_range(STDERR_FILENO + 1, ~0U, 0);
   const pid_t shell = clone_process(0);
   if (shell < 0) {
@@ -658,6 +657,18 @@ int shell_status(int status) noexcept {
   if (!prepare_child_io(stdout_fd)) {
     fail(errno);
   }
+
+  // Keep only the standard streams and the handoff, before anything below can
+  // block. This process never execs, so it would otherwise hold every
+  // descriptor it was cloned with, close-on-exec or not: the clients of
+  // `makebelieve unmount`, which wait for theirs to close, and other
+  // commands' pipes, devices and handoffs. Were the parent to die while two
+  // setups waited on their handoffs, each would keep the other's open, and
+  // neither would see it close.
+  if (handoff_sock > STDERR_FILENO + 1) {
+    ::close_range(STDERR_FILENO + 1, handoff_sock - 1, 0);
+  }
+  ::close_range(handoff_sock + 1, ~0U, 0);
 
   // The namespaces let the mounts below be made without real privilege, and
   // keep them invisible elsewhere.
