@@ -4,6 +4,7 @@
 #include <expected>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 namespace makebelieve {
@@ -22,6 +23,13 @@ struct FileSystemUtil {
   /// unlike through `std::ifstream`, which cannot ask for that.
   [[nodiscard]] static std::expected<std::string, std::error_code> read_file(
       const std::filesystem::path& path);
+
+  /// Creates or truncates the file @a path and writes @a contents to it,
+  /// returning the error that stopped it, if any. As with read_file, no
+  /// command launched meanwhile inherits the file.
+  [[nodiscard]] static std::error_code write_file(
+      const std::filesystem::path& path,
+      std::string_view contents);
 };
 
 }  // namespace makebelieve

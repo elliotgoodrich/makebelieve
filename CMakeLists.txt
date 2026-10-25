@@ -2,7 +2,8 @@
 # to MSVC's /std:c++latest (MSVC ships no stable /std:c++23) is reliable from
 # 3.25 on.
 cmake_minimum_required(VERSION 3.25)
-project(makebelieve LANGUAGES CXX)
+# C only for SQLite, which ships as one C source file.
+project(makebelieve LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -41,6 +42,39 @@ target_compile_options(stdexec INTERFACE
   # code-generation warning, so the SYSTEM include above doesn't silence it.
   $<$<CXX_COMPILER_ID:MSVC>:/wd4714>
 )
+
+# SQLite, as its single-file amalgamation, holds the build cache's records.
+# Declared before the warning and sanitizer flags below, so it gets neither: it
+# is not our code, and an uninstrumented C object links into an instrumented
+# binary whichever compiler built it.
+FetchContent_Declare(
+  sqlite3
+  URL https://www.sqlite.org/2024/sqlite-amalgamation-3460100.zip
+  URL_HASH SHA256=77823cb110929c2bcb0f5d48e4833b5c59a8a6e40cdea3936b99e199dbbe5784
+)
+FetchContent_MakeAvailable(sqlite3)
+add_library(sqlite3 STATIC "${sqlite3_SOURCE_DIR}/sqlite3.c")
+target_include_directories(sqlite3 SYSTEM INTERFACE "${sqlite3_SOURCE_DIR}")
+target_compile_definitions(sqlite3 PRIVATE
+  SQLITE_DQS=0
+  SQLITE_DEFAULT_MEMSTATUS=0
+  SQLITE_OMIT_DEPRECATED
+  SQLITE_OMIT_LOAD_EXTENSION
+)
+target_compile_options(sqlite3 PRIVATE $<IF:$<C_COMPILER_ID:MSVC>,/W0,-w>)
+target_link_libraries(sqlite3 INTERFACE Threads::Threads)
+
+# xxHash names the build cache's stored outputs by their content. Header-only;
+# only its header is used, so its CMakeLists never runs.
+FetchContent_Declare(
+  xxhash
+  URL https://github.com/Cyan4973/xxHash/archive/refs/tags/v0.8.2.tar.gz
+  URL_HASH SHA256=baee0c6afd4f03165de7a4e67988d16f0f2b257b51d0e3cb91909302a26a79c4
+  SOURCE_SUBDIR do-not-configure
+)
+FetchContent_MakeAvailable(xxhash)
+add_library(xxhash INTERFACE)
+target_include_directories(xxhash SYSTEM INTERFACE "${xxhash_SOURCE_DIR}")
 
 enable_testing()
 
@@ -179,6 +213,14 @@ if(BUILD_TESTING)
       -DBUILD_ALL=ON
       -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_dependency_test.cmake")
   set_tests_properties(makebelieve_dependencies_build_all PROPERTIES TIMEOUT 300)
+
+  # Builds kept from one run to the next
+  add_test(NAME makebelieve_resume
+    COMMAND "${CMAKE_COMMAND}"
+      "-DMAKEBELIEVE_EXE=$<TARGET_FILE:makebelieve>"
+      "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/integration/resume-work"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_resume_test.cmake")
+  set_tests_properties(makebelieve_resume PROPERTIES TIMEOUT 300)
 
   # Outputs run as programs rather than read
   add_executable(makebelieve_hello integration/executable/hello.m.cpp)

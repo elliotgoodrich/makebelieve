@@ -17,6 +17,7 @@
 
 namespace makebelieve {
 
+class BuildCache;
 class BuildCoordinator;
 
 /// @class BuildDirectoryTree
@@ -67,6 +68,15 @@ class BuildCoordinator;
 /// runner. Every open takes a fresh snapshot, and since that rewrite is caused
 /// by the reader it is not announced to subscribers.
 ///
+/// Given a @link BuildCache, the tree keeps each successful build in it, with
+/// a stamp of every input it read: a source file's mtime and size, or the hash
+/// of an output's content. On construction it serves every output whose record
+/// still holds as already built - the same command, every source input
+/// stamped as it is now, every output it read itself restored with the content
+/// it read - and drops every other record. An output that goes stale has its
+/// record dropped at once, so a record never outlives what it describes. A
+/// `tracing` output is never kept.
+///
 /// Subscribers are notified while an internal lock is held, so they must not
 /// call `open` from within their callback.
 class BuildDirectoryTree : public DirectoryTree {
@@ -85,11 +95,14 @@ class BuildDirectoryTree : public DirectoryTree {
   /// @link CommandRunner. A @a source without a `build.makebelieve` file
   /// yields an empty tree. Throws `std::runtime_error` describing the problems
   /// if the manifest cannot be read or has lines it cannot accept; later
-  /// problems of that kind go to @a on_manifest_error, if given.
+  /// problems of that kind go to @a on_manifest_error, if given. Builds are
+  /// kept in @a cache, if given, and restored from it.
   /// @pre @a source outlives this tree; it is observed for its whole life.
+  /// @pre @a cache, if given, outlives this tree.
   BuildDirectoryTree(const DirectoryTree& source,
                      CommandRunner runner,
-                     ManifestErrorHandler on_manifest_error = {});
+                     ManifestErrorHandler on_manifest_error = {},
+                     BuildCache* cache = nullptr);
 
   /// As above, but running and waiting on builds through @a coordinator
   /// rather than one of its own, which places no limit on how many run at
@@ -98,7 +111,8 @@ class BuildDirectoryTree : public DirectoryTree {
   BuildDirectoryTree(const DirectoryTree& source,
                      CommandRunner runner,
                      BuildCoordinator& coordinator,
-                     ManifestErrorHandler on_manifest_error = {});
+                     ManifestErrorHandler on_manifest_error = {},
+                     BuildCache* cache = nullptr);
 
   /// Cancels every build still under way and waits for each to complete, so
   /// no build outlives the tree.

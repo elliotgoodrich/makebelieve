@@ -109,6 +109,46 @@ TEST(ReadFile, ReportsAMissingFile) {
   EXPECT_EQ(read.error(), std::errc::no_such_file_or_directory);
 }
 
+TEST(WriteFile, WritesBytesThatReadBackUnchanged) {
+  std::string contents;
+  for (int i = 0; i < 10000; ++i) {
+    contents += static_cast<char>(i % 256);  // NUL, CR and LF among them
+  }
+  const std::filesystem::path path = temp_file();
+
+  const std::error_code written =
+      makebelieve::FileSystemUtil::write_file(path, contents);
+  const std::expected<std::string, std::error_code> read =
+      makebelieve::FileSystemUtil::read_file(path);
+  std::filesystem::remove(path);
+
+  ASSERT_FALSE(written) << written.message();
+  ASSERT_TRUE(read.has_value()) << read.error().message();
+  EXPECT_EQ(*read, contents);
+}
+
+TEST(WriteFile, ReplacesWhatTheFileHeld) {
+  const std::filesystem::path path = temp_file();
+  ASSERT_FALSE(makebelieve::FileSystemUtil::write_file(path, "a longer start"));
+
+  const std::error_code written =
+      makebelieve::FileSystemUtil::write_file(path, "short");
+  const std::expected<std::string, std::error_code> read =
+      makebelieve::FileSystemUtil::read_file(path);
+  std::filesystem::remove(path);
+
+  ASSERT_FALSE(written) << written.message();
+  ASSERT_TRUE(read.has_value()) << read.error().message();
+  EXPECT_EQ(*read, "short");
+}
+
+TEST(WriteFile, ReportsAMissingDirectory) {
+  const std::error_code written = makebelieve::FileSystemUtil::write_file(
+      temp_file() / "missing" / "file", "x");
+
+  EXPECT_EQ(written, std::errc::no_such_file_or_directory);
+}
+
 #ifdef __linux__
 // /proc files report a size of 0, so only reading to the end finds what they
 // hold.

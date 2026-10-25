@@ -32,6 +32,7 @@ endif()
 # Split from the executable so that tests can link the daemon's guts directly
 # rather than driving it through the binary.
 add_library(makebelieve_core STATIC
+  buildcache.cpp
   buildcoordinator.cpp
   builddirectorytree.cpp
   consoleinterrupthandler-${MAKEBELIEVE_PLATFORM}.cpp
@@ -95,6 +96,8 @@ target_compile_definitions(makebelieve_core PUBLIC
 # static lib still forwards the .lib to the final link line.
 target_link_libraries(makebelieve_core PRIVATE
   $<$<PLATFORM_ID:Windows>:detours>
+  sqlite3
+  xxhash
 )
 
 # The libfuse3 lookup is a configure-time command, not a value, so it cannot be
@@ -153,6 +156,7 @@ if(BUILD_TESTING)
     gtest_discover_tests(${name}_test PROPERTIES TIMEOUT 30)
   endfunction()
 
+  makebelieve_add_test(buildcache)
   makebelieve_add_test(buildcoordinator)
   makebelieve_add_test(builddirectorytree)
   makebelieve_add_test(filesystemutil)

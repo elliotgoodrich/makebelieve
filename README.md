@@ -64,6 +64,11 @@ If one of the dependencies changes, **makebelieve** will rerun the
 command and regenerate the output, and opening the file while that is
 under way waits for it.
 
+What has been built is kept beside the mountpoint, in `../output.makebelieve`,
+so stopping **makebelieve** - or a crash - loses nothing: the next `mount`
+serves every output whose command and dependencies are unchanged without
+building it again.
+
 This build system works well in situations where we can listen 
 for notifications when a file changes and react accordingly. For example,
 a static website generator where the browser can reload when a file is

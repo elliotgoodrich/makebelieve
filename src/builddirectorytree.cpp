@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "builddirectorytree.hpp"
 
+#include "buildcache.hpp"
 #include "buildcoordinator.hpp"
 #include "buildpermits.hpp"
 #include "directorytreeutil.hpp"
@@ -13,6 +14,7 @@
 #include <stdexec/execution.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -27,6 +29,7 @@
 #include <new>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -286,6 +289,10 @@ class BuildDirectoryTree::Impl {
   struct Attempts {
     BuildCoordinator::AttemptPtr current;
     BuildCoordinator::AttemptPtr next;
+
+    // The output's count of m_invalidations when `current` started, so its
+    // result is kept in the cache only if nothing invalidated it since.
+    std::uint64_t invalidations_at_start = 0;
   };
   std::map<std::filesystem::path, Attempts> m_attempts;
 
@@ -326,6 +333,23 @@ class BuildDirectoryTree::Impl {
   // it, matched against a source change to find what to rebuild.
   std::map<std::filesystem::path, std::set<std::filesystem::path>> m_dependents;
 
+  // How many times each output has gone stale through invalidate(), or had
+  // its rule removed: a build started at one count describes the output only
+  // while the count stands.
+  std::map<std::filesystem::path, std::uint64_t> m_invalidations;
+
+  // The hash of each output's content as served, kept while there is a cache,
+  // so a build that reads the output can record what it read.
+  std::map<std::filesystem::path, std::string> m_hashes;
+
+  // Where builds are kept across runs; may be null.
+  BuildCache* m_cache;
+
+  // Taken around each change to m_cache, before m_mutex, so a build's record
+  // is stored only if nothing invalidated the build first, and an
+  // invalidation's dropping of records always comes after any such store.
+  std::mutex m_cache_mutex;
+
   CommandRunner m_runner;
 
   // Used when the tree is given no coordinator: no limit on builds, and no
@@ -361,8 +385,10 @@ class BuildDirectoryTree::Impl {
   Impl(const DirectoryTree& source,
        CommandRunner runner,
        BuildCoordinator* coordinator,
-       ManifestErrorHandler on_manifest_error)
+       ManifestErrorHandler on_manifest_error,
+       BuildCache* cache)
       : m_source(source),
+        m_cache(cache),
         m_runner(std::move(runner)),
         m_coordinator(coordinator),
         m_on_manifest_error(std::move(on_manifest_error)) {
@@ -378,7 +404,10 @@ class BuildDirectoryTree::Impl {
     set_rules(std::move(*rules));
 
     // Subscribe only once the outputs are in place, so the callback cannot race
-    // the constructor.
+    // the constructor. Restoring from the cache holds the callback off
+    // meanwhile, so a change that lands while stamps are compared is applied
+    // after - never lost between a stamp and the subscription.
+    const std::lock_guard gate_lock(m_gate->mutex);
     m_source_subscription = source.subscribe_to_changes(
         [this, gate = m_gate](const DirectoryTreeDiff& diff) {
           const std::lock_guard lock(gate->mutex);
@@ -386,6 +415,15 @@ class BuildDirectoryTree::Impl {
             on_source_change(diff);
           }
         });
+    if (m_cache != nullptr) {
+      // Best-effort: whatever it restored before failing is consistent, and
+      // the rest builds afresh. Never thrown out of here, where a callback
+      // may already be waiting on the gate to run against this object.
+      try {
+        restore_from_cache();
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+      }
+    }
   }
 
   ~Impl() {
@@ -530,6 +568,14 @@ class BuildDirectoryTree::Impl {
   }
 
  private:
+  // A successful build to keep in the cache, as finish_build found it.
+  struct Keep {
+    Command command;
+    std::vector<std::filesystem::path> inputs;
+    std::chrono::file_clock::time_point mtime;
+    std::uint64_t invalidations_at_start = 0;
+  };
+
   // A build claimed under m_mutex, for launch_build to start once it is
   // released.
   struct Launch {
@@ -640,6 +686,7 @@ class BuildDirectoryTree::Impl {
         attempts.next != nullptr ? std::exchange(attempts.next, nullptr)
                                  : m_coordinator->create_attempt(output);
     attempts.current = attempt;
+    attempts.invalidations_at_start = m_invalidations[output];
     m_stale.erase(output);
     m_in_flight.insert(output);
     m_reads.try_emplace(output);
@@ -793,17 +840,33 @@ class BuildDirectoryTree::Impl {
                     const BuildCoordinator::AttemptPtr& attempt,
                     std::uint64_t build_id,
                     BuildResult result) {
+    // What to keep in the cache once waiters are released, if anything.
+    std::optional<Keep> keep;
     if (result.has_value()) {
       const std::lock_guard layout(m_layout_mutex);
       bool declared = false;
+      const auto built_at = std::chrono::file_clock::now();
       {
         const std::lock_guard lock(m_mutex);
         // Its rule may have left the manifest mid-build.
-        declared = m_commands.contains(output);
+        const auto command = m_commands.find(output);
+        declared = command != m_commands.end();
         if (declared) {
           if (const auto reads = m_reads.find(output); reads != m_reads.end()) {
             result->inputs.insert(result->inputs.end(), reads->second.begin(),
                                   reads->second.end());
+          }
+          if (m_cache != nullptr) {
+            // Before any waiter is released, so a build reading this output
+            // finds the hash of what it read.
+            m_hashes.insert_or_assign(output, BuildCache::hash(result->bytes));
+            if (command->second.action != Manifest::Action::Tracing) {
+              keep = Keep{.command = command->second,
+                          .inputs = result->inputs,
+                          .mtime = built_at,
+                          .invalidations_at_start =
+                              m_attempts[output].invalidations_at_start};
+            }
           }
           update_dependents(output, std::move(result->inputs));
         }
@@ -811,7 +874,7 @@ class BuildDirectoryTree::Impl {
       // Outside m_mutex: write_file notifies subscribers, who may read back
       // through us.
       if (declared) {
-        m_structure.write_file(output, std::move(result->bytes));
+        m_structure.write_file(output, result->bytes, built_at);
       }
     }
 
@@ -855,6 +918,11 @@ class BuildDirectoryTree::Impl {
           orphaned, std::make_error_code(std::errc::no_such_file_or_directory));
     }
 
+    // After the release, as nothing waiting needs it.
+    if (keep.has_value()) {
+      keep_in_cache(output, result->bytes, *keep);
+    }
+
     const std::optional<TraceLane> lane =
         build_id != 0 ? lane_of(output) : std::nullopt;
     if (lane.has_value()) {
@@ -868,6 +936,222 @@ class BuildDirectoryTree::Impl {
 
     if (next.has_value()) {
       launch_build(std::move(*next));
+    }
+  }
+
+  // The stamp of the source file or directory @a path as it is now, or
+  // nothing if it cannot be had.
+  [[nodiscard]] std::optional<BuildCache::Input> stamp_source(
+      const std::filesystem::path& path) const {
+    const std::expected<EntryInfo, std::error_code> info =
+        m_source.status(path);
+    if (!info.has_value()) {
+      return std::nullopt;
+    }
+    if (const auto* const file = std::get_if<FileInfo>(&*info)) {
+      return BuildCache::Input{.path = path,
+                               .mtime = BuildCache::raw_mtime(file->mtime),
+                               .size = static_cast<std::int64_t>(file->size),
+                               .hash = {}};
+    }
+    return BuildCache::Input{
+        .path = path,
+        .mtime = BuildCache::raw_mtime(std::get<DirectoryInfo>(*info).mtime),
+        .size = -1,
+        .hash = {}};
+  }
+
+  // The output @a input names, if it names one rather than a source file.
+  static std::optional<std::filesystem::path> output_named_by(
+      const std::filesystem::path& input) {
+    const std::string text = input.generic_string();
+    if (!text.starts_with(k_generated_prefix)) {
+      return std::nullopt;
+    }
+    return std::filesystem::path(text.substr(k_generated_prefix.size()));
+  }
+
+  // Keeps @a output's build, @a bytes, in the cache - unless something
+  // invalidated it since it started, or an input it read cannot be stamped,
+  // in which case the output is left with no record.
+  void keep_in_cache(const std::filesystem::path& output,
+                     const std::string& bytes,
+                     const Keep& keep) {
+    const std::lock_guard cache_lock(m_cache_mutex);
+    std::vector<BuildCache::Input> stamps;
+    bool keepable = true;
+    {
+      const std::lock_guard lock(m_mutex);
+      const auto invalidations = m_invalidations.find(output);
+      keepable = (invalidations == m_invalidations.end()
+                      ? 0
+                      : invalidations->second) == keep.invalidations_at_start;
+      for (const std::filesystem::path& input : keep.inputs) {
+        if (!keepable) {
+          break;
+        }
+        if (const std::optional<std::filesystem::path> read =
+                output_named_by(input)) {
+          const auto hash = m_hashes.find(*read);
+          keepable = hash != m_hashes.end();
+          if (keepable) {
+            stamps.push_back(BuildCache::Input{
+                .path = input, .mtime = 0, .size = 0, .hash = hash->second});
+          }
+        }
+      }
+    }
+    // Source files are stamped outside m_mutex, as that reaches the disk. A
+    // change landing after the stamp invalidates the output, whose record is
+    // then dropped once this one is in place.
+    for (const std::filesystem::path& input : keep.inputs) {
+      if (!keepable) {
+        break;
+      }
+      if (!output_named_by(input).has_value()) {
+        const std::optional<BuildCache::Input> stamp = stamp_source(input);
+        keepable = stamp.has_value();
+        if (keepable) {
+          stamps.push_back(*stamp);
+        }
+      }
+    }
+    // Best-effort: a build the cache cannot keep is just built again next run.
+    try {
+      if (keepable) {
+        m_cache->store(keep.command, bytes, keep.mtime, stamps);
+      } else {
+        m_cache->forget(std::span(&output, 1));
+      }
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+    }
+  }
+
+  // Drops the cache's records of @a outputs.
+  void forget_in_cache(const std::vector<std::filesystem::path>& outputs) {
+    if (m_cache == nullptr || outputs.empty()) {
+      return;
+    }
+    const std::lock_guard cache_lock(m_cache_mutex);
+    // Best-effort, as for keep_in_cache. A record left behind holds stamps
+    // that no longer match, so the next run still finds it stale.
+    try {
+      m_cache->forget(outputs);
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+    }
+  }
+
+  // What restore_from_cache works out as it goes.
+  struct Restoring {
+    // Every record, by the output it is of.
+    std::map<std::filesystem::path, const BuildCache::Record*> records;
+    // The rules in force.
+    std::map<std::filesystem::path, Command> commands;
+    // Whether each output's record holds, worked out once each.
+    enum class Check : std::uint8_t { checking, holds, stale };
+    std::map<std::filesystem::path, Check> checked;
+    // The content of every output whose record holds.
+    std::map<std::filesystem::path, std::string> contents;
+  };
+
+  // Whether @a output's record in @a restoring holds: its rule is unchanged,
+  // every source file it read is stamped as it is now, every output it read
+  // holds too with the content it read, and its own content is intact. An
+  // output on a cycle finds its own record does not.
+  // NOLINTNEXTLINE(misc-no-recursion): through what it read; `checked` ends it
+  bool record_holds(const std::filesystem::path& output,
+                    Restoring& restoring) const {
+    using Check = Restoring::Check;
+    if (const auto it = restoring.checked.find(output);
+        it != restoring.checked.end()) {
+      return it->second == Check::holds;
+    }
+    restoring.checked.emplace(output, Check::checking);
+    const bool holds = check_record(output, restoring);
+    restoring.checked.insert_or_assign(output,
+                                       holds ? Check::holds : Check::stale);
+    return holds;
+  }
+
+  // Works out, once, what record_holds says of @a output, keeping its
+  // content in @a restoring if so.
+  // NOLINTNEXTLINE(misc-no-recursion): see record_holds
+  bool check_record(const std::filesystem::path& output,
+                    Restoring& restoring) const {
+    const auto record = restoring.records.find(output);
+    const auto command = restoring.commands.find(output);
+    if (record == restoring.records.end() ||
+        command == restoring.commands.end() ||
+        command->second.action == Manifest::Action::Tracing ||
+        record->second->command != command->second) {
+      return false;
+    }
+    for (const BuildCache::Input& input : record->second->inputs) {
+      if (const std::optional<std::filesystem::path> read =
+              output_named_by(input.path)) {
+        if (!record_holds(*read, restoring) ||
+            restoring.records.at(*read)->hash != input.hash) {
+          return false;
+        }
+      } else if (stamp_source(input.path) != input) {
+        return false;
+      }
+    }
+    std::expected<std::string, std::error_code> bytes =
+        m_cache->read(record->second->hash);
+    if (!bytes.has_value()) {
+      return false;
+    }
+    restoring.contents.emplace(output, std::move(*bytes));
+    return true;
+  }
+
+  // Serves every output whose cached build still holds as built, and drops
+  // every other record. Called from the constructor, with source changes held
+  // off.
+  void restore_from_cache() {
+    std::vector<BuildCache::Record> records;
+    try {
+      records = m_cache->records();
+    } catch (...) {
+      return;  // as if empty: everything builds afresh
+    }
+    Restoring restoring;
+    for (const BuildCache::Record& record : records) {
+      restoring.records.emplace(record.command.output, &record);
+    }
+    {
+      const std::lock_guard lock(m_mutex);
+      restoring.commands = m_commands;
+    }
+
+    std::vector<std::filesystem::path> dropped;
+    {
+      const std::lock_guard layout(m_layout_mutex);
+      for (const BuildCache::Record& record : records) {
+        const std::filesystem::path& output = record.command.output;
+        if (!record_holds(output, restoring)) {
+          dropped.push_back(output);
+          continue;
+        }
+        // Its placeholder is already in place, so its directories are too.
+        m_structure.write_file(output, restoring.contents.at(output),
+                               record.mtime);
+        const std::lock_guard lock(m_mutex);
+        m_stale.erase(output);
+        m_hashes.insert_or_assign(output, record.hash);
+        std::vector<std::filesystem::path> inputs;
+        inputs.reserve(record.inputs.size());
+        for (const BuildCache::Input& input : record.inputs) {
+          inputs.push_back(input.path);
+        }
+        update_dependents(output, std::move(inputs));
+      }
+    }
+    try {
+      m_cache->forget(dropped);
+      m_cache->collect_garbage();
+    } catch (...) {  // NOLINT(bugprone-empty-catch): best-effort, as above
     }
   }
 
@@ -962,6 +1246,8 @@ class BuildDirectoryTree::Impl {
         for (const std::filesystem::path& output : removed) {
           m_stale.erase(output);
           m_materialized.erase(output);
+          m_hashes.erase(output);
+          ++m_invalidations[output];
           // A build under way keeps its attempts until it finishes, which
           // settles whatever waits on them.
           if (!m_in_flight.contains(output)) {
@@ -998,6 +1284,8 @@ class BuildDirectoryTree::Impl {
         }
       }
     }
+
+    forget_in_cache(removed);
 
     // Outside the layout lock, since an eager rebuild writes its result.
     invalidate(std::move(changed));
@@ -1050,10 +1338,10 @@ class BuildDirectoryTree::Impl {
   // downstream is served old content meanwhile.
   void invalidate(std::vector<std::filesystem::path> outputs) {
     std::vector<std::filesystem::path> eager;
+    // Outputs that read each other must not loop.
+    std::set<std::filesystem::path> seen;
     {
       const std::lock_guard lock(m_mutex);
-      // Outputs that read each other must not loop.
-      std::set<std::filesystem::path> seen;
       while (!outputs.empty()) {
         const std::filesystem::path output = std::move(outputs.back());
         outputs.pop_back();
@@ -1061,6 +1349,7 @@ class BuildDirectoryTree::Impl {
           continue;
         }
         m_stale.insert(output);
+        ++m_invalidations[output];
         // Eager only if opened and idle; an in-flight build re-runs if stale.
         if (m_materialized.contains(output) && !m_in_flight.contains(output)) {
           eager.push_back(output);
@@ -1072,6 +1361,10 @@ class BuildDirectoryTree::Impl {
         }
       }
     }
+    // Before any rebuild starts, so a record of the stale content never
+    // outlives it.
+    forget_in_cache({seen.begin(), seen.end()});
+
     // Called only from within on_source_change, whose span is what the
     // rebuilds' arrows leave.
     const std::optional<TraceLane> origin =
@@ -1084,20 +1377,24 @@ class BuildDirectoryTree::Impl {
 
 BuildDirectoryTree::BuildDirectoryTree(const DirectoryTree& source,
                                        CommandRunner runner,
-                                       ManifestErrorHandler on_manifest_error)
+                                       ManifestErrorHandler on_manifest_error,
+                                       BuildCache* cache)
     : m_impl(std::make_unique<Impl>(source,
                                     std::move(runner),
                                     nullptr,
-                                    std::move(on_manifest_error))) {}
+                                    std::move(on_manifest_error),
+                                    cache)) {}
 
 BuildDirectoryTree::BuildDirectoryTree(const DirectoryTree& source,
                                        CommandRunner runner,
                                        BuildCoordinator& coordinator,
-                                       ManifestErrorHandler on_manifest_error)
+                                       ManifestErrorHandler on_manifest_error,
+                                       BuildCache* cache)
     : m_impl(std::make_unique<Impl>(source,
                                     std::move(runner),
                                     &coordinator,
-                                    std::move(on_manifest_error))) {}
+                                    std::move(on_manifest_error),
+                                    cache)) {}
 
 BuildDirectoryTree::~BuildDirectoryTree() = default;
 
