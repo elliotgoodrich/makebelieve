@@ -6,6 +6,7 @@
 
 #include <stdexec/execution.hpp>
 
+#include <cassert>
 #include <cstdio>
 #include <filesystem>
 #include <print>
@@ -14,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 #include <windows.h>
 
@@ -79,6 +81,11 @@ std::wstring endpoint_name(const std::string& id) {
          std::wstring(id.begin(), id.end());
 }
 
+// Names the mutex the mount holds until it has torn down, beside its event.
+std::wstring alive_name(const std::wstring& endpoint) {
+  return endpoint + L"-alive";
+}
+
 // Closes a HANDLE on scope exit, tolerating a null handle.
 class ScopedHandle {
   HANDLE m_handle = nullptr;
@@ -110,19 +117,45 @@ class ScopedHandle {
 }  // namespace
 
 class UnmountChannel::Impl {
-  std::stop_source m_source;
+  std::stop_source m_source;  // Shares the channel's stop state.
+
+  // Held from construction until destruction, so `request_unmount` waits on it
+  // for teardown. Owned by the constructing thread, which must release it. If
+  // that thread ends first it is abandoned, which ends the wait too.
+  ScopedHandle m_alive;
+
   ScopedHandle m_poke;  // Auto-reset event, signalled to trigger a stop.
 
   // The wait on m_poke, stopped and joined on destruction.
   stdexec::counting_scope m_listening;
 
  public:
-  Impl(const std::filesystem::path& mountpoint, IoContext& io) {
-    // Create the named event first and read the "already exists" flag before
-    // any other Win32 call can clear it: a live event of this name means
-    // another instance already owns the mount.
+  Impl(const std::filesystem::path& mountpoint,
+       IoContext& io,
+       std::stop_source source)
+      : m_source(std::move(source)) {
+    // Take the mutex before creating the event, so whoever finds the event
+    // finds the mutex held. Read each "already exists" flag before any other
+    // Win32 call can clear it: either object existing means another instance
+    // already owns the mount, or is still tearing down.
     const std::wstring name =
         endpoint_name(endpoint_id(canonical_key(mountpoint)));
+    m_alive.reset(CreateMutexW(nullptr, TRUE, alive_name(name).c_str()));
+    if (m_alive.get() == nullptr) {
+      throw std::system_error(last_error_code(),
+                              "CreateMutex failed to create the control "
+                              "endpoint");
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+      throw std::runtime_error(
+          "another makebelieve instance is already serving [" +
+          mountpoint.string() + "]");
+    }
+    // Not released on a failure below, where the destructor will not run:
+    // whoever waits on it would return while the mount that failed to listen
+    // is still being unwound. Left owned, it is abandoned once this thread
+    // ends, after that.
+
     m_poke.reset(CreateEventW(nullptr, FALSE, FALSE, name.c_str()));
     const bool already_exists = GetLastError() == ERROR_ALREADY_EXISTS;
     if (m_poke.get() == nullptr) {
@@ -155,44 +188,87 @@ class UnmountChannel::Impl {
   ~Impl() {
     m_listening.request_stop();
     stdexec::sync_wait(m_listening.join());
-    // Closing the last handle to the named event removes the endpoint.
+    // Closing the last handle to the named event removes the endpoint. Only
+    // then is the mutex let go, so a waiting `request_unmount` returns once
+    // nothing of this mount is left.
+    m_poke.reset(nullptr);
+    ReleaseMutex(m_alive.get());
+    // Closed at once, as while it is open no later mount can take the name.
+    m_alive.reset(nullptr);
   }
 
   Impl(const Impl&) = delete;
   Impl& operator=(const Impl&) = delete;
   Impl(Impl&&) = delete;
   Impl& operator=(Impl&&) = delete;
-
-  [[nodiscard]] std::stop_token token() const { return m_source.get_token(); }
 };
 
 UnmountChannel::Result UnmountChannel::request_unmount(
     const std::filesystem::path& mountpoint) {
   const std::wstring name =
       endpoint_name(endpoint_id(canonical_key(mountpoint)));
-  const HANDLE handle =
-      OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, name.c_str());
-  if (handle == nullptr) {
-    return Result::not_mounted;  // No endpoint of that name.
-  }
-  const ScopeGuard close_handle([handle] { CloseHandle(handle); });
 
-  if (!SetEvent(handle)) {
+  // Open the mutex before poking, so this waits on the mount it pokes: while
+  // the handle is open the mutex's name stays taken, so a mount started after
+  // this one has gone cannot take it over. The mount holds it from before it
+  // creates its event until after it closes it, so no mutex means no mount.
+  const ScopedHandle alive(OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE,
+                                      alive_name(name).c_str()));
+  if (alive.get() == nullptr) {
+    if (GetLastError() == ERROR_FILE_NOT_FOUND) {
+      return Result::not_mounted;
+    }
     throw std::system_error(last_error_code(),
-                            "SetEvent failed to signal the mount");
+                            "OpenMutex failed to reach the mount");
   }
 
-  return wait_until_gone(mountpoint) ? Result::ok : Result::teardown_timeout;
+  // Poke, then wait for the mutex to be let go. With no event the mount is
+  // either about to create it or has already closed it to tear down, so keep
+  // trying to poke it until it turns up or the mutex is let go.
+  constexpr DWORD k_retry_ms = 10;
+  bool poked = false;
+  while (true) {
+    if (!poked) {
+      const ScopedHandle poke(
+          OpenEventW(EVENT_MODIFY_STATE, FALSE, name.c_str()));
+      if (poke.get() != nullptr) {
+        if (!SetEvent(poke.get())) {
+          throw std::system_error(last_error_code(),
+                                  "SetEvent failed to signal the mount");
+        }
+        poked = true;
+      } else if (GetLastError() != ERROR_FILE_NOT_FOUND) {
+        throw std::system_error(last_error_code(),
+                                "OpenEvent failed to reach the mount");
+      }
+      // Closed now, so this handle cannot keep the event's name alive for a
+      // mount that follows.
+    }
+
+    // WAIT_ABANDONED means the mount's process died holding it.
+    const DWORD waited =
+        WaitForSingleObject(alive.get(), poked ? INFINITE : k_retry_ms);
+    if (waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED) {
+      // Owned now, so let it go at once for the next mount to take.
+      ReleaseMutex(alive.get());
+      return Result::ok;
+    }
+    if (waited != WAIT_TIMEOUT) {
+      throw std::system_error(last_error_code(),
+                              "WaitForSingleObject failed to wait for the "
+                              "mount to tear down");
+    }
+  }
 }
 
-UnmountChannel::UnmountChannel(const std::filesystem::path& mountpoint,
-                               IoContext& io)
-    : m_impl(std::make_unique<Impl>(mountpoint, io)) {}
+UnmountChannel::UnmountChannel() = default;
 
 UnmountChannel::~UnmountChannel() = default;
 
-std::stop_token UnmountChannel::token() const {
-  return m_impl->token();
+void UnmountChannel::listen(const std::filesystem::path& mountpoint,
+                            IoContext& io) {
+  assert(m_impl == nullptr && "UnmountChannel is already listening");
+  m_impl = std::make_unique<Impl>(mountpoint, io, m_source);
 }
 
 }  // namespace makebelieve

@@ -5,6 +5,7 @@
 
 #include <stdexec/execution.hpp>
 
+#include <cassert>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,8 @@
 #include <stop_token>
 #include <string>
 #include <system_error>
+#include <utility>
+#include <vector>
 
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -146,16 +149,24 @@ bool make_address(const std::filesystem::path& path, sockaddr_un& addr) {
 }  // namespace
 
 class UnmountChannel::Impl {
-  std::stop_source m_source;
+  std::stop_source m_source;     // Shares the channel's stop state.
   std::filesystem::path m_path;  // The socket file, unlinked on teardown.
   UniqueFd m_listen;
+
+  // Every client that has poked, held open until teardown: `request_unmount`
+  // waits for its end to close. Only touched from the IoContext's thread
+  // until m_listening is joined.
+  std::vector<int> m_clients;
 
   // The wait on m_listen, stopped and joined on destruction.
   stdexec::counting_scope m_listening;
   bool m_serving = false;
 
  public:
-  Impl(const std::filesystem::path& mountpoint, IoContext& io) {
+  Impl(const std::filesystem::path& mountpoint,
+       IoContext& io,
+       std::stop_source source)
+      : m_source(std::move(source)) {
     const std::optional<std::filesystem::path> path =
         socket_path(endpoint_id(canonical_key(mountpoint)));
     if (!path) {
@@ -163,7 +174,7 @@ class UnmountChannel::Impl {
       // mount still works; only a console interrupt can stop it.
       std::println(
           stderr,
-          "makebelieve: no per-user runtime directory for a control "
+          "makebelieve: no private per-user runtime directory for a control "
           "endpoint; `makebelieve unmount` cannot stop this mount, use "
           "Ctrl+C instead");
       return;
@@ -186,7 +197,9 @@ class UnmountChannel::Impl {
 
     bind_endpoint(addr);
 
-    if (::listen(m_listen.get(), 1) != 0) {
+    // Room for as many requests as arrive at once, as one left waiting to
+    // connect when the endpoint closes is told nothing is mounted.
+    if (::listen(m_listen.get(), SOMAXCONN) != 0) {
       throw std::system_error(last_error_code(), "listen");
     }
 
@@ -211,16 +224,20 @@ class UnmountChannel::Impl {
     }
     m_listening.request_stop();
     stdexec::sync_wait(m_listening.join());
-    // Remove the endpoint; the directory is left in place.
+    // Remove the endpoint; the directory is left in place. Only then let the
+    // clients go, so a waiting `request_unmount` returns once nothing of this
+    // mount is left.
     ::unlink(m_path.c_str());
+    m_listen.reset();
+    for (const int client : m_clients) {
+      ::close(client);
+    }
   }
 
   Impl(const Impl&) = delete;
   Impl& operator=(const Impl&) = delete;
   Impl(Impl&&) = delete;
   Impl& operator=(Impl&&) = delete;
-
-  [[nodiscard]] std::stop_token token() const { return m_source.get_token(); }
 
  private:
   // Binds the socket, enforcing single ownership: a bind clash means either a
@@ -254,15 +271,33 @@ class UnmountChannel::Impl {
   }
 
   // Turns every poke (a client connect) waiting to be accepted into a stop
-  // request. Idempotent, so the watch keeps going to the end.
+  // request, keeping the client to release at teardown. Idempotent, so the
+  // watch keeps going to the end.
   void accept_pokes() noexcept {
     while (true) {
       const int client =
           ::accept4(m_listen.get(), nullptr, nullptr, SOCK_CLOEXEC);
       if (client < 0) {
-        return;  // Drained (EAGAIN), or nothing more to be done.
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          return;  // Drained.
+        }
+        if (errno == EINTR || errno == ECONNABORTED) {
+          continue;  // Interrupted, or that client gave up first.
+        }
+        // A client is waiting but cannot be accepted - out of descriptors,
+        // say. The socket being readable is its poke all the same, so stop:
+        // it is let go, with a reset, when the socket closes at teardown.
+        // Until then the watch keeps reporting the socket ready.
+        m_source.request_stop();
+        return;
       }
-      ::close(client);
+      try {
+        m_clients.push_back(client);
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+        // Out of memory: leave it open, untracked. Closing it now would let
+        // that `request_unmount` return before teardown, whereas the process
+        // exiting closes it at the right time.
+      }
       m_source.request_stop();
     }
   }
@@ -293,17 +328,30 @@ UnmountChannel::Result UnmountChannel::request_unmount(
     throw std::system_error(last_error_code(), "connect");
   }
 
-  return wait_until_gone(mountpoint) ? Result::ok : Result::teardown_timeout;
+  // The mount holds its end open until it has torn down, or its process
+  // exits, so wait for that end to close: a read of 0 bytes, or a reset.
+  // The socket blocks, so each read waits for that.
+  while (true) {
+    char byte = 0;
+    const ssize_t got = ::recv(sock.get(), &byte, 1, 0);
+    if (got == 0 || (got < 0 && errno == ECONNRESET)) {
+      return Result::ok;
+    }
+    if (got < 0 && errno != EINTR) {
+      throw std::system_error(last_error_code(), "recv");
+    }
+    // The mount never writes, but anything that arrives is ignored.
+  }
 }
 
-UnmountChannel::UnmountChannel(const std::filesystem::path& mountpoint,
-                               IoContext& io)
-    : m_impl(std::make_unique<Impl>(mountpoint, io)) {}
+UnmountChannel::UnmountChannel() = default;
 
 UnmountChannel::~UnmountChannel() = default;
 
-std::stop_token UnmountChannel::token() const {
-  return m_impl->token();
+void UnmountChannel::listen(const std::filesystem::path& mountpoint,
+                            IoContext& io) {
+  assert(m_impl == nullptr && "UnmountChannel is already listening");
+  m_impl = std::make_unique<Impl>(mountpoint, io, m_source);
 }
 
 }  // namespace makebelieve
