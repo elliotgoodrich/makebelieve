@@ -400,6 +400,14 @@ class VirtualFileSystem::Impl {
         // the last handle closing is what releases notifications held back
         // for an open file (see cleanup()).
         .PostCleanupWhenModifiedOnly = 0,
+        // Drop a file's cached pages when its last handle closes. Otherwise
+        // the pages of a version that has since changed stay until the
+        // notifier announces the change, which it does on its own thread, and
+        // an open that gets in first maps them - keeping them for as long as
+        // that view is mapped. Cleanup comes before CloseHandle returns, so a
+        // mapping that has gone is gone before the next open. Pages a view
+        // still maps cannot be dropped, which is the case COMPAT.md describes.
+        .FlushAndPurgeOnCleanup = 1,
         // The context open() hands back is one OpenFile per handle, not one
         // per file. By default WinFsp assumes the latter - every open of a
         // name must return the same pointer while any handle to it is live -

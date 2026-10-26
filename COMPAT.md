@@ -114,10 +114,11 @@ process, or a tool that maps its inputs, such as `link.exe` or a compiler
 loading a precompiled header. Plain reads are not affected: they never go
 through that section.
 
-This can last after the program holding the earlier version has exited.
-WinFsp cannot drop a section's pages while any view of them is mapped, and
-makebelieve only asks it to when the output changes, so pages left from before
-a rebuild can stay until the output is next rebuilt, or until Windows reclaims
+This can last after the program holding the earlier version has exited. WinFsp
+cannot drop a section's pages while any view of them is mapped, and makebelieve
+only asks it to when the output changes or the last handle on it closes - and a
+program keeps its view after closing its handle - so pages left from before a
+rebuild can stay until the output is next rebuilt, or until Windows reclaims
 the memory.
 
 A build command that maps an output it reads can therefore build from the
