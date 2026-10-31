@@ -73,6 +73,15 @@ the copy:
 @/latest.json = copy @/releases/v2.json
 ```
 
+A build that fails makes opening its output fail with an I/O error (`EIO`
+on Linux, `STATUS_IO_DEVICE_ERROR` on Windows) - never with
+`ENOENT`, which would suggest the output does not exist. That covers a
+command exiting nonzero, a `run` command that exits successfully but
+writes nothing to `%out`, and a `copy` whose source cannot be read; the
+last two also print a line to **makebelieve**'s standard error naming the
+output and the reason. Commands' standard error goes there too, as does
+a `run` command's standard output.
+
 `tracing` takes no argument: the output is a trace of what
 **makebelieve** itself has been doing - every file opened through the
 mount, every build with its command and how long it took, and an arrow

@@ -24,6 +24,25 @@ class IoContext;
   return {status, exit_status_category()};
 }
 
+/// Why a build failed through a fault in its rule, rather than an error from
+/// the system - one a reader opening the output would otherwise mistake for an
+/// error about the output itself, such as it not existing.
+enum class BuildError : int {
+  /// A `Run` command exited successfully without leaving a file at `%out`.
+  out_not_written = 1,
+
+  /// The file a `Copy` rule names could not be read.
+  copy_source_unreadable,
+};
+
+/// The category of the errors @link BuildError names.
+[[nodiscard]] const std::error_category& build_error_category();
+
+/// The error a build fails with for @a error.
+[[nodiscard]] inline std::error_code make_error_code(BuildError error) {
+  return {static_cast<int>(error), build_error_category()};
+}
+
 namespace detail {
 
 // Carries out @a command as `ShellRunner` describes, waiting on a command it
@@ -53,13 +72,17 @@ exec::task<BuildResult> run_shell_command(
 /// `Run` command has `%out` substituted with a scratch file - with the same
 /// file name as the output it builds, so a tool that chooses its format from
 /// the extension needs no extra flag - and produces the bytes it wrote there,
-/// failing if it wrote no file there at all; a `Capture` command produces the
-/// bytes it wrote to standard output. A command that exits with a nonzero
-/// status fails. Each `@/<path>` in either becomes that output's path under
-/// the mountpoint. A
+/// failing with `BuildError::out_not_written` if it left no file there; what
+/// it wrote to standard output goes to this process's standard error. A
+/// `Capture` command produces the bytes it wrote to standard output. A command
+/// that exits with a nonzero status fails. Each `@/<path>` in either becomes
+/// that output's path under the mountpoint. A
 /// `Copy` rule runs no command at all: it produces the bytes of the file it
 /// names, read from under the working directory, and reports that file as its
-/// one input. (`BuildDirectoryTree` serves a copy of an output itself.)
+/// one input, failing with `BuildError::copy_source_unreadable` if that file
+/// cannot be read. (`BuildDirectoryTree` serves a copy of an output itself.)
+/// Either `BuildError` is explained by a line on standard error naming the
+/// output.
 /// Each command it runs is added to the @link BuildProcessTracker given at
 /// construction, before it runs, under the output it builds
 /// (`Command::output`).
