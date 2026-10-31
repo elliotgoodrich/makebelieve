@@ -64,6 +64,33 @@ TEST_F(BuildCacheTest, AFreshCacheIsEmpty) {
   EXPECT_TRUE(std::filesystem::is_directory(directory / "objects"));
 }
 
+TEST_F(BuildCacheTest, MarksItsDirectoryAsACache) {
+  { const BuildCache cache(directory); }
+
+  const std::expected<std::string, std::error_code> gitignore =
+      FileSystemUtil::read_file(directory / ".gitignore");
+  ASSERT_TRUE(gitignore.has_value()) << gitignore.error().message();
+  EXPECT_TRUE(gitignore->ends_with("\n*\n")) << *gitignore;
+
+  const std::expected<std::string, std::error_code> tag =
+      FileSystemUtil::read_file(directory / "CACHEDIR.TAG");
+  ASSERT_TRUE(tag.has_value()) << tag.error().message();
+  EXPECT_TRUE(tag->starts_with("Signature: 8a477f597d28d172789f06886806bc55"))
+      << *tag;
+}
+
+TEST_F(BuildCacheTest, KeepsAGitignoreThatIsAlreadyThere) {
+  std::filesystem::create_directories(directory);
+  ASSERT_FALSE(FileSystemUtil::write_file(directory / ".gitignore", "mine\n"));
+
+  { const BuildCache cache(directory); }
+
+  const std::expected<std::string, std::error_code> gitignore =
+      FileSystemUtil::read_file(directory / ".gitignore");
+  ASSERT_TRUE(gitignore.has_value()) << gitignore.error().message();
+  EXPECT_EQ(*gitignore, "mine\n");
+}
+
 TEST_F(BuildCacheTest, StoredRecordsOutliveTheCache) {
   const std::vector<BuildCache::Input> inputs = {
       {.path = "src/a.txt", .mtime = 42, .size = 7, .hash = {}},

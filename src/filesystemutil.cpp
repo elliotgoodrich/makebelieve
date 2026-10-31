@@ -128,4 +128,25 @@ std::error_code FileSystemUtil::write_file(const std::filesystem::path& path,
   return {};
 }
 
+std::error_code FileSystemUtil::hide(const std::filesystem::path& path) {
+#ifdef _WIN32
+  const DWORD attributes = GetFileAttributesW(path.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    return {static_cast<int>(GetLastError()), std::system_category()};
+  }
+  if ((attributes & FILE_ATTRIBUTE_HIDDEN) == 0 &&
+      !SetFileAttributesW(path.c_str(), attributes | FILE_ATTRIBUTE_HIDDEN)) {
+    return {static_cast<int>(GetLastError()), std::system_category()};
+  }
+  return {};
+#else
+  // There is no attribute to set: a name starting with `.` is what hides it.
+  std::error_code error;
+  if (!std::filesystem::exists(path, error) && !error) {
+    error = std::make_error_code(std::errc::no_such_file_or_directory);
+  }
+  return error;
+#endif
+}
+
 }  // namespace makebelieve

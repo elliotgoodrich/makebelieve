@@ -30,6 +30,10 @@ struct FileSystemUtil {
   [[nodiscard]] static std::error_code write_file(
       const std::filesystem::path& path,
       std::string_view contents);
+
+  /// Attempts to hide the existing file or directory @a path from listings
+  /// that skip hidden entries, returning the error that stopped it, if any.
+  [[nodiscard]] static std::error_code hide(const std::filesystem::path& path);
 };
 
 }  // namespace makebelieve

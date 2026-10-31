@@ -60,23 +60,24 @@ void raise_open_file_limit() {
 int usage(const char* program) {
   std::println(
       stderr,
-      "usage: {0} mount [-j <builds>] [--build=requested|all] <mountpoint>\n"
-      "       {0} unmount <mountpoint>\n"
-      "mount's options may also follow the mountpoint",
+      "usage: {0} mount [-j <builds>] [--build=requested|all] <directory>\n"
+      "       {0} unmount <directory>\n"
+      "outputs are served at <directory>/mount and kept in\n"
+      "<directory>/.makebelieve; mount's options may also follow the "
+      "directory",
       program);
   return 1;
 }
 
-// Where builds served at @a mountpoint are kept between runs: beside it, under
-// its name with `.makebelieve` added.
-std::filesystem::path cache_directory_for(std::filesystem::path mountpoint) {
-  mountpoint = std::filesystem::absolute(mountpoint).lexically_normal();
-  // `mnt/` names the same directory as `mnt`.
-  if (!mountpoint.has_filename()) {
-    mountpoint = mountpoint.parent_path();
-  }
-  mountpoint += ".makebelieve";
-  return mountpoint;
+// Where the outputs of the build directory @a directory are served.
+std::filesystem::path mountpoint_for(const std::filesystem::path& directory) {
+  return directory / "mount";
+}
+
+// Where the builds served from @a directory are kept between runs.
+std::filesystem::path cache_directory_for(
+    const std::filesystem::path& directory) {
+  return directory / ".makebelieve";
 }
 
 // A reason to stop: a token, and the exit status to end with once a stop is
@@ -110,7 +111,8 @@ enum class BuildMode : std::uint8_t {
 
 // How `mount` was asked to serve.
 struct MountOptions {
-  const char* mountpoint = nullptr;
+  // Holds the mount and the cache.
+  const char* directory = nullptr;
   // At most this many builds hold a permit at once; one per core if 0.
   unsigned jobs = 0;
   // Which outputs to keep built; `requested` if not given.
@@ -129,7 +131,7 @@ std::optional<BuildMode> parse_build_mode(std::string_view name) {
 }
 
 // Reads `mount`'s arguments - @a args, those after the command - or nothing if
-// they are not one mountpoint and options, each given at most once.
+// they are not one directory and options, each given at most once.
 std::optional<MountOptions> parse_mount(std::span<char* const> args) {
   constexpr std::string_view k_build_option = "--build=";
   MountOptions options;
@@ -153,13 +155,13 @@ std::optional<MountOptions> parse_mount(std::span<char* const> args) {
         return std::nullopt;
       }
       options.build = mode;
-    } else if (arg.starts_with('-') || options.mountpoint != nullptr) {
+    } else if (arg.starts_with('-') || options.directory != nullptr) {
       return std::nullopt;
     } else {
-      options.mountpoint = args[i];
+      options.directory = args[i];
     }
   }
-  if (options.mountpoint == nullptr) {
+  if (options.directory == nullptr) {
     return std::nullopt;
   }
   return options;
@@ -167,7 +169,7 @@ std::optional<MountOptions> parse_mount(std::span<char* const> args) {
 
 // Serves the manifest's outputs as @a options asks, blocking until torn down.
 int mount(const MountOptions& options) {
-  const char* const mountpoint_arg = options.mountpoint;
+  const char* const directory_arg = options.directory;
   const unsigned jobs = options.jobs;
   // Always recording, so a `tracing` rule added to the manifest at any point
   // shows the history leading up to it. Installed before anything below starts
@@ -194,28 +196,21 @@ int mount(const MountOptions& options) {
   UnmountChannel unmount_channel;
 
   const std::filesystem::path source = std::filesystem::current_path();
-  const std::filesystem::path mountpoint =
-      std::filesystem::absolute(mountpoint_arg);
+  const std::filesystem::path directory =
+      std::filesystem::absolute(directory_arg);
 
-  if (!FileSystemUtil::are_disjoint(mountpoint, source)) {
+  // It holds the mount and the cache, whose writes must not reach the source's
+  // change notifications, nor be taken for what a build read.
+  if (!FileSystemUtil::are_disjoint(directory, source)) {
     std::println(stderr,
-                 "makebelieve: mountpoint [{}] must not overlap the source "
+                 "makebelieve: directory [{}] must not overlap the source "
                  "directory [{}]",
-                 mountpoint_arg, source.string());
+                 directory_arg, source.string());
     return 1;
   }
+  const std::filesystem::path mountpoint = mountpoint_for(directory);
+  const std::filesystem::path cache_directory = cache_directory_for(directory);
 
-  // Its writes must not reach the source's change notifications, nor be taken
-  // for what a build read.
-  const std::filesystem::path cache_directory =
-      cache_directory_for(mountpoint_arg);
-  if (!FileSystemUtil::are_disjoint(cache_directory, source)) {
-    std::println(stderr,
-                 "makebelieve: the build cache [{}] must not overlap the "
-                 "source directory [{}]",
-                 cache_directory.string(), source.string());
-    return 1;
-  }
   // Outlives the build tree, which keeps its builds here.
   BuildCache cache(cache_directory);
 
@@ -257,8 +252,7 @@ int mount(const MountOptions& options) {
       },
       &cache);
 
-  const VirtualFileSystem vfs(build_tree, mountpoint_arg,
-                              workers.get_scheduler());
+  const VirtualFileSystem vfs(build_tree, mountpoint, workers.get_scheduler());
 
   // Only after the mount, so the mount root exists to canonicalize.
   unmount_channel.listen(mountpoint, io);
@@ -272,7 +266,7 @@ int mount(const MountOptions& options) {
   std::println(stderr,
                "makebelieve serving [{}], press Ctrl+C or run "
                "`makebelieve unmount {}` to stop",
-               mountpoint_arg, mountpoint_arg);
+               mountpoint_for(directory_arg).string(), directory_arg);
 
   // A failed watch has already said why on stderr. It leaves the mount unable
   // to keep up with the source, or to be stopped as asked, so it is torn down
@@ -283,14 +277,15 @@ int mount(const MountOptions& options) {
       StopReason{.token = io.watch_failure_token(), .exit_status = 1});
 }
 
-// Signals the daemon serving `mountpoint` to shut down and waits for it to go.
-int unmount(const char* mountpoint_arg) {
-  switch (UnmountChannel::request_unmount(mountpoint_arg)) {
+// Signals the daemon serving from @a directory_arg to shut down and waits for
+// it to go.
+int unmount(const char* directory_arg) {
+  switch (UnmountChannel::request_unmount(mountpoint_for(directory_arg))) {
     case UnmountChannel::Result::ok:
       return 0;
     case UnmountChannel::Result::not_mounted:
-      std::println(stderr, "makebelieve: nothing is mounted at [{}]",
-                   mountpoint_arg);
+      std::println(stderr, "makebelieve: nothing is mounted from [{}]",
+                   directory_arg);
       return 1;
   }
   std::unreachable();

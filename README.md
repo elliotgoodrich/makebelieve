@@ -22,16 +22,16 @@ Then **makebelieve** will instantly manifest this as a folder,
 
 ```sh
 $ makebelieve mount ../output
-$ ls ../output
-../output/built.txt
-../output/copied.txt
-../output/hello.txt
+$ ls ../output/mount
+../output/mount/built.txt
+../output/mount/copied.txt
+../output/mount/hello.txt
 ```
 
 `makebelieve mount` reads the `build.makebelieve` in the current
-directory and serves the outputs at `../output`; the mountpoint must be
-outside the source directory, so it can't live inside it as `./output`.
-It runs in the foreground until stopped, so run the commands below from
+directory and serves the outputs at `../output/mount`. The directory it is
+given must be outside the source directory, so it can't live inside it as
+`./output`. It runs in the foreground until stopped, so run the commands below from
 another terminal (or background it with `&`).
 
 Nothing is built until a file is opened. Opening it runs the
@@ -39,7 +39,7 @@ corresponding command, automatically collecting all dependencies, and
 waits for it to finish, so the first read already sees the output,
 
 ```sh
-$ cat ../output/hello.txt
+$ cat ../output/mount/hello.txt
 hello world
 ```
 
@@ -64,8 +64,8 @@ If one of the dependencies changes, **makebelieve** will rerun the
 command and regenerate the output, and opening the file while that is
 under way waits for it.
 
-What has been built is kept beside the mountpoint, in `../output.makebelieve`,
-so stopping **makebelieve** - or a crash - loses nothing: the next `mount`
+What has been built is kept beside the mount, in `../output/.makebelieve`, so
+stopping **makebelieve** - or a crash - loses nothing: the next `mount`
 serves every output whose command and dependencies are unchanged without
 building it again.
 
