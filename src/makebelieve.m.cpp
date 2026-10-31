@@ -6,6 +6,7 @@
 #include "buildqueue.hpp"
 #include "consoleinterrupthandler.hpp"
 #include "filesystemutil.hpp"
+#include "help.hpp"
 #include "iocontext.hpp"
 #include "osbuildprocesstracker.hpp"
 #include "realdirectorytree.hpp"
@@ -24,7 +25,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <expected>
 #include <filesystem>
+#include <format>
 #include <optional>
 #include <print>
 #include <semaphore>
@@ -57,14 +60,52 @@ void raise_open_file_limit() {
 #endif
 }
 
-int usage(const char* program) {
-  std::println(
-      stderr,
-      "usage: {0} mount [-j <builds>] [--build=requested|all] <mountpoint>\n"
-      "       {0} unmount <mountpoint>\n"
-      "mount's options may also follow the mountpoint",
-      program);
-  return 1;
+// Reports a command line that makes no sense, with what was wrong.
+int usage_error(std::string_view problem) {
+  std::println(stderr, "makebelieve: {}\nRun `makebelieve --help` for usage.",
+               problem);
+  return 2;
+}
+
+// Whether @a arg asks for help, as an option.
+bool is_help_option(std::string_view arg) {
+  return arg == "-h" || arg == "--help";
+}
+
+// Whether any of a command's @a args asks for help, which wins over whatever
+// else they say.
+bool asks_for_help(std::span<char* const> args) {
+  return std::ranges::any_of(
+      args, [](std::string_view arg) { return is_help_option(arg); });
+}
+
+// Prints @a text, help that was asked for, to stdout.
+int print_help(std::string_view text) {
+  std::print("{}", text);
+  return 0;
+}
+
+// `makebelieve help [<topic>]`: the overview, or the help on the one topic in
+// @a topics.
+int help_command(std::span<char* const> topics) {
+  if (topics.empty()) {
+    return print_help(help::overview());
+  }
+  if (topics.size() > 1) {
+    return usage_error("`help` takes at most one topic");
+  }
+  const std::string_view topic = topics.front();
+  if (topic == "manifest") {
+    return print_help(help::manifest());
+  }
+  if (topic == "mount") {
+    return print_help(help::mount());
+  }
+  if (topic == "unmount") {
+    return print_help(help::unmount());
+  }
+  return usage_error(std::format(
+      "no help on `{}`; try `manifest`, `mount` or `unmount`", topic));
 }
 
 // Where builds served at @a mountpoint are kept between runs: beside it, under
@@ -128,39 +169,51 @@ std::optional<BuildMode> parse_build_mode(std::string_view name) {
   return std::nullopt;
 }
 
-// Reads `mount`'s arguments - @a args, those after the command - or nothing if
-// they are not one mountpoint and options, each given at most once.
-std::optional<MountOptions> parse_mount(std::span<char* const> args) {
+// Reads `mount`'s arguments - @a args, those after the command - or says what
+// is wrong if they are not one mountpoint and options, each given at most once.
+std::expected<MountOptions, std::string> parse_mount(
+    std::span<char* const> args) {
   constexpr std::string_view k_build_option = "--build=";
   MountOptions options;
   for (std::size_t i = 0; i < args.size(); ++i) {
     const std::string_view arg = args[i];
     if (arg == "-j") {
-      if (++i == args.size() || options.jobs != 0) {
-        return std::nullopt;
+      if (options.jobs != 0) {
+        return std::unexpected("`-j` was given more than once");
+      }
+      if (++i == args.size()) {
+        return std::unexpected("`-j` needs a number of builds");
       }
       const std::string_view text = args[i];
       const auto [end, error] =
           std::from_chars(text.data(), text.data() + text.size(), options.jobs);
       if (error != std::errc() || end != text.data() + text.size() ||
           options.jobs == 0) {
-        return std::nullopt;
+        return std::unexpected(std::format(
+            "`-j` takes a positive number of builds, not `{}`", text));
       }
     } else if (arg.starts_with(k_build_option)) {
-      const std::optional<BuildMode> mode =
-          parse_build_mode(arg.substr(k_build_option.size()));
-      if (!mode.has_value() || options.build.has_value()) {
-        return std::nullopt;
+      if (options.build.has_value()) {
+        return std::unexpected("`--build` was given more than once");
       }
-      options.build = mode;
-    } else if (arg.starts_with('-') || options.mountpoint != nullptr) {
-      return std::nullopt;
+      const std::string_view name = arg.substr(k_build_option.size());
+      options.build = parse_build_mode(name);
+      if (!options.build.has_value()) {
+        return std::unexpected(std::format(
+            "`--build=` takes `requested` or `all`, not `{}`", name));
+      }
+    } else if (arg.starts_with('-')) {
+      return std::unexpected(std::format("`mount` has no option `{}`", arg));
+    } else if (options.mountpoint != nullptr) {
+      return std::unexpected(std::format(
+          "`mount` takes one mountpoint, but was given `{}` and `{}`",
+          options.mountpoint, arg));
     } else {
       options.mountpoint = args[i];
     }
   }
   if (options.mountpoint == nullptr) {
-    return std::nullopt;
+    return std::unexpected("`mount` needs a mountpoint");
   }
   return options;
 }
@@ -301,24 +354,42 @@ int unmount(const char* mountpoint_arg) {
 int main(int argc, char** argv) {
   raise_open_file_limit();
   try {
-    if (argc < 3) {
-      return usage(argv[0]);
+    const std::span<char* const> args =
+        std::span<char* const>(argv, static_cast<std::size_t>(argc)).subspan(1);
+    if (args.empty()) {
+      return usage_error("no command given");
     }
 
-    const std::string_view command = argv[1];
+    const std::string_view command = args.front();
+    const std::span<char* const> rest = args.subspan(1);
+    if (command == "help" || is_help_option(command)) {
+      return help_command(rest);
+    }
+    if (command == "--version") {
+      std::println("{}", help::version());
+      return 0;
+    }
     if (command == "mount") {
-      const std::optional<MountOptions> options = parse_mount(
-          std::span<char* const>(argv, static_cast<std::size_t>(argc))
-              .subspan(2));
+      if (asks_for_help(rest)) {
+        return print_help(help::mount());
+      }
+      const std::expected<MountOptions, std::string> options =
+          parse_mount(rest);
       if (!options.has_value()) {
-        return usage(argv[0]);
+        return usage_error(options.error());
       }
       return mount(*options);
     }
-    if (command == "unmount" && argc == 3) {
-      return unmount(argv[2]);
+    if (command == "unmount") {
+      if (asks_for_help(rest)) {
+        return print_help(help::unmount());
+      }
+      if (rest.size() != 1 || std::string_view(rest.front()).starts_with('-')) {
+        return usage_error("`unmount` takes just a mountpoint");
+      }
+      return unmount(rest.front());
     }
-    return usage(argv[0]);
+    return usage_error(std::format("unknown command `{}`", command));
   } catch (const std::exception& error) {
     // Best-effort: a failure to report the failure has nowhere left to go.
     try {

@@ -74,4 +74,9 @@ for notifications when a file changes and react accordingly. For example,
 a static website generator where the browser can reload when a file is
 updated.
 
+The binary documents itself: `makebelieve --help` lists the commands and their
+options, and `makebelieve help manifest` is a complete reference for
+`build.makebelieve`, so a tool or agent that only has the binary can still
+write a manifest.
+
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for build and test instructions.
