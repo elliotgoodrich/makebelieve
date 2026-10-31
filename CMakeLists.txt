@@ -3,7 +3,7 @@
 # 3.25 on.
 cmake_minimum_required(VERSION 3.25)
 # C only for SQLite, which ships as one C source file.
-project(makebelieve LANGUAGES C CXX)
+project(makebelieve VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -176,6 +176,15 @@ if(BUILD_TESTING)
   add_subdirectory(experiments/ProjFS)
   add_subdirectory(experiments/ETW_tracing)
   add_subdirectory(experiments/detours_tracing)
+
+  # The help the binary prints, and that it keeps up with DOCS.md
+  add_test(NAME makebelieve_help
+    COMMAND "${CMAKE_COMMAND}"
+      "-DMAKEBELIEVE_EXE=$<TARGET_FILE:makebelieve>"
+      "-DDOCS_FILE=${CMAKE_CURRENT_SOURCE_DIR}/DOCS.md"
+      "-DEXPECTED_VERSION=${PROJECT_VERSION}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_help_test.cmake")
+  set_tests_properties(makebelieve_help PROPERTIES TIMEOUT 60)
 
   # End integration test
   add_test(NAME makebelieve_integration

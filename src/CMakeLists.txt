@@ -138,8 +138,28 @@ if(WIN32)
   add_dependencies(makebelieve_core makebelievehook)
 endif()
 
-add_executable(makebelieve makebelieve.m.cpp)
+add_executable(makebelieve makebelieve.m.cpp help.cpp)
 target_link_libraries(makebelieve PRIVATE makebelieve_core)
+
+# `makebelieve --version` reports the project version and, when built from a
+# git checkout, the commit as of the last configure - cheap, if stale until
+# CMake next runs.
+set(MAKEBELIEVE_VERSION_STRING "${PROJECT_VERSION}")
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" rev-parse --short=12 HEAD
+    WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    OUTPUT_VARIABLE _makebelieve_commit
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE _makebelieve_git_result)
+  if(_makebelieve_git_result EQUAL 0 AND _makebelieve_commit)
+    string(APPEND MAKEBELIEVE_VERSION_STRING " (${_makebelieve_commit})")
+  endif()
+endif()
+set_property(SOURCE help.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+  "MAKEBELIEVE_VERSION=\"${MAKEBELIEVE_VERSION_STRING}\"")
 makebelieve_apply_clang_tidy(makebelieve)
 
 if(BUILD_TESTING)
