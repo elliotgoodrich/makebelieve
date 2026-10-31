@@ -38,5 +38,7 @@ WarningsAsErrors: "bugprone-*,
                    -readability-qualified-auto,
                    -readability-static-accessed-through-instance,
 "
+CheckOptions:
+  bugprone-unused-return-value.AllowCastToVoid: true
 HeaderFilterRegex: 'experiments/.*\.hpp$'
 FormatStyle: none

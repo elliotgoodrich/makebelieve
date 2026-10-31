@@ -162,30 +162,35 @@ would never end - `@/gen/*.md.md = copy @/gen/*.md`.
 
 ## Serving
 
-The manifest in the current directory is served at a mountpoint with:
+The manifest in the current directory is served from a build directory
+with:
 
 ```sh
-makebelieve mount <mountpoint>
+makebelieve mount <directory>
 ```
+
+The outputs are served at `<directory>/mount`, and what has been built is
+kept in the hidden `<directory>/.makebelieve` (see [Resuming](#resuming)).
+`<directory>` must not overlap the source directory.
 
 This runs in the foreground and serves the outputs until stopped, either
 by Ctrl+C or, from another terminal, by:
 
 ```sh
-makebelieve unmount <mountpoint>
+makebelieve unmount <directory>
 ```
 
-`unmount` signals the instance serving that mountpoint to shut down and
-blocks until it has fully torn down.
+`unmount` signals the instance serving from that directory to shut down
+and blocks until it has fully torn down.
 
 By default, at most one build per core holds a place to run at a time;
 `-j <builds>` sets another limit:
 
 ```sh
-makebelieve mount -j 2 <mountpoint>
+makebelieve mount -j 2 <directory>
 ```
 
-Options may also follow the mountpoint: `makebelieve mount <mountpoint> -j 2`.
+Options may also follow the directory: `makebelieve mount <directory> -j 2`.
 
 Opening an output always builds it if it is not up to date, and waits.
 `--build=<mode>` sets which outputs are kept built without being asked:
@@ -196,7 +201,7 @@ Opening an output always builds it if it is not up to date, and waits.
 - `all`: every output, from the moment the mount is up.
 
 ```sh
-makebelieve mount --build=all <mountpoint>
+makebelieve mount --build=all <directory>
 ```
 
 With `--build=all`, every output is treated as already opened: outputs
@@ -228,11 +233,16 @@ Windows defers WinFsp transactions. Unmount cancels pending requests.
 
 ## Resuming
 
-Every successful build is kept in a directory beside the mountpoint, named
-after it with `.makebelieve` added - mounting at `../output` keeps builds in
-`../output.makebelieve`. With each output it keeps the command that built it
-and what each input it read looked like: a source file's modification time
-and size, or the content of an output read through the mount.
+Every successful build is kept in the build directory's `.makebelieve`,
+beside its `mount` - `makebelieve mount ../output` keeps builds in
+`../output/.makebelieve`. With each output it keeps the command that built
+it and what each input it read looked like: a source file's modification
+time and size, or the content of an output read through the mount.
+
+`.makebelieve` is hidden (on Windows it also has the hidden attribute) and
+holds a `.gitignore` that ignores everything in it, so git never sees it,
+and a [`CACHEDIR.TAG`](https://bford.info/cachedir/), so backup tools that
+honour it skip it. Deleting it is always safe: it only costs rebuilding.
 
 When `mount` starts, an output is served as already built, without running
 anything, if

@@ -233,11 +233,34 @@ bool is_hash(std::string_view hash) {
          });
 }
 
+// Marks @a directory as a cache: hidden, ignored by git, and tagged for backup
+// tools that skip caches (https://bford.info/cachedir/). Best-effort, as the
+// cache works the same without any of it.
+void mark_as_cache(const std::filesystem::path& directory) {
+  (void)FileSystemUtil::hide(directory);
+  // Left as they are if already there.
+  const auto write_once = [&directory](std::string_view name,
+                                       std::string_view contents) {
+    const std::filesystem::path path = directory / name;
+    std::error_code error;
+    if (!std::filesystem::exists(path, error) && !error) {
+      (void)FileSystemUtil::write_file(path, contents);
+    }
+  };
+  write_once(".gitignore", "# Created by makebelieve.\n*\n");
+  write_once("CACHEDIR.TAG",
+             "Signature: 8a477f597d28d172789f06886806bc55\n"
+             "# This file is a cache directory tag created by makebelieve.\n"
+             "# For information about cache directory tags, see:\n"
+             "#\thttps://bford.info/cachedir/\n");
+}
+
 }  // namespace
 
 BuildCache::BuildCache(std::filesystem::path directory)
     : m_directory(std::move(directory)), m_objects(m_directory / "objects") {
   std::filesystem::create_directories(m_objects);
+  mark_as_cache(m_directory);
 
   const std::string database = to_text(m_directory / "cache.sqlite");
   if (const int code = sqlite3_open_v2(

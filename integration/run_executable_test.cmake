@@ -13,7 +13,8 @@
 #   WORK_DIR          scratch directory this script owns exclusively
 
 set(SRC "${WORK_DIR}/src")
-set(MNT "${WORK_DIR}/mnt")
+set(BUILD_DIR "${WORK_DIR}/out")
+set(MNT "${BUILD_DIR}/mount")
 
 # How long any one run may take before it counts as a hang.
 set(RUN_TIMEOUT 60)
@@ -37,11 +38,11 @@ endforeach()
 if(WIN32)
   execute_process(
     COMMAND powershell -NoProfile -ExecutionPolicy Bypass -Command
-    "$ErrorActionPreference='Stop'; Start-Process -FilePath '${MAKEBELIEVE_EXE}' -ArgumentList 'mount','${MNT}' -WorkingDirectory '${SRC}' -WindowStyle Hidden")
+    "$ErrorActionPreference='Stop'; Start-Process -FilePath '${MAKEBELIEVE_EXE}' -ArgumentList 'mount','${BUILD_DIR}' -WorkingDirectory '${SRC}' -WindowStyle Hidden")
 else()
   execute_process(
     COMMAND sh -c
-    "cd \"${SRC}\" && \"${MAKEBELIEVE_EXE}\" mount \"${MNT}\" >\"${WORK_DIR}/daemon.log\" 2>&1 &")
+    "cd \"${SRC}\" && \"${MAKEBELIEVE_EXE}\" mount \"${BUILD_DIR}\" >\"${WORK_DIR}/daemon.log\" 2>&1 &")
 endif()
 
 set(FAILURES "")
@@ -138,7 +139,7 @@ finished
   endif()
 endif()
 
-execute_process(COMMAND "${MAKEBELIEVE_EXE}" unmount "${MNT}"
+execute_process(COMMAND "${MAKEBELIEVE_EXE}" unmount "${BUILD_DIR}"
                 RESULT_VARIABLE unmount_result OUTPUT_QUIET ERROR_QUIET
                 TIMEOUT ${RUN_TIMEOUT})
 if(NOT unmount_result EQUAL 0)

@@ -11,6 +11,10 @@
 #include <string_view>
 #include <system_error>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace {
 
 // are_disjoint requires absolute inputs, and what counts as absolute is
@@ -147,6 +151,30 @@ TEST(WriteFile, ReportsAMissingDirectory) {
       temp_file() / "missing" / "file", "x");
 
   EXPECT_EQ(written, std::errc::no_such_file_or_directory);
+}
+
+TEST(Hide, HidesADirectory) {
+  const std::filesystem::path path = temp_file();
+  std::filesystem::create_directory(path);
+  const std::error_code hidden = makebelieve::FileSystemUtil::hide(path);
+  // Hiding what is already hidden is not an error.
+  const std::error_code again = makebelieve::FileSystemUtil::hide(path);
+#ifdef _WIN32
+  const DWORD attributes = GetFileAttributesW(path.c_str());
+#endif
+  std::filesystem::remove(path);
+
+  EXPECT_FALSE(hidden) << hidden.message();
+  EXPECT_FALSE(again) << again.message();
+#ifdef _WIN32
+  ASSERT_NE(attributes, INVALID_FILE_ATTRIBUTES);
+  EXPECT_NE(attributes & FILE_ATTRIBUTE_HIDDEN, 0U);
+#endif
+}
+
+TEST(Hide, ReportsAMissingPath) {
+  EXPECT_EQ(makebelieve::FileSystemUtil::hide(temp_file() / "missing"),
+            std::errc::no_such_file_or_directory);
 }
 
 #ifdef __linux__

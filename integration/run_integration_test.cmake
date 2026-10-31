@@ -11,7 +11,8 @@
 #   WORK_DIR          scratch directory this script owns exclusively
 
 set(SRC "${WORK_DIR}/src")
-set(MNT "${WORK_DIR}/mnt")
+set(BUILD_DIR "${WORK_DIR}/out")
+set(MNT "${BUILD_DIR}/mount")
 
 file(REMOVE_RECURSE "${WORK_DIR}")
 file(MAKE_DIRECTORY "${SRC}")
@@ -70,11 +71,11 @@ if(WIN32)
   # rather than a log.
   execute_process(
     COMMAND powershell -NoProfile -ExecutionPolicy Bypass -Command
-    "$ErrorActionPreference='Stop'; Start-Process -FilePath '${MAKEBELIEVE_EXE}' -ArgumentList 'mount','${MNT}' -WorkingDirectory '${SRC}' -WindowStyle Hidden")
+    "$ErrorActionPreference='Stop'; Start-Process -FilePath '${MAKEBELIEVE_EXE}' -ArgumentList 'mount','${BUILD_DIR}' -WorkingDirectory '${SRC}' -WindowStyle Hidden")
 else()
   execute_process(
     COMMAND sh -c
-    "cd \"${SRC}\" && \"${MAKEBELIEVE_EXE}\" mount \"${MNT}\" >\"${WORK_DIR}/daemon.log\" 2>&1 &")
+    "cd \"${SRC}\" && \"${MAKEBELIEVE_EXE}\" mount \"${BUILD_DIR}\" >\"${WORK_DIR}/daemon.log\" 2>&1 &")
 endif()
 
 set(FAILURES "")
@@ -175,7 +176,7 @@ endif()
 # Ask the daemon to unmount, which blocks until it has torn down, however long
 # that takes. The timeout turns a teardown that hangs into a failure here,
 # within the test's own TIMEOUT for everything before it as well.
-execute_process(COMMAND "${MAKEBELIEVE_EXE}" unmount "${MNT}"
+execute_process(COMMAND "${MAKEBELIEVE_EXE}" unmount "${BUILD_DIR}"
                 RESULT_VARIABLE unmount_result OUTPUT_QUIET ERROR_QUIET
                 TIMEOUT 30)
 if(NOT unmount_result EQUAL 0)

@@ -18,7 +18,8 @@
 #                     that every output gets built without anything opening it
 
 set(SRC "${WORK_DIR}/src")
-set(MNT "${WORK_DIR}/mnt")
+set(BUILD_DIR "${WORK_DIR}/out")
+set(MNT "${BUILD_DIR}/mount")
 
 # How long any one read may take before it counts as a hang.
 set(READ_TIMEOUT 60)
@@ -40,9 +41,9 @@ file(READ "${SRC}/shared-leaf.txt" SHARED_LEAF)
 # Launched as the main integration test launches it; see the notes there.
 if(WIN32)
   if(JOBS_AFTER_MOUNTPOINT)
-    set(mount_arguments "'mount','${MNT}','-j','1'")
+    set(mount_arguments "'mount','${BUILD_DIR}','-j','1'")
   else()
-    set(mount_arguments "'mount','-j','1','${MNT}'")
+    set(mount_arguments "'mount','-j','1','${BUILD_DIR}'")
   endif()
   if(BUILD_ALL)
     string(APPEND mount_arguments ",'--build=all'")
@@ -52,9 +53,9 @@ if(WIN32)
     "$ErrorActionPreference='Stop'; Start-Process -FilePath '${MAKEBELIEVE_EXE}' -ArgumentList ${mount_arguments} -WorkingDirectory '${SRC}' -WindowStyle Hidden")
 else()
   if(JOBS_AFTER_MOUNTPOINT)
-    set(mount_arguments "mount \"${MNT}\" -j 1")
+    set(mount_arguments "mount \"${BUILD_DIR}\" -j 1")
   else()
-    set(mount_arguments "mount -j 1 \"${MNT}\"")
+    set(mount_arguments "mount -j 1 \"${BUILD_DIR}\"")
   endif()
   if(BUILD_ALL)
     string(APPEND mount_arguments " --build=all")
@@ -196,7 +197,7 @@ if(MOUNTED)
   endforeach()
 endif()
 
-execute_process(COMMAND "${MAKEBELIEVE_EXE}" unmount "${MNT}"
+execute_process(COMMAND "${MAKEBELIEVE_EXE}" unmount "${BUILD_DIR}"
                 RESULT_VARIABLE unmount_result OUTPUT_QUIET ERROR_QUIET
                 TIMEOUT ${READ_TIMEOUT})
 if(NOT unmount_result EQUAL 0)
