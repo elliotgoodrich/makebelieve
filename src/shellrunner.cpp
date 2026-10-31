@@ -11,9 +11,11 @@
 #include <stdexec/execution.hpp>
 
 #include <cstddef>
+#include <cstdio>
 #include <expected>
 #include <filesystem>
 #include <optional>
+#include <print>
 #include <random>
 #include <string>
 #include <string_view>
@@ -33,6 +35,21 @@ class ExitStatusCategory : public std::error_category {
 
   [[nodiscard]] std::string message(int status) const override {
     return "command exited with status " + std::to_string(status);
+  }
+};
+
+class BuildErrorCategory : public std::error_category {
+ public:
+  [[nodiscard]] const char* name() const noexcept override { return "build"; }
+
+  [[nodiscard]] std::string message(int error) const override {
+    switch (static_cast<BuildError>(error)) {
+      case BuildError::out_not_written:
+        return "command did not write %out";
+      case BuildError::copy_source_unreadable:
+        return "could not read the file to copy";
+    }
+    return "unknown build error";
   }
 };
 
@@ -224,10 +241,22 @@ std::vector<std::filesystem::path> relativize(
   return result;
 }
 
+// Explains on standard error why building @a output failed, as `@/<output>:
+// <reason>`, so the reader that sees only an I/O error can find out.
+void report(const std::filesystem::path& output, std::string_view reason) {
+  std::println(stderr, "makebelieve: @/{}: {}", output.generic_string(),
+               reason);
+}
+
 }  // namespace
 
 const std::error_category& exit_status_category() {
   static const ExitStatusCategory category;
+  return category;
+}
+
+const std::error_category& build_error_category() {
+  static const BuildErrorCategory category;
   return category;
 }
 
@@ -250,8 +279,13 @@ exec::task<BuildResult> detail::run_shell_command(
     const std::filesystem::path source = command.text;
     std::expected<std::string, std::error_code> bytes =
         read_file(working_directory / source);
+    // The reader sees the output, so the source's own error - that it does
+    // not exist, say - would read as being about the output.
     if (!bytes.has_value()) {
-      co_return std::unexpected(bytes.error());
+      report(command.output, "cannot copy [" + source.generic_string() +
+                                 "]: " + bytes.error().message());
+      co_return std::unexpected(
+          make_error_code(BuildError::copy_source_unreadable));
     }
     co_return BuildOutput{.bytes = std::move(*bytes), .inputs = {source}};
   }
@@ -286,6 +320,13 @@ exec::task<BuildResult> detail::run_shell_command(
   if (!result.has_value()) {
     co_return std::unexpected(result.error());
   }
+  // A `run` command's standard output is not its output, but may say why it
+  // failed, so it goes where its standard error does.
+  if (!capture && !result->standard_output.empty()) {
+    std::fwrite(result->standard_output.data(), 1,
+                result->standard_output.size(), stderr);
+    std::fflush(stderr);
+  }
   // A command that reports failure has not built its output.
   if (result->exit_status != 0) {
     co_return std::unexpected(exit_status_error(result->exit_status));
@@ -294,10 +335,19 @@ exec::task<BuildResult> detail::run_shell_command(
   if (capture) {
     bytes = std::move(result->standard_output);
   } else {
-    // A command that left nothing at %out has not built its output.
+    // A command that left nothing at %out has not built its output. Reading
+    // the scratch file's own error back - that it does not exist, say - would
+    // read as being about the output.
     std::expected<std::string, std::error_code> written = read_file(out_path);
     if (!written.has_value()) {
-      co_return std::unexpected(written.error());
+      report(command.output,
+             written.error() == std::errc::no_such_file_or_directory
+                 ? std::string(
+                       "command exited successfully but wrote nothing to %out")
+                 : "command exited successfully but its %out could not be "
+                   "read: " +
+                       written.error().message());
+      co_return std::unexpected(make_error_code(BuildError::out_not_written));
     }
     bytes = std::move(*written);
   }
