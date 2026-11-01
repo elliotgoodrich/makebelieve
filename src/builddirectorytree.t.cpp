@@ -335,16 +335,22 @@ struct InstalledTracer {
 class BuildDirectoryTreeTracingTest : protected InstalledTracer,
                                       public BuildDirectoryTreeTest {};
 
-TEST_F(BuildDirectoryTreeTest, NoManifestYieldsAnEmptyTree) {
+// Most likely started in the wrong directory, so it says so rather than serve
+// nothing.
+TEST_F(BuildDirectoryTreeTest, NoManifestAtStartupThrows) {
   int runs = 0;
-  const BuildDirectoryTree tree(source, [&runs](Command) {
-    ++runs;
-    return finished(built(std::string{}));
-  });
-
-  const auto root = tree.ls("");
-  ASSERT_TRUE(root.has_value());
-  EXPECT_TRUE(root->empty());
+  try {
+    const BuildDirectoryTree tree(source, [&runs](Command) {
+      ++runs;
+      return finished(built(std::string{}));
+    });
+    ADD_FAILURE() << "a tree was made without a manifest";
+  } catch (const std::runtime_error& error) {
+    EXPECT_TRUE(
+        std::string_view(error.what())
+            .starts_with("no build.makebelieve in the source directory"))
+        << error.what();
+  }
   EXPECT_EQ(runs, 0);
 }
 
@@ -960,9 +966,11 @@ CommandRunner echoing(std::vector<std::string>& commands) {
   };
 }
 
-TEST_F(BuildDirectoryTreeTest, AManifestWrittenLaterAddsItsOutputs) {
+TEST_F(BuildDirectoryTreeTest, AManifestWrittenBackAddsItsOutputs) {
+  write_manifest("");
   std::vector<std::string> commands;
   const BuildDirectoryTree tree(source, echoing(commands));
+  source.remove("build.makebelieve");
   EXPECT_TRUE(tree.ls("")->empty());
 
   write_manifest("@/out/file.txt = run first %out\n");

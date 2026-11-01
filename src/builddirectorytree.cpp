@@ -397,6 +397,16 @@ class BuildDirectoryTree::Impl {
           unlimited_permits(), BuildProcessTracker::none(),
           m_own_workers.emplace(1).get_scheduler());
     }
+    // Only at the start: one removed later is no more than an edit to it.
+    if (const auto manifest = m_source.status(k_manifest_name);
+        !manifest.has_value() &&
+        manifest.error() == std::errc::no_such_file_or_directory) {
+      throw std::runtime_error(std::format(
+          "no {0} in the source directory, so there is nothing to serve; "
+          "create {0} there, or run makebelieve from the directory that has "
+          "one",
+          k_manifest_name));
+    }
     auto rules = read_rules(m_source);
     if (!rules.has_value()) {
       throw std::runtime_error(rules.error());

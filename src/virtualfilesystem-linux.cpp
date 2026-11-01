@@ -155,18 +155,58 @@ timespec to_timespec(std::chrono::file_clock::time_point time) {
   };
 }
 
+// The device FUSE talks to the kernel through.
+constexpr const char* k_fuse_device = "/dev/fuse";
+
 // Throw if `mountpoint` already exists, otherwise attempt to create it +
-// parents.
+// parents. The path itself is looked at, never through: a live mount there
+// would answer for whatever is behind it. Each error appends what its code
+// says, and the path.
 void create_mountpoint(const std::filesystem::path& mountpoint) {
-  std::error_code error;
-  if (std::filesystem::exists(mountpoint, error)) {
+  struct stat info {};
+  if (::lstat(mountpoint.c_str(), &info) == 0) {
+    // A mount point is on another device than the directory holding it.
+    std::filesystem::path parent = mountpoint.lexically_normal();
+    if (!parent.has_filename()) {
+      parent = parent.parent_path();
+    }
+    parent = parent.parent_path();
+    struct stat parent_info {};
+    if (S_ISDIR(info.st_mode) && ::stat(parent.c_str(), &parent_info) == 0 &&
+        parent_info.st_dev != info.st_dev) {
+      throw std::filesystem::filesystem_error(
+          "the mountpoint is already a mount point, most likely another "
+          "makebelieve serving it; stop that one with `makebelieve "
+          "unmount <the directory holding it>` and try again",
+          mountpoint, std::make_error_code(std::errc::file_exists));
+    }
     throw std::filesystem::filesystem_error(
-        "mountpoint already exists; refusing to reuse it", mountpoint,
-        std::make_error_code(std::errc::file_exists));
+        "the mountpoint already exists; makebelieve creates it itself and "
+        "removes it on unmount, so delete it if nothing in it is needed "
+        "and try again",
+        mountpoint, std::make_error_code(std::errc::file_exists));
   }
+  if (errno == ENOTCONN) {
+    // What a FUSE mount whose process died without unmounting answers to
+    // everything, until it is unmounted.
+    throw std::filesystem::filesystem_error(
+        std::format("the mountpoint is a stale mount left behind by a "
+                    "makebelieve that stopped without unmounting; remove it "
+                    "with `fusermount3 -u {0}` (or `umount {0}` as root) and "
+                    "try again",
+                    mountpoint.string()),
+        mountpoint, std::error_code(ENOTCONN, std::system_category()));
+  }
+  if (errno != ENOENT) {
+    throw std::filesystem::filesystem_error(
+        "cannot use the mountpoint", mountpoint,
+        std::error_code(errno, std::system_category()));
+  }
+
+  std::error_code error;
   std::filesystem::create_directories(mountpoint, error);
   if (error) {
-    throw std::filesystem::filesystem_error("could not create mountpoint",
+    throw std::filesystem::filesystem_error("cannot create the mountpoint",
                                             mountpoint, error);
   }
 }
@@ -355,9 +395,28 @@ class VirtualFileSystem::Impl {
       throw std::system_error(errno ? errno : EIO, std::system_category(),
                               "fuse_session_new");
     }
+    // libfuse only prints why it cannot reach the kernel, so the commonest
+    // reason is checked for first, to say what to do about it.
+    if (::access(k_fuse_device, F_OK) != 0) {
+      // The error appends what the code says.
+      throw std::system_error(
+          std::make_error_code(std::errc::no_such_device),
+          std::format(
+              "cannot serve [{}] as {} does not exist, so FUSE, which "
+              "makebelieve mounts through, is not available; install FUSE 3 "
+              "(`sudo apt install fuse3` or your distribution's equivalent) "
+              "and load it with `sudo modprobe fuse`, or in a container pass "
+              "`--device /dev/fuse`",
+              m_mountpoint.string(), k_fuse_device));
+    }
     if (fuse_session_mount(m_fuse, m_mountpoint.c_str()) != 0) {
-      throw std::system_error(errno ? errno : EIO, std::system_category(),
-                              "fuse_session_mount");
+      throw std::system_error(
+          std::error_code(errno != 0 ? errno : EIO, std::system_category()),
+          std::format("cannot mount FUSE at [{}]; check that FUSE 3 is "
+                      "installed, with `fusermount3` on PATH and {} readable "
+                      "and writable by you (libfuse's own message above, if "
+                      "any, says more)",
+                      m_mountpoint.string(), k_fuse_device));
     }
     // A single dispatcher suffices: waiting requests retain their reply handle,
     // not this thread. Completions can reply concurrently from coroutine

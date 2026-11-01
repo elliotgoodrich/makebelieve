@@ -282,12 +282,33 @@ void merge_changes(Changes& into, const Changes& from) {
 // unlike a provider that virtualizes an existing directory, this refuses a
 // path that is already there and only makes sure the parent exists for WinFsp
 // to create into.
+//
+// The path itself is looked at, never through: a live mount there would answer
+// for whatever is behind it, if it answers at all.
 void create_mountpoint(const std::filesystem::path& mountpoint) {
   std::error_code error;
-  if (std::filesystem::exists(mountpoint, error)) {
+  const std::filesystem::file_type type =
+      std::filesystem::symlink_status(mountpoint, error).type();
+  if (type == std::filesystem::file_type::junction) {
+    // What a WinFsp mount is on disk: a junction into its volume. Not
+    // necessarily another makebelieve's, but nothing else is as likely.
+    // The errors below append what their code says, and the path.
     throw std::filesystem::filesystem_error(
-        "mountpoint already exists; refusing to reuse it", mountpoint,
-        std::make_error_code(std::errc::file_exists));
+        "the mountpoint is already a mount point, most likely another "
+        "makebelieve serving it; stop that one with `makebelieve unmount <the "
+        "directory holding it>` and try again",
+        mountpoint, std::make_error_code(std::errc::file_exists));
+  }
+  if (type != std::filesystem::file_type::not_found && error) {
+    throw std::filesystem::filesystem_error("cannot use the mountpoint",
+                                            mountpoint, error);
+  }
+  if (type != std::filesystem::file_type::not_found) {
+    throw std::filesystem::filesystem_error(
+        "the mountpoint already exists; makebelieve creates it itself and "
+        "removes it on unmount, so delete it if nothing in it is needed and "
+        "try again",
+        mountpoint, std::make_error_code(std::errc::file_exists));
   }
 
   const std::filesystem::path parent = mountpoint.parent_path();
@@ -296,8 +317,8 @@ void create_mountpoint(const std::filesystem::path& mountpoint) {
   }
   std::filesystem::create_directories(parent, error);
   if (error) {
-    throw std::filesystem::filesystem_error("could not create mountpoint",
-                                            mountpoint, error);
+    throw std::filesystem::filesystem_error(
+        "cannot create the directory to hold the mountpoint", parent, error);
   }
 }
 
@@ -368,7 +389,15 @@ class VirtualFileSystem::Impl {
     // turns "WinFsp is not installed" into a diagnosable error rather than a
     // loader failure before main().
     if (const NTSTATUS status = FspLoad(nullptr); !NT_SUCCESS(status)) {
-      throw_status(status, "FspLoad failed; is WinFsp installed?");
+      // The error appends what the status says.
+      throw std::system_error(
+          static_cast<int>(FspWin32FromNtStatus(status)),
+          std::system_category(),
+          std::format("cannot serve [{}] as WinFsp, which makebelieve mounts "
+                      "through, is not installed or failed to load; install "
+                      "it from https://winfsp.dev/rel/ (or `winget install "
+                      "WinFsp.WinFsp`) and try again",
+                      m_mountpoint.string()));
     }
 
     const UINT64 created = to_filetime(std::chrono::file_clock::now());
@@ -437,7 +466,9 @@ class VirtualFileSystem::Impl {
     if (const NTSTATUS status =
             FspFileSystemSetMountPoint(m_filesystem, m_root.data());
         !NT_SUCCESS(status)) {
-      throw_status(status, "FspFileSystemSetMountPoint failed");
+      throw_status(status, std::format("cannot mount WinFsp at [{}]",
+                                       m_mountpoint.string())
+                               .c_str());
     }
     m_mounted = true;
 
