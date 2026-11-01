@@ -92,10 +92,11 @@ class BuildDirectoryTree : public DirectoryTree {
 
   /// Builds the outputs declared in the `build.makebelieve` file of @a source,
   /// delegating each command to @a runner - any callable convertible to a
-  /// @link CommandRunner. A @a source without a `build.makebelieve` file
-  /// yields an empty tree. Throws `std::runtime_error` describing the problems
-  /// if the manifest cannot be read or has lines it cannot accept; later
-  /// problems of that kind go to @a on_manifest_error, if given. Builds are
+  /// @link CommandRunner. Throws `std::runtime_error` describing the problems
+  /// if the manifest is missing, cannot be read or has lines it cannot
+  /// accept; later problems of that kind go to @a on_manifest_error, if
+  /// given, except that a manifest removed later leaves an empty tree until it
+  /// is written back. Builds are
   /// kept in @a cache, if given, and restored from it.
   /// @pre @a source outlives this tree; it is observed for its whole life.
   /// @pre @a cache, if given, outlives this tree.

@@ -282,10 +282,14 @@ BuildCache::BuildCache(std::filesystem::path directory)
   const int locked =
       sqlite3_exec(m_db, "BEGIN EXCLUSIVE; COMMIT", nullptr, nullptr, nullptr);
   if (locked == SQLITE_BUSY || locked == SQLITE_LOCKED) {
+    // The error appends what the code says.
     throw std::system_error(
         std::make_error_code(std::errc::device_or_resource_busy),
-        std::format("build cache [{}] is in use by another makebelieve",
-                    m_directory.string()));
+        std::format(
+            "build cache [{}] is in use by another makebelieve, which "
+            "is serving from it or still stopping; stop that one with "
+            "`makebelieve unmount <the directory holding it>` and try again",
+            m_directory.string()));
   }
   if (locked != SQLITE_OK) {
     fail(m_db, locked, "locking the database");

@@ -1272,6 +1272,23 @@ TEST_F(VirtualFileSystem, RefusesAnExistingMountpointAndLeavesItAlone) {
   EXPECT_EQ(read_file(file), "file");
 }
 
+// A second mount on a live one is refused, saying what is there and how to
+// stop it, and leaves the first serving.
+TEST_F(VirtualFileSystem, RefusesALiveMountSayingHowToStopIt) {
+  tree().write_file("a.txt", "abc");
+  mount();
+  try {
+    const makebelieve::VirtualFileSystem second(tree(), mountpoint(),
+                                                notifier());
+    ADD_FAILURE() << "a second mount succeeded";
+  } catch (const std::filesystem::filesystem_error& error) {
+    const std::string_view what = error.what();
+    EXPECT_TRUE(what.contains("is already a mount point")) << what;
+    EXPECT_TRUE(what.contains("makebelieve unmount")) << what;
+  }
+  EXPECT_EQ(read_file(mountpoint() / "a.txt"), "abc");
+}
+
 // A mountpoint beneath a regular file can never be created, and the contract
 // names filesystem_error for that rather than any system_error.
 TEST_F(VirtualFileSystem, RefusesAMountpointThatCannotBeCreated) {

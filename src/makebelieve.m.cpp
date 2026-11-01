@@ -197,15 +197,17 @@ int mount(const MountOptions& options) {
 
   const std::filesystem::path source = std::filesystem::current_path();
   const std::filesystem::path directory =
-      std::filesystem::absolute(directory_arg);
+      std::filesystem::absolute(directory_arg).lexically_normal();
 
   // It holds the mount and the cache, whose writes must not reach the source's
   // change notifications, nor be taken for what a build read.
   if (!FileSystemUtil::are_disjoint(directory, source)) {
     std::println(stderr,
-                 "makebelieve: directory [{}] must not overlap the source "
-                 "directory [{}]",
-                 directory_arg, source.string());
+                 "makebelieve: directory [{}] must not be, contain or be "
+                 "inside the source directory [{}], the one makebelieve was "
+                 "started in; serve from somewhere else, such as "
+                 "`makebelieve mount ../output`",
+                 directory.string(), source.string());
     return 1;
   }
   const std::filesystem::path mountpoint = mountpoint_for(directory);
