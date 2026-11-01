@@ -35,6 +35,7 @@
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -231,12 +232,27 @@ class Tracer {
   // reply: a session serves one request at a time, so replies never overlap.
   std::vector<char> m_reply_buffer;
 
+  // What open() and opendir() handed out and the kernel has not yet released.
+  // The command can exit before its last releases arrive, ending the session
+  // without them, so whatever is left is closed with the tracer.
+  std::unordered_set<int> m_open_files;
+  std::unordered_set<DIR*> m_open_directories;
+
  public:
   // @pre @a root_fd is open on @a root.
   Tracer(int root_fd, const std::filesystem::path& root) : m_root(root_fd) {
     struct stat st {};
     ::fstat(root_fd, &st);
     m_inodes.try_emplace(FUSE_ROOT_ID, ".", root, st.st_dev, st.st_ino);
+  }
+
+  ~Tracer() {
+    for (const int fd : m_open_files) {
+      ::close(fd);
+    }
+    for (DIR* const dir : m_open_directories) {
+      ::closedir(dir);
+    }
   }
 
   Tracer(const Tracer&) = delete;
@@ -325,7 +341,8 @@ class Tracer {
     // its cache starts empty, and without keep_cache the kernel drops a file's
     // cached pages at every open, so a file rewritten while the command runs
     // reads as new at its next open.
-    fi->fh = static_cast<std::uint64_t>(fd.release());
+    fi->fh = static_cast<std::uint64_t>(fd.get());
+    m_open_files.insert(fd.release());
     fuse_reply_open(req, fi);
   }
 
@@ -347,6 +364,7 @@ class Tracer {
   }
 
   void release(fuse_req_t req, fuse_ino_t /*ino*/, fuse_file_info* fi) {
+    m_open_files.erase(static_cast<int>(fi->fh));
     ::close(static_cast<int>(fi->fh));
     fuse_reply_err(req, 0);
   }
@@ -376,6 +394,7 @@ class Tracer {
 
     // The stream now belongs to fi->fh; Tracer::releasedir() closes it.
     fi->fh = std::bit_cast<std::uintptr_t>(dir);
+    m_open_directories.insert(dir);
     fuse_reply_open(req, fi);
   }
 
@@ -425,6 +444,7 @@ class Tracer {
   }
 
   void releasedir(fuse_req_t req, fuse_ino_t /*ino*/, fuse_file_info* fi) {
+    m_open_directories.erase(directory(fi));
     ::closedir(directory(fi));
     fuse_reply_err(req, 0);
   }
