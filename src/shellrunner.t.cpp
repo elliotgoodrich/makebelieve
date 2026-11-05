@@ -11,6 +11,7 @@
 #include <exec/static_thread_pool.hpp>
 #include <stdexec/execution.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +27,7 @@
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -171,7 +173,7 @@ TEST_F(ShellRunnerTest, AddsEachCommandBeforeItRuns) {
              .action = Manifest::Action::Capture,
              .text = "cmake -E touch \"" + marker.string() + "\""},
             {}, recording);
-  ASSERT_TRUE(built.result.has_value()) << built.result.error().message();
+  ASSERT_TRUE(built.result.has_value()) << built.result.error().error.message();
   EXPECT_TRUE(std::filesystem::exists(marker));
   std::filesystem::remove(marker);
   EXPECT_EQ(recording.added, 1);
@@ -210,7 +212,7 @@ TEST_F(ShellRunnerTest, ACommandThatCannotBeAddedNeverRunsAndFails) {
              .text = "cmake -E touch \"" + marker.string() + "\""},
             {}, refusing);
   ASSERT_FALSE(built.result.has_value());
-  EXPECT_EQ(built.result.error(), refusal);
+  EXPECT_EQ(built.result.error().error, refusal);
   EXPECT_FALSE(std::filesystem::exists(marker));
 }
 
@@ -242,10 +244,10 @@ TEST_F(ShellRunnerTest, FailsARunCommandThatWritesNothingToOut) {
                              .action = Manifest::Action::Run,
                              .text = "cmake -E echo nothing"});
   ASSERT_FALSE(built.result.has_value());
-  EXPECT_EQ(built.result.error(),
+  EXPECT_EQ(built.result.error().error,
             makebelieve::make_error_code(BuildError::out_not_written));
-  EXPECT_NE(built.result.error(), std::errc::no_such_file_or_directory);
-  EXPECT_EQ(built.result.error().message(), "command did not write %out");
+  EXPECT_NE(built.result.error().error, std::errc::no_such_file_or_directory);
+  EXPECT_EQ(built.result.error().error.message(), "command did not write %out");
 }
 
 // Standard error explains the failure, naming the output, and carries what
@@ -279,13 +281,44 @@ TEST_F(ShellRunnerTest, ForwardsWhatARunCommandPrints) {
   EXPECT_NE(errors.find("progress"), std::string::npos) << errors;
 }
 
+#if defined(_WIN32) || defined(__linux__)
+// A failing command still read its inputs, and they come back with the
+// failure, so changing one - the fix, say - retries it.
+TEST_F(ShellRunnerTest, KeepsWhatAFailingCommandRead) {
+  write_input("input.txt", "read");
+  const Built built = build({.output = "output.txt",
+                             .action = Manifest::Action::Run,
+                             .text = "cmake -E copy input.txt %out && exit 3"});
+  ASSERT_FALSE(built.result.has_value());
+  EXPECT_EQ(built.result.error().error, makebelieve::exit_status_error(3));
+  EXPECT_TRUE(std::ranges::contains(built.result.error().inputs,
+                                    std::filesystem::path("input.txt")));
+}
+
+// As does one that exits successfully without writing %out.
+TEST_F(ShellRunnerTest, KeepsWhatACommandThatWritesNothingToOutRead) {
+  write_input("input.txt", "read");
+  ::testing::internal::CaptureStderr();
+  const Built built = build({.output = "output.txt",
+                             .action = Manifest::Action::Run,
+                             .text = "cmake -E cat input.txt"});
+  ::testing::internal::GetCapturedStderr();
+  ASSERT_FALSE(built.result.has_value());
+  EXPECT_EQ(built.result.error().error,
+            makebelieve::make_error_code(BuildError::out_not_written));
+  EXPECT_TRUE(std::ranges::contains(built.result.error().inputs,
+                                    std::filesystem::path("input.txt")));
+}
+#endif
+
 TEST_F(ShellRunnerTest, FailsACommandThatExitsNonzero) {
   const Built built = build({.output = "output.txt",
                              .action = Manifest::Action::Capture,
                              .text = "exit 2"});
   ASSERT_FALSE(built.result.has_value());
-  EXPECT_EQ(built.result.error(), makebelieve::exit_status_error(2));
-  EXPECT_EQ(built.result.error().message(), "command exited with status 2");
+  EXPECT_EQ(built.result.error().error, makebelieve::exit_status_error(2));
+  EXPECT_EQ(built.result.error().error.message(),
+            "command exited with status 2");
 }
 
 TEST_F(ShellRunnerTest, ProducesWhatACaptureCommandWroteToStandardOutput) {
@@ -327,7 +360,7 @@ TEST_F(ShellRunnerTest, ExpandsAnOutputInACaptureCommandToItsPathInTheMount) {
   const Built built = build({.output = "output.txt",
                              .action = Manifest::Action::Capture,
                              .text = "cmake -E cat @/sub/generated.txt"});
-  ASSERT_TRUE(built.result.has_value()) << built.result.error().message();
+  ASSERT_TRUE(built.result.has_value()) << built.result.error().error.message();
   EXPECT_EQ(built.result->bytes, "generated");
 }
 
@@ -338,7 +371,7 @@ TEST_F(ShellRunnerTest, ExpandsAnOutputInARunCommandAlongsideOut) {
       build({.output = "output.txt",
              .action = Manifest::Action::Run,
              .text = "cmake -E cat input.txt @/generated.txt > %out"});
-  ASSERT_TRUE(built.result.has_value()) << built.result.error().message();
+  ASSERT_TRUE(built.result.has_value()) << built.result.error().error.message();
   EXPECT_EQ(built.result->bytes, "inputgenerated");
 }
 
@@ -349,7 +382,7 @@ TEST_F(ShellRunnerTest, ExpandsAnOutputAlreadyInsideQuotes) {
   const Built built = build({.output = "output.txt",
                              .action = Manifest::Action::Capture,
                              .text = "cmake -E cat \"@/my file.txt\""});
-  ASSERT_TRUE(built.result.has_value()) << built.result.error().message();
+  ASSERT_TRUE(built.result.has_value()) << built.result.error().error.message();
   EXPECT_EQ(built.result->bytes, "spaced");
 }
 
@@ -382,7 +415,7 @@ TEST_F(ShellRunnerTest, RunsAProgramNamedByAQuotedPath) {
                .action = Manifest::Action::Run,
                .text = "\"" + program.string() + "\" @/generated.txt %out"});
     ASSERT_TRUE(built.result.has_value())
-        << directory << ": " << built.result.error().message();
+        << directory << ": " << built.result.error().error.message();
     EXPECT_EQ(built.result->bytes, "generated") << directory;
   }
 }
@@ -397,7 +430,7 @@ TEST_F(ShellRunnerTest, RunsAProgramWithQuotedArguments) {
       build({.output = "output.txt",
              .action = Manifest::Action::Run,
              .text = relative.string() + " \"@/my file.txt\" %out"});
-  ASSERT_TRUE(built.result.has_value()) << built.result.error().message();
+  ASSERT_TRUE(built.result.has_value()) << built.result.error().error.message();
   EXPECT_EQ(built.result->bytes, "spaced");
 }
 
@@ -431,12 +464,16 @@ TEST_F(ShellRunnerTest, FailsACopyOfAMissingFile) {
                              .text = "missing.txt"});
   const std::string errors = ::testing::internal::GetCapturedStderr();
   ASSERT_FALSE(built.result.has_value());
-  EXPECT_EQ(built.result.error(),
+  EXPECT_EQ(built.result.error().error,
             makebelieve::make_error_code(BuildError::copy_source_unreadable));
-  EXPECT_NE(built.result.error(), std::errc::no_such_file_or_directory);
+  EXPECT_NE(built.result.error().error, std::errc::no_such_file_or_directory);
   EXPECT_NE(errors.find("makebelieve: @/output.txt: cannot copy [missing.txt]"),
             std::string::npos)
       << errors;
+  // Nothing opened it, so no tracer could say; its input is what it names,
+  // so creating it retries the copy.
+  EXPECT_EQ(built.result.error().inputs,
+            std::vector<std::filesystem::path>{"missing.txt"});
 }
 
 // The execution requirement: a build's synchronous steps run on the given
@@ -490,7 +527,7 @@ TEST_F(ShellRunnerTest, StoppingABuildEndsItsCommand) {
                              .text = "cmake -E sleep 20"},
                             stop.get_token());
   ASSERT_FALSE(built.result.has_value());
-  EXPECT_EQ(built.result.error(), std::errc::operation_canceled);
+  EXPECT_EQ(built.result.error().error, std::errc::operation_canceled);
   EXPECT_LT(std::chrono::steady_clock::now() - start, 10s);
 }
 
