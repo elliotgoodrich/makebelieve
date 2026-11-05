@@ -655,17 +655,19 @@ class BuildDirectoryTree::Impl {
   exec::task<BuildResult> copy_output(std::filesystem::path source,
                                       BuildCoordinator::AttemptPtr self,
                                       std::optional<TraceLane> lane) {
+    // Its input even if the copy fails, so the original building retries it.
     if (const BuildCoordinator::AttemptPtr target =
             bring_up_to_date(source, lane)) {
       if (const std::error_code error = co_await m_coordinator->wait_as(
               target, BuildCoordinator::output_of(self))) {
-        co_return std::unexpected(error);
+        co_return std::unexpected(BuildFailure(error, {as_input(source)}));
       }
     }
     std::expected<std::string, std::error_code> bytes =
         read_all(m_structure, source);
     if (!bytes.has_value()) {
-      co_return std::unexpected(bytes.error());
+      co_return std::unexpected(
+          BuildFailure(bytes.error(), {as_input(source)}));
     }
     co_return BuildOutput{.bytes = std::move(*bytes),
                           .inputs = {as_input(source)}};
@@ -862,10 +864,7 @@ class BuildDirectoryTree::Impl {
         const auto command = m_commands.find(output);
         declared = command != m_commands.end();
         if (declared) {
-          if (const auto reads = m_reads.find(output); reads != m_reads.end()) {
-            result->inputs.insert(result->inputs.end(), reads->second.begin(),
-                                  reads->second.end());
-          }
+          add_reads(output, result->inputs);
           if (m_cache != nullptr) {
             // Before any waiter is released, so a build reading this output
             // finds the hash of what it read.
@@ -892,6 +891,15 @@ class BuildDirectoryTree::Impl {
     BuildCoordinator::AttemptPtr orphaned;
     {
       const std::lock_guard lock(m_mutex);
+      // A failure that read nothing - one stopped, or that never got to run
+      // its command - says nothing of what the output depends on, so keeps
+      // the dependencies it had. Never cached: a failure is not kept.
+      if (!result.has_value() && m_commands.contains(output)) {
+        add_reads(output, result.error().inputs);
+        if (!result.error().inputs.empty()) {
+          update_dependents(output, std::move(result.error().inputs));
+        }
+      }
       m_in_flight.erase(output);
       m_reads.erase(output);
       const auto attempts = m_attempts.find(output);
@@ -905,16 +913,23 @@ class BuildDirectoryTree::Impl {
           orphaned = std::move(attempts->second.next);
           m_attempts.erase(attempts);
         }
-      } else if (result.has_value()) {
-        // An input that changed mid-build left it stale again; rebuild if
-        // watched, or if an open waits on the next build.
-        rebuild = waited_on ||
-                  (m_stale.contains(output) && m_materialized.contains(output));
       } else {
-        // A failed build stays stale, so a later open or input change retries;
-        // an open already waiting on the next build gets it now.
-        m_stale.insert(output);
-        rebuild = waited_on;
+        // Nothing but a change to its inputs or rule marks an output stale
+        // while its build runs, so one stale now changed mid-build: rebuild it
+        // if watched, or if an open waits on the next build. A failure is
+        // retried the same way, as the change may be its fix - unless it was
+        // stopped, as the tree is going. An output whose first build is
+        // running has no inputs recorded yet, so a change to them goes unseen.
+        const bool changed = m_stale.contains(output);
+        const bool stopped =
+            !result.has_value() &&
+            result.error().error == std::errc::operation_canceled;
+        // A failed build stays stale, so a later open or input change retries.
+        if (!result.has_value()) {
+          m_stale.insert(output);
+        }
+        rebuild = waited_on ||
+                  (changed && !stopped && m_materialized.contains(output));
       }
       if (rebuild) {
         next = claim_build(output);
@@ -922,7 +937,7 @@ class BuildDirectoryTree::Impl {
     }
     // Only now the content is in place may a waiting open() be released.
     m_coordinator->complete(
-        attempt, result.has_value() ? std::error_code() : result.error());
+        attempt, result.has_value() ? std::error_code() : result.error().error);
     if (orphaned != nullptr) {
       m_coordinator->complete(
           orphaned, std::make_error_code(std::errc::no_such_file_or_directory));
@@ -938,7 +953,7 @@ class BuildDirectoryTree::Impl {
     if (lane.has_value()) {
       TraceArgs args;
       args.add("result", result.has_value() ? std::string("ok")
-                                            : result.error().message());
+                                            : result.error().error.message());
       g_tracer->end(*lane, "build", output, args);
       // Only now the span is closed may another build take this row.
       free_lane(output);
@@ -1186,6 +1201,16 @@ class BuildDirectoryTree::Impl {
       m_dependents[input].insert(output);
     }
     m_dependencies.insert_or_assign(output, std::move(inputs));
+  }
+
+  // Adds to @a inputs, those @a output's build read, the outputs it opened
+  // through us, which tracing does not see - whether it built or failed.
+  // @pre m_mutex is held, and the build's reads are still in m_reads.
+  void add_reads(const std::filesystem::path& output,
+                 std::vector<std::filesystem::path>& inputs) const {
+    if (const auto reads = m_reads.find(output); reads != m_reads.end()) {
+      inputs.insert(inputs.end(), reads->second.begin(), reads->second.end());
+    }
   }
 
   // Rereads the manifest and applies its rules, or reports why it cannot and

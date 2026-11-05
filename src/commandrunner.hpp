@@ -13,6 +13,7 @@
 #include <new>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 // What a `BuildDirectoryTree` hands a runner and what the runner hands back:
@@ -28,9 +29,24 @@ struct BuildOutput {
   std::vector<std::filesystem::path> inputs;
 };
 
-/// The outcome of running a command: a @link BuildOutput, or an `error_code`
-/// when it could not be run to completion.
-using BuildResult = std::expected<BuildOutput, std::error_code>;
+/// Why a build failed, and the input files it read on the way, relative to
+/// the source tree's root - so a change to one, the fix for what failed, say,
+/// retries it as it would rebuild a successful build.
+struct BuildFailure {
+  std::error_code error;
+  std::vector<std::filesystem::path> inputs;
+
+  /// A failure that read nothing. Implicit, so a build can fail with
+  /// `std::unexpected(error)`.
+  // NOLINTNEXTLINE(google-explicit-constructor,hicpp-explicit-conversions)
+  BuildFailure(std::error_code error,
+               std::vector<std::filesystem::path> inputs = {})
+      : error(error), inputs(std::move(inputs)) {}
+};
+
+/// The outcome of running a command: a @link BuildOutput, or a
+/// @link BuildFailure when it could not be run to completion.
+using BuildResult = std::expected<BuildOutput, BuildFailure>;
 
 /// One rule as the runner receives it: the output it builds, the action that
 /// says where that output comes from - the file `%out` names for

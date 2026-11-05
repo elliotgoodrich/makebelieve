@@ -1388,6 +1388,129 @@ TEST_F(BuildDirectoryTreeTest, ATracingOutputWithoutATracerIsAnEmptyTrace) {
   EXPECT_EQ(runs, 0);
 }
 
+// A failed build is retried when an input it read changes, as a successful one
+// is rebuilt - eagerly, once materialized, so the fix for what it failed on
+// builds it without anything opening it, along with the outputs that read it
+// through the mount and failed for it.
+TEST_F(BuildDirectoryTreeTest, ChangingAnInputOfAFailedBuildRetriesIt) {
+  source.write_file("source.txt", "two");
+  write_manifest(
+      "@/compiled.txt = run compile source.txt %out\n"
+      "@/copied.txt = copy @/compiled.txt\n"
+      "@/reader.txt = run read @/compiled.txt %out\n");
+
+  bool broken = true;
+  std::map<std::string, int> runs;
+  const BuildDirectoryTree tree(source, [&](const Command& command) {
+    ++runs[command.text];
+    const bool compiles = command.text.starts_with("compile");
+    std::vector<std::filesystem::path> inputs = {
+        compiles ? std::filesystem::path("source.txt")
+                 : std::filesystem::path("@") / "compiled.txt"};
+    return finished(broken ? BuildResult(std::unexpected(BuildFailure(
+                                 exit_status_error(1), std::move(inputs))))
+                           : BuildResult(BuildOutput{
+                                 .bytes = compiles ? "compiled" : "read",
+                                 .inputs = std::move(inputs)}));
+  });
+  tree.materialize_all();
+  // Each is still the placeholder of an unbuilt output.
+  EXPECT_EQ(output_size(tree, "compiled.txt"), 1U);
+  EXPECT_EQ(output_size(tree, "copied.txt"), 1U);
+  EXPECT_EQ(output_size(tree, "reader.txt"), 1U);
+
+  // The copy retried the failure it read, so count from here.
+  const std::map<std::string, int> before = runs;
+  broken = false;
+  source.write_file("source.txt", "2");
+  EXPECT_EQ(runs["compile source.txt %out"],
+            before.at("compile source.txt %out") + 1);
+  EXPECT_EQ(runs["read @/compiled.txt %out"],
+            before.at("read @/compiled.txt %out") + 1);
+  EXPECT_EQ(output_size(tree, "compiled.txt"), std::string("compiled").size());
+  EXPECT_EQ(output_size(tree, "copied.txt"), std::string("compiled").size());
+  EXPECT_EQ(output_size(tree, "reader.txt"), std::string("read").size());
+}
+
+// Without materializing, a failed build that was opened is retried eagerly
+// too.
+TEST_F(BuildDirectoryTreeTest, ChangingAnInputOfAnOpenedFailureRetriesIt) {
+  source.write_file("input.txt", "v1");
+  write_manifest("@/output.txt = run build input.txt %out\n");
+
+  int runs = 0;
+  bool broken = true;
+  const BuildDirectoryTree tree(source, [&](const Command& /*command*/) {
+    ++runs;
+    return finished(broken ? BuildResult(std::unexpected(BuildFailure(
+                                 exit_status_error(1), {"input.txt"})))
+                           : built("built"));
+  });
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "output.txt").has_value());
+  EXPECT_EQ(runs, 1);
+
+  broken = false;
+  source.write_file("input.txt", "v2");
+  EXPECT_EQ(runs, 2);
+  EXPECT_EQ(read_output(tree, "output.txt"), "built");
+  EXPECT_EQ(runs, 2);
+}
+
+// A failure that read nothing - one that never got to run its command, say -
+// says nothing of what the output depends on, so it keeps the inputs its last
+// build read, and a change to them still retries it, rather than recording
+// that it has none.
+TEST_F(BuildDirectoryTreeTest, AFailureThatReadNothingKeepsItsInputs) {
+  source.write_file("input.txt", "v1");
+  write_manifest("@/output.txt = run build input.txt %out\n");
+
+  int runs = 0;
+  const BuildDirectoryTree tree(source, [&runs](const Command& /*command*/) {
+    ++runs;
+    return finished(
+        runs == 2
+            ? BuildResult(std::unexpected(exit_status_error(1)))
+            : BuildResult(BuildOutput{.bytes = "build " + std::to_string(runs),
+                                      .inputs = {"input.txt"}}));
+  });
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+
+  source.write_file("input.txt", "v2");
+  EXPECT_EQ(runs, 2);
+
+  source.write_file("input.txt", "v3");
+  EXPECT_EQ(runs, 3);
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 3");
+}
+
+// A failed build whose input changed while it ran is retried as it finishes,
+// as a successful one is rebuilt, once materialized.
+TEST_F(BuildDirectoryTreeTest, AFailureWhoseInputChangedMidBuildIsRetried) {
+  source.write_file("input.txt", "v1");
+  write_manifest("@/output.txt = run build input.txt %out\n");
+
+  const DeferredRunner builds;
+  const BuildDirectoryTree tree(source, builds.runner());
+  // Fails once, recording its input.
+  std::thread first([&tree] {
+    EXPECT_FALSE(DirectoryTreeUtil::open(tree, "output.txt").has_value());
+  });
+  ASSERT_TRUE(builds.wait_for_runs(1));
+  builds.complete(
+      std::unexpected(BuildFailure(exit_status_error(1), {"input.txt"})));
+  first.join();
+
+  // The retry is under way when the input changes again.
+  source.write_file("input.txt", "v2");
+  ASSERT_TRUE(builds.wait_for_runs(2));
+  source.write_file("input.txt", "v3");
+  builds.complete(
+      std::unexpected(BuildFailure(exit_status_error(1), {"input.txt"})));
+  ASSERT_TRUE(builds.wait_for_runs(3));
+  builds.complete(built("fixed"));
+  EXPECT_EQ(output_size(tree, "output.txt"), std::string("fixed").size());
+}
+
 // Builds share a pool of rows in the trace: one row each while they overlap,
 // and a row goes back in the pool for the next build once its own span is
 // closed.

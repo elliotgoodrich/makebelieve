@@ -280,12 +280,14 @@ exec::task<BuildResult> detail::run_shell_command(
     std::expected<std::string, std::error_code> bytes =
         read_file(working_directory / source);
     // The reader sees the output, so the source's own error - that it does
-    // not exist, say - would read as being about the output.
+    // not exist, say - would read as being about the output. The source is
+    // still its input, so creating or fixing it retries the copy: a tracer
+    // records only the files that opened, so nothing else would.
     if (!bytes.has_value()) {
       report(command.output, "cannot copy [" + source.generic_string() +
                                  "]: " + bytes.error().message());
-      co_return std::unexpected(
-          make_error_code(BuildError::copy_source_unreadable));
+      co_return std::unexpected(BuildFailure(
+          make_error_code(BuildError::copy_source_unreadable), {source}));
     }
     co_return BuildOutput{.bytes = std::move(*bytes), .inputs = {source}};
   }
@@ -327,9 +329,16 @@ exec::task<BuildResult> detail::run_shell_command(
                 result->standard_output.size(), stderr);
     std::fflush(stderr);
   }
+  // What it read, whether or not it built anything: a failure is retried when
+  // one of these changes, as a success is rebuilt.
+  std::vector<std::filesystem::path> inputs =
+      relativize(result->inputs, working_directory);
+  const auto fail = [&inputs](std::error_code error) {
+    return std::unexpected(BuildFailure(error, std::move(inputs)));
+  };
   // A command that reports failure has not built its output.
   if (result->exit_status != 0) {
-    co_return std::unexpected(exit_status_error(result->exit_status));
+    co_return fail(exit_status_error(result->exit_status));
   }
   std::string bytes;
   if (capture) {
@@ -347,13 +356,11 @@ exec::task<BuildResult> detail::run_shell_command(
                  : "command exited successfully but its %out could not be "
                    "read: " +
                        written.error().message());
-      co_return std::unexpected(make_error_code(BuildError::out_not_written));
+      co_return fail(make_error_code(BuildError::out_not_written));
     }
     bytes = std::move(*written);
   }
-  co_return BuildOutput{
-      .bytes = std::move(bytes),
-      .inputs = relativize(result->inputs, working_directory)};
+  co_return BuildOutput{.bytes = std::move(bytes), .inputs = std::move(inputs)};
 }
 
 }  // namespace makebelieve

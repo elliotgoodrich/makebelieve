@@ -80,7 +80,10 @@ command exiting nonzero, a `run` command that exits successfully but
 writes nothing to `%out`, and a `copy` whose source cannot be read; the
 last two also print a line to **makebelieve**'s standard error naming the
 output and the reason. Commands' standard error goes there too, as does
-a `run` command's standard output.
+a `run` command's standard output. A failed output is retried the next
+time it is opened, or when a file its build read changes - the fix for
+what it failed on, say, or the missing source of a `copy` appearing - just
+as a built output is rebuilt.
 
 `tracing` takes no argument: the output is a trace of what
 **makebelieve** itself has been doing - every file opened through the
