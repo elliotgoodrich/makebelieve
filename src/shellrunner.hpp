@@ -83,8 +83,8 @@ exec::task<BuildResult> run_shell_command(
 ///
 /// Whatever a command writes to standard error - and a `Run` command's
 /// standard output, which is not its output but may say why it failed - is
-/// kept with what it built (`BuildOutput::standard_error`), or with its
-/// failure. Either `BuildError` is explained there too, by a line of its own.
+/// kept with its failure (`BuildFailure::standard_error`), and dropped once it
+/// builds. Either `BuildError` is explained there too, by a line of its own.
 /// Each command it runs is added to the @link BuildProcessTracker given at
 /// construction, before it runs, under the output it builds
 /// (`Command::output`).

@@ -418,7 +418,7 @@ class BuildDirectoryTree::Impl {
   // Told why a changed manifest was rejected; may be empty.
   ManifestErrorHandler m_on_manifest_error;
 
-  // Told of each build that failed or wrote to standard error; may be empty.
+  // Told of each build that failed; may be empty.
   BuildReportHandler m_on_build_report;
 
   // Why an output's last build failed: what it ran, and either how that went
@@ -904,8 +904,7 @@ class BuildDirectoryTree::Impl {
                                                 Manifest::Action::Tracing
                                             ? trace_snapshot()
                                             : std::string(),
-                               .inputs = {},
-                               .standard_error = {}});
+                               .inputs = {}});
       return;
     }
 
@@ -1186,9 +1185,8 @@ class BuildDirectoryTree::Impl {
 
   // Records how @a output's build went, as @a result says: a success clears
   // any failure it had, a failure replaces it. Reports a failure as
-  // append_failure() gives it, a success only if it wrote to standard error,
-  // and nothing for a build stopped before it could finish, which says nothing
-  // of the output.
+  // append_failure() gives it, and nothing for a success, or for a build
+  // stopped before it could finish, which says nothing of the output.
   // @pre m_mutex is held, and the build's reads are still in m_reads.
   Outcome record_outcome(const std::filesystem::path& output,
                          const BuildResult& result) {
@@ -1198,16 +1196,7 @@ class BuildDirectoryTree::Impl {
       return {.report = {}, .failures_changed = m_failures.erase(output) != 0};
     }
     if (result.has_value()) {
-      Outcome outcome{.report = {},
-                      .failures_changed = m_failures.erase(output) != 0};
-      if (!result->standard_error.empty()) {
-        append_output(outcome.report, output);
-        outcome.report += " built: ";
-        append_command(outcome.report, command->second);
-        outcome.report += '\n';
-        append_indented(outcome.report, result->standard_error);
-      }
-      return outcome;
+      return {.report = {}, .failures_changed = m_failures.erase(output) != 0};
     }
     if (result.error().error == std::errc::operation_canceled) {
       return {};

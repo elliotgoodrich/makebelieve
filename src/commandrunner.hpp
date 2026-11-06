@@ -21,13 +21,12 @@
 
 namespace makebelieve {
 
-/// What running a command produced: the bytes of the output it built, the
+/// What running a command produced: the bytes of the output it built, and the
 /// input files it read (its dependencies), relative to the source tree's
-/// root, and whatever it wrote to standard error.
+/// root.
 struct BuildOutput {
   std::string bytes;
   std::vector<std::filesystem::path> inputs;
-  std::string standard_error;
 };
 
 /// Why a build failed: the error; the input files it read on the way, relative

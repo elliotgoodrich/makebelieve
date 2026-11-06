@@ -102,13 +102,11 @@ class BuildDirectoryTree : public DirectoryTree {
   /// thread.
   using ManifestErrorHandler = std::function<void(const std::string& problems)>;
 
-  /// Told of each build that failed, or succeeded but wrote to standard error,
-  /// as @link status_report would describe it: a line naming the output,
-  /// followed by
-  /// what it wrote to standard error, indented - such as
-  /// `@/foo.txt failed (exit 2): run cc foo.c` - ending in a newline. A
-  /// success is `@/foo.txt built: run cc foo.c` and its standard error. Called
-  /// on whatever thread finished the build, before anything waiting on it is
+  /// Told of each build that failed, as @link status_report describes it: a
+  /// line naming the output, followed by what it wrote to standard error,
+  /// indented - such as `@/foo.txt failed (exit 2): run cc foo.c` - ending in
+  /// a newline. Not told of a build stopped before it could finish. Called on
+  /// whatever thread finished the build, before anything waiting on it is
   /// released.
   using BuildReportHandler = std::function<void(const std::string& report)>;
 
@@ -119,8 +117,7 @@ class BuildDirectoryTree : public DirectoryTree {
   /// accept; later problems of that kind go to @a on_manifest_error, if
   /// given, except that a manifest removed later leaves an empty tree until it
   /// is written back. Builds are kept in @a cache, if given, and restored from
-  /// it. Each build that fails or writes to standard error is told to
-  /// @a on_build_report, if given.
+  /// it. Each build that fails is told to @a on_build_report, if given.
   /// @pre @a source outlives this tree; it is observed for its whole life.
   /// @pre @a cache, if given, outlives this tree.
   BuildDirectoryTree(const DirectoryTree& source,

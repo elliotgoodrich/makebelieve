@@ -264,18 +264,15 @@ TEST_F(ShellRunnerTest, ReportsARunCommandThatWritesNothingToOut) {
       << errors;
 }
 
-// A run command's standard output is not its output, but is kept with its
-// standard error rather than being dropped.
-TEST_F(ShellRunnerTest, KeepsWhatARunCommandPrints) {
-  write_input("input.txt", "written");
+// A run command's standard output is not its output, but may say why it
+// failed, so it is kept with a failure's standard error rather than dropped.
+TEST_F(ShellRunnerTest, KeepsWhatAFailingRunCommandPrints) {
   const Built built = build({.output = "output.txt",
                              .action = Manifest::Action::Run,
-                             .text = "cmake -E echo progress && cmake -E copy "
-                                     "input.txt %out"});
-  ASSERT_TRUE(built.result.has_value());
-  EXPECT_EQ(built.result->bytes, "written");
-  EXPECT_TRUE(built.result->standard_error.starts_with("progress"))
-      << built.result->standard_error;
+                             .text = "cmake -E echo progress && exit 1"});
+  ASSERT_FALSE(built.result.has_value());
+  EXPECT_TRUE(built.result.error().standard_error.starts_with("progress"))
+      << built.result.error().standard_error;
 }
 
 #if defined(_WIN32) || defined(__linux__)
@@ -328,17 +325,15 @@ TEST_F(ShellRunnerTest, KeepsWhatAFailingCommandWroteToStandardError) {
       << built.result.error().standard_error;
 }
 
-// A command that succeeds may still have warned; that is kept apart from the
-// output it built.
-TEST_F(ShellRunnerTest, KeepsWhatASucceedingCommandWroteToStandardError) {
+// A command that succeeds may still have warned, but it built, so that is not
+// mixed into the output it built.
+TEST_F(ShellRunnerTest, KeepsWhatASucceedingCommandWarnedOutOfItsOutput) {
   const Built built = build(
       {.output = "output.txt",
        .action = Manifest::Action::Capture,
        .text = "cmake -E echo warned 1>&2 && cmake -E echo_append built"});
   ASSERT_TRUE(built.result.has_value()) << built.result.error().error.message();
   EXPECT_EQ(built.result->bytes, "built");
-  EXPECT_TRUE(built.result->standard_error.starts_with("warned"))
-      << built.result->standard_error;
 }
 
 TEST_F(ShellRunnerTest, ProducesWhatACaptureCommandWroteToStandardOutput) {

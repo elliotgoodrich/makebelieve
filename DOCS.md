@@ -244,10 +244,11 @@ makebelieve unmount <directory>
 `unmount` signals the instance serving from that directory to shut down
 and blocks until it has fully torn down.
 
-A build's standard error - and a `run` command's standard output, which
-is not its output but may say why it failed - goes to the terminal
-running the mount, each build's under a line naming its output, so
-builds running at once do not interleave:
+A failed build's standard error - and a `run` command's standard output,
+which is not its output but may say why it failed - goes to the terminal
+running the mount, under a line naming its output, so builds failing at
+once do not interleave. What a build that succeeds writes there is
+dropped:
 
 ```text
 makebelieve: @/index.md failed (exit 1): run pandoc --from markdown index.txt -o %out

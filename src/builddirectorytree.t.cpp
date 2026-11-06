@@ -1653,8 +1653,8 @@ TEST_F(BuildDirectoryTreeTest, AStatusOutputReportsARejectedManifest) {
   EXPECT_EQ(read_output(tree, "status.txt"), "");
 }
 
-// Each build that fails, or writes to standard error, is told to the build
-// report handler as it finishes, in the same terms.
+// Each build that fails is told to the build report handler as it finishes, in
+// the same terms; one that builds is not.
 TEST_F(BuildDirectoryTreeTest, TellsTheBuildReportHandlerOfEachBuild) {
   write_manifest(
       "@/bad.txt = run build %out\n"
@@ -1665,8 +1665,7 @@ TEST_F(BuildDirectoryTreeTest, TellsTheBuildReportHandlerOfEachBuild) {
   std::map<std::filesystem::path, BuildResult> failures = {
       {"bad.txt",
        std::unexpected(BuildFailure(exit_status_error(2), {}, "no\n"))},
-      {"warned.txt",
-       BuildOutput{.bytes = "ok", .inputs = {}, .standard_error = "careful"}}};
+      {"warned.txt", BuildOutput{.bytes = "ok", .inputs = {}}}};
   std::vector<std::string> reports;
   const BuildDirectoryTree tree(
       source, failing(runs, failures), {}, nullptr,
@@ -1675,10 +1674,9 @@ TEST_F(BuildDirectoryTreeTest, TellsTheBuildReportHandlerOfEachBuild) {
   EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
   EXPECT_EQ(read_output(tree, "warned.txt"), "ok");
   EXPECT_EQ(read_output(tree, "quiet.txt"), "built");
-  EXPECT_EQ(reports, (std::vector<std::string>{
-                         "@/bad.txt failed (exit 2): run build %out\n    no\n",
-                         "@/warned.txt built: capture build\n    careful\n"}));
-  // A build that succeeded is no failure, warnings or not.
+  EXPECT_EQ(reports,
+            (std::vector<std::string>{
+                "@/bad.txt failed (exit 2): run build %out\n    no\n"}));
   EXPECT_EQ(tree.status_report(),
             "@/bad.txt failed (exit 2): run build %out\n    no\n");
 }

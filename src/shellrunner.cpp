@@ -368,9 +368,8 @@ exec::task<BuildResult> detail::run_shell_command(
     }
     bytes = std::move(*written);
   }
-  co_return BuildOutput{.bytes = std::move(bytes),
-                        .inputs = std::move(inputs),
-                        .standard_error = std::move(diagnostics)};
+  // What it printed is dropped: it built, so there is nothing to explain.
+  co_return BuildOutput{.bytes = std::move(bytes), .inputs = std::move(inputs)};
 }
 
 }  // namespace makebelieve
