@@ -21,27 +21,33 @@
 
 namespace makebelieve {
 
-/// What running a command produced: the bytes of the output it built, and the
+/// What running a command produced: the bytes of the output it built, the
 /// input files it read (its dependencies), relative to the source tree's
-/// root.
+/// root, and whatever it wrote to standard error.
 struct BuildOutput {
   std::string bytes;
   std::vector<std::filesystem::path> inputs;
+  std::string standard_error;
 };
 
-/// Why a build failed, and the input files it read on the way, relative to
-/// the source tree's root - so a change to one, the fix for what failed, say,
-/// retries it as it would rebuild a successful build.
+/// Why a build failed: the error; the input files it read on the way, relative
+/// to the source tree's root - so a change to one, the fix for what failed,
+/// say, retries it as it would rebuild a successful build; and whatever its
+/// command wrote to standard error before failing, if it ran one.
 struct BuildFailure {
   std::error_code error;
   std::vector<std::filesystem::path> inputs;
+  std::string standard_error;
 
-  /// A failure that read nothing. Implicit, so a build can fail with
-  /// `std::unexpected(error)`.
+  /// A failure that read nothing and wrote nothing to standard error, unless
+  /// given. Implicit, so a build can fail with `std::unexpected(error)`.
   // NOLINTNEXTLINE(google-explicit-constructor,hicpp-explicit-conversions)
   BuildFailure(std::error_code error,
-               std::vector<std::filesystem::path> inputs = {})
-      : error(error), inputs(std::move(inputs)) {}
+               std::vector<std::filesystem::path> inputs = {},
+               std::string standard_error = {})
+      : error(error),
+        inputs(std::move(inputs)),
+        standard_error(std::move(standard_error)) {}
 };
 
 /// The outcome of running a command: a @link BuildOutput, or a
@@ -63,7 +69,8 @@ struct Command {
   Manifest::Action action = Manifest::Action::Run;
 
   /// The command to run for `Run` and `Capture`; for `Copy`, the path of the
-  /// file to read, relative to the source tree's root; empty for `Tracing`.
+  /// file to read, relative to the source tree's root; empty for `Tracing`
+  /// and `Errors`.
   std::string text;
 
   [[nodiscard]] friend bool operator==(const Command&,
@@ -103,7 +110,7 @@ using BuildSender = exec::any_sender<exec::any_receiver<
 }
 
 /// Carries out one rule, returning the build as a sender that the caller -
-/// a `BuildDirectoryTree` - starts. A `Manifest::Action::Tracing` rule never
+/// a `BuildDirectoryTree` - starts. A `Manifest::is_report` rule never
 /// reaches it. The sender may complete inline, from within `start`, or later on
 /// any thread. Any sender whose completions fit @link BuildSender converts to
 /// it, so a runner with its answer to hand can return `stdexec::just(result)`.

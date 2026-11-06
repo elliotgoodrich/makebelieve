@@ -250,35 +250,32 @@ TEST_F(ShellRunnerTest, FailsARunCommandThatWritesNothingToOut) {
   EXPECT_EQ(built.result.error().error.message(), "command did not write %out");
 }
 
-// Standard error explains the failure, naming the output, and carries what
-// the command printed, which is often the clue.
+// The failure explains itself, and carries what the command printed, which is
+// often the clue.
 TEST_F(ShellRunnerTest, ReportsARunCommandThatWritesNothingToOut) {
-  ::testing::internal::CaptureStderr();
   const Built built = build({.output = "sub/output.txt",
                              .action = Manifest::Action::Run,
                              .text = "cmake -E echo forgot to write it"});
-  const std::string errors = ::testing::internal::GetCapturedStderr();
   ASSERT_FALSE(built.result.has_value());
-  EXPECT_NE(errors.find("forgot to write it"), std::string::npos) << errors;
-  EXPECT_NE(errors.find("makebelieve: @/sub/output.txt: command exited "
-                        "successfully but wrote nothing to %out"),
-            std::string::npos)
+  const std::string& errors = built.result.error().standard_error;
+  EXPECT_TRUE(errors.starts_with("forgot to write it")) << errors;
+  EXPECT_TRUE(errors.ends_with(
+      "command exited successfully but wrote nothing to %out\n"))
       << errors;
 }
 
-// A run command's standard output is not its output, but still goes to
+// A run command's standard output is not its output, but is kept with its
 // standard error rather than being dropped.
-TEST_F(ShellRunnerTest, ForwardsWhatARunCommandPrints) {
+TEST_F(ShellRunnerTest, KeepsWhatARunCommandPrints) {
   write_input("input.txt", "written");
-  ::testing::internal::CaptureStderr();
   const Built built = build({.output = "output.txt",
                              .action = Manifest::Action::Run,
                              .text = "cmake -E echo progress && cmake -E copy "
                                      "input.txt %out"});
-  const std::string errors = ::testing::internal::GetCapturedStderr();
   ASSERT_TRUE(built.result.has_value());
   EXPECT_EQ(built.result->bytes, "written");
-  EXPECT_NE(errors.find("progress"), std::string::npos) << errors;
+  EXPECT_TRUE(built.result->standard_error.starts_with("progress"))
+      << built.result->standard_error;
 }
 
 #if defined(_WIN32) || defined(__linux__)
@@ -298,11 +295,9 @@ TEST_F(ShellRunnerTest, KeepsWhatAFailingCommandRead) {
 // As does one that exits successfully without writing %out.
 TEST_F(ShellRunnerTest, KeepsWhatACommandThatWritesNothingToOutRead) {
   write_input("input.txt", "read");
-  ::testing::internal::CaptureStderr();
   const Built built = build({.output = "output.txt",
                              .action = Manifest::Action::Run,
                              .text = "cmake -E cat input.txt"});
-  ::testing::internal::GetCapturedStderr();
   ASSERT_FALSE(built.result.has_value());
   EXPECT_EQ(built.result.error().error,
             makebelieve::make_error_code(BuildError::out_not_written));
@@ -319,6 +314,31 @@ TEST_F(ShellRunnerTest, FailsACommandThatExitsNonzero) {
   EXPECT_EQ(built.result.error().error, makebelieve::exit_status_error(2));
   EXPECT_EQ(built.result.error().error.message(),
             "command exited with status 2");
+}
+
+// What a failing command wrote to standard error comes back with the failure,
+// for whoever reads the output to be told why.
+TEST_F(ShellRunnerTest, KeepsWhatAFailingCommandWroteToStandardError) {
+  const Built built = build({.output = "output.txt",
+                             .action = Manifest::Action::Capture,
+                             .text = "cmake -E echo oops 1>&2 && exit 3"});
+  ASSERT_FALSE(built.result.has_value());
+  EXPECT_EQ(built.result.error().error, makebelieve::exit_status_error(3));
+  EXPECT_TRUE(built.result.error().standard_error.starts_with("oops"))
+      << built.result.error().standard_error;
+}
+
+// A command that succeeds may still have warned; that is kept apart from the
+// output it built.
+TEST_F(ShellRunnerTest, KeepsWhatASucceedingCommandWroteToStandardError) {
+  const Built built = build(
+      {.output = "output.txt",
+       .action = Manifest::Action::Capture,
+       .text = "cmake -E echo warned 1>&2 && cmake -E echo_append built"});
+  ASSERT_TRUE(built.result.has_value()) << built.result.error().error.message();
+  EXPECT_EQ(built.result->bytes, "built");
+  EXPECT_TRUE(built.result->standard_error.starts_with("warned"))
+      << built.result->standard_error;
 }
 
 TEST_F(ShellRunnerTest, ProducesWhatACaptureCommandWroteToStandardOutput) {
@@ -456,20 +476,18 @@ TEST_F(ShellRunnerTest, CopiesBytesVerbatim) {
 
 // A copy whose source is not there fails rather than quietly producing
 // nothing - not with the source's own error, which would read as the output
-// not existing, but saying why on standard error.
+// not existing, but saying why alongside.
 TEST_F(ShellRunnerTest, FailsACopyOfAMissingFile) {
-  ::testing::internal::CaptureStderr();
   const Built built = build({.output = "output.txt",
                              .action = Manifest::Action::Copy,
                              .text = "missing.txt"});
-  const std::string errors = ::testing::internal::GetCapturedStderr();
   ASSERT_FALSE(built.result.has_value());
   EXPECT_EQ(built.result.error().error,
             makebelieve::make_error_code(BuildError::copy_source_unreadable));
   EXPECT_NE(built.result.error().error, std::errc::no_such_file_or_directory);
-  EXPECT_NE(errors.find("makebelieve: @/output.txt: cannot copy [missing.txt]"),
-            std::string::npos)
-      << errors;
+  EXPECT_TRUE(built.result.error().standard_error.starts_with(
+      "cannot copy [missing.txt]: "))
+      << built.result.error().standard_error;
   // Nothing opened it, so no tracer could say; its input is what it names,
   // so creating it retries the copy.
   EXPECT_EQ(built.result.error().inputs,

@@ -20,10 +20,12 @@ class IoContext;
 /// @class ProcessUtil
 /// Provides a namespace for running external commands.
 struct ProcessUtil {
-  /// What a command produced: the bytes it wrote to standard output, and the
-  /// files it read while running - its discovered input dependencies.
+  /// What a command produced: the bytes it wrote to standard output and to
+  /// standard error, and the files it read while running - its discovered
+  /// input dependencies.
   struct Output {
     std::string standard_output;
+    std::string standard_error;
 
     /// Absolute paths, under @a working_directory, that the command (or
     /// anything it started) opened for reading, de-duplicated. Tracing is
@@ -44,14 +46,14 @@ struct ProcessUtil {
 
   /// Returns a sender that runs @a command through the system shell with the
   /// working directory set to @a working_directory, and completes with its
-  /// standard output, the files it read (see Output::inputs) and its exit
-  /// status once it has run to completion, whatever that status. It completes
-  /// with `std::errc::operation_canceled` if @a stop was requested, in which
-  /// case the command is terminated first, or with the platform error if the
-  /// command could not be started or waited on - or could not be traced,
-  /// whether because tracing could not be set up or because it failed while
-  /// the command ran. A command that cannot be traced never runs, or is
-  /// terminated.
+  /// standard output and standard error, the files it read (see
+  /// Output::inputs) and its exit status once it has run to completion,
+  /// whatever that status. It completes with `std::errc::operation_canceled`
+  /// if @a stop was requested, in which case the command is terminated first,
+  /// or with the platform error if the command could not be started or waited
+  /// on - or could not be traced, whether because tracing could not be set up
+  /// or because it failed while the command ran. A command that cannot be
+  /// traced never runs, or is terminated.
   ///
   /// Once the command has exited, whatever it started and left running is
   /// killed, and the sender completes only once all of it has exited too -

@@ -23,6 +23,7 @@
 #include <deque>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <ios>
 #include <map>
@@ -1511,6 +1512,217 @@ TEST_F(BuildDirectoryTreeTest, AFailureWhoseInputChangedMidBuildIsRetried) {
   EXPECT_EQ(output_size(tree, "output.txt"), std::string("fixed").size());
 }
 
+// A runner whose builds of the outputs in @a failures fail as given there, and
+// whose others build "built", counting them all in @a runs.
+CommandRunner failing(
+    int& runs,
+    const std::map<std::filesystem::path, BuildResult>& failures) {
+  return [&runs, &failures](const Command& command) {
+    ++runs;
+    const auto failure = failures.find(command.output);
+    return finished(failure != failures.end() ? failure->second
+                                              : built("built"));
+  };
+}
+
+// Nothing has failed, so there is nothing to report - and reading the report
+// builds nothing.
+TEST_F(BuildDirectoryTreeTest, AnErrorsOutputIsEmptyWhileNothingFails) {
+  write_manifest(
+      "@/errors.txt = errors\n"
+      "@/output.txt = run build %out\n");
+
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
+
+  // Current from the start, rather than the placeholder of an unbuilt output.
+  EXPECT_EQ(output_size(tree, "errors.txt"), 0U);
+  EXPECT_EQ(read_output(tree, "errors.txt"), "");
+  EXPECT_EQ(runs, 0);
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+  EXPECT_EQ(read_output(tree, "errors.txt"), "");
+  EXPECT_EQ(tree.errors(), "");
+}
+
+// A failed build is reported with what it ran, its exit status and what it
+// wrote to standard error, until it next builds.
+TEST_F(BuildDirectoryTreeTest, AnErrorsOutputReportsAFailureUntilItBuilds) {
+  write_manifest(
+      "@/errors.txt = errors\n"
+      "@/bad.txt = run build %out\n");
+
+  int runs = 0;
+  std::map<std::filesystem::path, BuildResult> failures;
+  failures.emplace("bad.txt",
+                   std::unexpected(BuildFailure(exit_status_error(2), {},
+                                                "oops\r\n\nagain\n\n\r\n")));
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  // A blank line within what it wrote is kept, but not those at the end.
+  const std::string report =
+      "@/bad.txt failed (exit 2): run build %out\n"
+      "    oops\n"
+      "\n"
+      "    again\n";
+  // Its size is right before anything opens it.
+  EXPECT_EQ(output_size(tree, "errors.txt"), report.size());
+  EXPECT_EQ(read_output(tree, "errors.txt"), report);
+  EXPECT_EQ(tree.errors(), report);
+  EXPECT_EQ(runs, 1);
+
+  failures.clear();
+  EXPECT_EQ(read_output(tree, "bad.txt"), "built");
+  EXPECT_EQ(read_output(tree, "errors.txt"), "");
+}
+
+// An error that is no exit status is reported as itself.
+TEST_F(BuildDirectoryTreeTest, AnErrorsOutputReportsAnyError) {
+  write_manifest("@/bad.txt = copy missing.txt\n");
+
+  int runs = 0;
+  const std::error_code error =
+      std::make_error_code(std::errc::no_such_file_or_directory);
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"bad.txt", std::unexpected(error)}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  EXPECT_EQ(tree.errors(), std::format("@/bad.txt failed ({}): copy "
+                                       "missing.txt\n",
+                                       error.message()));
+}
+
+// An output that failed only because one it read had failed says so in a
+// line, rather than repeating that output's failure.
+TEST_F(BuildDirectoryTreeTest, AnOutputThatReadAFailureIsReportedInALine) {
+  write_manifest(
+      "@/copy.txt = copy @/original.txt\n"
+      "@/original.txt = run build %out\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"original.txt",
+       std::unexpected(BuildFailure(exit_status_error(3), {}, "broken\n"))}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "copy.txt").has_value());
+  EXPECT_EQ(tree.errors(),
+            "@/copy.txt failed because @/original.txt failed\n"
+            "@/original.txt failed (exit 3): run build %out\n"
+            "    broken\n");
+}
+
+// A rule that is gone takes its failure with it.
+TEST_F(BuildDirectoryTreeTest, RemovingARuleDropsItsFailure) {
+  write_manifest(
+      "@/bad.txt = run build %out\n"
+      "@/also-bad.txt = run build %out\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"bad.txt", std::unexpected(exit_status_error(1))},
+      {"also-bad.txt", std::unexpected(exit_status_error(1))}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "also-bad.txt").has_value());
+
+  write_manifest("@/also-bad.txt = run build %out\n");
+  EXPECT_EQ(tree.errors(), "@/also-bad.txt failed (exit 1): run build %out\n");
+}
+
+// Why a change to the manifest was rejected is reported, in the manifest's
+// own terms, until a change is accepted.
+TEST_F(BuildDirectoryTreeTest, AnErrorsOutputReportsARejectedManifest) {
+  write_manifest("@/errors.txt = errors\n");
+
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}),
+                                [](const std::string&) {});
+
+  write_manifest("@/errors.txt = errors\n@/b.txt run b %out\n");
+  const std::string report = read_output(tree, "errors.txt");
+  EXPECT_TRUE(report.starts_with("build.makebelieve:2: ")) << report;
+  EXPECT_TRUE(report.ends_with("\n")) << report;
+  EXPECT_EQ(std::ranges::count(report, '\n'), 1);
+
+  write_manifest("@/errors.txt = errors\n@/b.txt = run b %out\n");
+  EXPECT_EQ(read_output(tree, "errors.txt"), "");
+}
+
+// Each build that fails, or writes to standard error, is told to the build
+// report handler as it finishes, in the same terms.
+TEST_F(BuildDirectoryTreeTest, TellsTheBuildReportHandlerOfEachBuild) {
+  write_manifest(
+      "@/bad.txt = run build %out\n"
+      "@/warned.txt = capture build\n"
+      "@/quiet.txt = capture build\n");
+
+  int runs = 0;
+  std::map<std::filesystem::path, BuildResult> failures = {
+      {"bad.txt",
+       std::unexpected(BuildFailure(exit_status_error(2), {}, "no\n"))},
+      {"warned.txt",
+       BuildOutput{.bytes = "ok", .inputs = {}, .standard_error = "careful"}}};
+  std::vector<std::string> reports;
+  const BuildDirectoryTree tree(
+      source, failing(runs, failures), {}, nullptr,
+      [&reports](const std::string& report) { reports.push_back(report); });
+
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  EXPECT_EQ(read_output(tree, "warned.txt"), "ok");
+  EXPECT_EQ(read_output(tree, "quiet.txt"), "built");
+  EXPECT_EQ(reports, (std::vector<std::string>{
+                         "@/bad.txt failed (exit 2): run build %out\n    no\n",
+                         "@/warned.txt built: capture build\n    careful\n"}));
+  // A build that succeeded is no failure, warnings or not.
+  EXPECT_EQ(tree.errors(),
+            "@/bad.txt failed (exit 2): run build %out\n    no\n");
+}
+
+// Unlike a trace, the report is rewritten only when it changes - not by
+// reading it - and that is announced, so whatever watches it hears.
+TEST_F(BuildDirectoryTreeTest, AnErrorsOutputIsAnnouncedWhenItChanges) {
+  write_manifest(
+      "@/errors.txt = errors\n"
+      "@/bad.txt = run build %out\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"bad.txt", std::unexpected(exit_status_error(1))}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+  std::vector<std::filesystem::path> changed;
+  const Subscription subscription =
+      tree.subscribe_to_changes([&changed](const DirectoryTreeDiff& diff) {
+        changed.insert(changed.end(), diff.entries_changed.begin(),
+                       diff.entries_changed.end());
+      });
+
+  read_output(tree, "errors.txt");
+  read_output(tree, "errors.txt");
+  EXPECT_TRUE(changed.empty());
+
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  EXPECT_EQ(changed, std::vector<std::filesystem::path>{"errors.txt"});
+
+  // Failing the same way again changes nothing.
+  changed.clear();
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  EXPECT_TRUE(changed.empty());
+  EXPECT_EQ(runs, 2);
+}
+
+// Nor does building every output build the report, which is always current.
+TEST_F(BuildDirectoryTreeTest, MaterializingAllLeavesAnErrorsOutputAlone) {
+  write_manifest("@/errors.txt = errors\n");
+
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
+  tree.materialize_all();
+  EXPECT_EQ(output_size(tree, "errors.txt"), 0U);
+  EXPECT_EQ(runs, 0);
+}
+
 // Builds share a pool of rows in the trace: one row each while they overlap,
 // and a row goes back in the pool for the next build once its own span is
 // closed.
@@ -2009,6 +2221,13 @@ TEST_F(BuildDirectoryTreeCacheTest, ATraceIsNeverKept) {
   write_manifest("@/trace.json = tracing\n");
   const BuildDirectoryTree tree(source, returning("unused"), {}, &*cache);
   read_output(tree, "trace.json");
+  EXPECT_TRUE(recorded().empty());
+}
+
+TEST_F(BuildDirectoryTreeCacheTest, AnErrorsOutputIsNeverKept) {
+  write_manifest("@/errors.txt = errors\n");
+  const BuildDirectoryTree tree(source, returning("unused"), {}, &*cache);
+  read_output(tree, "errors.txt");
   EXPECT_TRUE(recorded().empty());
 }
 

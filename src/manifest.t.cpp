@@ -124,6 +124,15 @@ INSTANTIATE_TEST_SUITE_P(
                            "@/b.json = tracing\n",
                   .expected = {{"b.json", Action::Tracing, ""}},
                   .error_lines = {1}},
+        // Nor does `errors`: the output is what is failing right now.
+        ParseCase{.name = "single_errors_rule",
+                  .input = "@/errors.txt = errors\n",
+                  .expected = {{"errors.txt", Action::Errors, ""}}},
+        ParseCase{.name = "rejects_an_errors_rule_with_an_argument",
+                  .input = "@/a.txt = errors everything\n"
+                           "@/b.txt = errors\n",
+                  .expected = {{"b.txt", Action::Errors, ""}},
+                  .error_lines = {1}},
         // A copy source is a path, not a command line, so the whole of the
         // rest of the line is the path - spaces and all.
         ParseCase{.name = "keeps_spaces_in_a_copy_source",
@@ -167,17 +176,19 @@ INSTANTIATE_TEST_SUITE_P(
                            "@/output.txt =\n",
                   .expected = {},
                   .error_lines = {1, 2, 3, 4, 5}},
-        // Only `run`, `capture`, `copy` and `tracing` name an action; anything
-        // else - a bare command, a word that merely starts with one of them, or
-        // a rule invocation - is rejected rather than guessed at.
+        // Only `run`, `capture`, `copy`, `tracing` and `errors` name an
+        // action; anything else - a bare command, a word that merely starts
+        // with one of them, or a rule invocation - is rejected rather than
+        // guessed at.
         ParseCase{.name = "rejects_an_unknown_action",
                   .input = "@/output.txt = cp input.txt %out\n"
                            "@/output.txt = running cp input.txt %out\n"
                            "@/output.txt = copying input.txt\n"
                            "@/output.txt = tracingfile\n"
+                           "@/output.txt = errorsfile\n"
                            "@/foo.o = !cc foo.cpp\n",
                   .expected = {},
-                  .error_lines = {1, 2, 3, 4, 5}},
+                  .error_lines = {1, 2, 3, 4, 5, 6}},
         // Syntax the manifest format documents but the parser does not handle
         // yet is rejected rather than misread.
         ParseCase{.name = "rejects_unsupported_syntax",
@@ -241,9 +252,10 @@ INSTANTIATE_TEST_SUITE_P(
                            "@/*.o = run cc \"src/*.cpp\"\n"
                            "@/*.o = run cc @/../gen/*.cpp\n"
                            "@/*.o = copy @/gen/*/a.o\n"
-                           "@/*.json = tracing\n",
+                           "@/*.json = tracing\n"
+                           "@/*.txt = errors\n",
                   .expected = {},
-                  .error_lines = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}},
+                  .error_lines = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}},
         // A wildcard bans what its outputs end in - whatever follows the `*` -
         // from its directory: no other output there may end in it, whichever
         // is declared first and whatever comes before.

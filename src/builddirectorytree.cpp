@@ -8,6 +8,7 @@
 #include "inmemorydirectorytree.hpp"
 #include "manifest.hpp"
 #include "processinfo.hpp"
+#include "shellrunner.hpp"
 #include "tracer.hpp"
 
 #include <exec/static_thread_pool.hpp>
@@ -134,6 +135,8 @@ std::string_view to_string(Manifest::Action action) {
       return "copy";
     case Manifest::Action::Tracing:
       return "tracing";
+    case Manifest::Action::Errors:
+      return "errors";
   }
   return "unknown";
 }
@@ -142,6 +145,58 @@ std::string_view to_string(Manifest::Action action) {
 // nothing is being traced.
 std::string trace_snapshot() {
   return g_tracer != nullptr ? g_tracer->snapshot() : std::string("[]\n");
+}
+
+// How much of what a build wrote to standard error is kept with its failure.
+constexpr std::size_t k_kept_standard_error = std::size_t{16} * 1024;
+
+// Appends @a output as a manifest names it, `@/` and all.
+void append_output(std::string& report, const std::filesystem::path& output) {
+  report += k_generated_prefix;
+  report += output.generic_string();
+}
+
+// Appends @a command as its manifest line spells it after the `=`.
+void append_command(std::string& report, const Command& command) {
+  report += to_string(command.action);
+  if (!command.text.empty()) {
+    report += ' ';
+    report += command.text;
+  }
+}
+
+// Appends @a text with each line indented, and every line ended by a newline
+// alone. Blank lines at its end are left out, so they do not part one entry
+// of a report from the next.
+void append_indented(std::string& report, std::string_view text) {
+  const std::size_t last = text.find_last_not_of("\r\n");
+  text = last == std::string_view::npos ? std::string_view()
+                                        : text.substr(0, last + 1);
+  while (!text.empty()) {
+    const std::size_t end = text.find('\n');
+    std::string_view line = text.substr(0, end);
+    text = end == std::string_view::npos ? std::string_view()
+                                         : text.substr(end + 1);
+    if (line.ends_with('\r')) {
+      line.remove_suffix(1);
+    }
+    if (!line.empty()) {
+      report += "    ";
+      report += line;
+    }
+    report += '\n';
+  }
+}
+
+// Appends why a build failed: its exit status if its command exited with one,
+// otherwise the error itself.
+void append_reason(std::string& report, const std::error_code& error) {
+  if (error.category() == exit_status_category()) {
+    report += "exit ";
+    report += std::to_string(error.value());
+  } else {
+    report += error.message();
+  }
 }
 
 // Reads the rules of the manifest in @a source, or describes - one problem per
@@ -363,6 +418,28 @@ class BuildDirectoryTree::Impl {
   // Told why a changed manifest was rejected; may be empty.
   ManifestErrorHandler m_on_manifest_error;
 
+  // Told of each build that failed or wrote to standard error; may be empty.
+  BuildReportHandler m_on_build_report;
+
+  // Why an output's last build failed: what it ran, and either how that went
+  // wrong or the output it read that had failed, which is the reason enough.
+  struct Failure {
+    Command command;
+    std::error_code error;
+    std::string standard_error;
+    std::optional<std::filesystem::path> failed_input;
+  };
+
+  // Every output whose last build failed, until one succeeds or its rule goes.
+  std::map<std::filesystem::path, Failure> m_failures;
+
+  // Every declared `errors` output, kept in step with m_commands.
+  std::vector<std::filesystem::path> m_errors_outputs;
+
+  // Why the latest change to the manifest was rejected, one problem per line,
+  // or empty if it was accepted.
+  std::string m_manifest_problems;
+
   // Every build under way. Destruction requests a stop through it, telling
   // those builds their results are no longer wanted, then joins it, so none
   // completes into a tree that is gone.
@@ -386,12 +463,14 @@ class BuildDirectoryTree::Impl {
        CommandRunner runner,
        BuildCoordinator* coordinator,
        ManifestErrorHandler on_manifest_error,
-       BuildCache* cache)
+       BuildCache* cache,
+       BuildReportHandler on_build_report)
       : m_source(source),
         m_cache(cache),
         m_runner(std::move(runner)),
         m_coordinator(coordinator),
-        m_on_manifest_error(std::move(on_manifest_error)) {
+        m_on_manifest_error(std::move(on_manifest_error)),
+        m_on_build_report(std::move(on_build_report)) {
     if (m_coordinator == nullptr) {
       m_coordinator = &m_own_coordinator.emplace(
           unlimited_permits(), BuildProcessTracker::none(),
@@ -475,6 +554,26 @@ class BuildDirectoryTree::Impl {
     return m_structure.read_whole(path);
   }
 
+  // What an `errors` output holds: the manifest's problems, then each failing
+  // output in path order.
+  [[nodiscard]] std::string errors() {
+    const std::lock_guard lock(m_mutex);
+    return errors_locked();
+  }
+
+  // As errors(). @pre m_mutex is held.
+  [[nodiscard]] std::string errors_locked() const {
+    std::string report;
+    if (!m_manifest_problems.empty()) {
+      report += m_manifest_problems;
+      report += '\n';
+    }
+    for (const auto& [output, failure] : m_failures) {
+      append_failure(report, output, failure);
+    }
+    return report;
+  }
+
   // Waits, through the coordinator, for the build of a declared output that
   // brings it up to date - joining the one under way unless the output has
   // changed since it started, otherwise the next, which is started here if the
@@ -521,7 +620,7 @@ class BuildDirectoryTree::Impl {
       const std::lock_guard lock(m_mutex);
       m_materialize_all = true;
       for (const auto& [output, command] : m_commands) {
-        if (command.action != Manifest::Action::Tracing) {
+        if (!Manifest::is_report(command.action)) {
           m_materialized.insert(output);
           outputs.push_back(output);
         }
@@ -537,7 +636,8 @@ class BuildDirectoryTree::Impl {
   // Passes on every change but the rewrite of a `tracing` output. Reading the
   // trace is what rewrites it, so announcing that would have anything that
   // rereads a file when told it changed - an editor showing it, say - reread
-  // the trace forever.
+  // the trace forever. An `errors` output is rewritten only when the report
+  // changes, so that is announced like any other change.
   [[nodiscard]] Subscription subscribe_to_changes(
       const std::function<void(const DirectoryTreeDiff&)>& callback) {
     return m_structure.subscribe_to_changes(
@@ -706,8 +806,9 @@ class BuildDirectoryTree::Impl {
                   .attempt = std::move(attempt),
                   .command = m_commands.at(output)};
     // A `tracing` output is left out of the trace, whose snapshot would
-    // otherwise always hold its own unfinished build.
-    if (launch.command.action != Manifest::Action::Tracing) {
+    // otherwise always hold its own unfinished build, and so is an `errors`
+    // output, which is no build either.
+    if (!Manifest::is_report(launch.command.action)) {
       launch.build_id = ++m_last_build_id;
     }
     return launch;
@@ -740,10 +841,17 @@ class BuildDirectoryTree::Impl {
     const std::filesystem::path output = launch.output;
     const std::uint64_t build_id = launch.build_id;
 
-    // Served by the tree itself rather than the runner.
-    if (launch.command.action == Manifest::Action::Tracing) {
+    // Served by the tree itself rather than the runner. The report of errors
+    // is filled in by finish_build, under the lock that orders it with
+    // refresh_errors, so it cannot overwrite a newer one.
+    if (Manifest::is_report(launch.command.action)) {
       finish_build(output, launch.attempt, build_id,
-                   BuildOutput{.bytes = trace_snapshot(), .inputs = {}});
+                   BuildOutput{.bytes = launch.command.action ==
+                                                Manifest::Action::Tracing
+                                            ? trace_snapshot()
+                                            : std::string(),
+                               .inputs = {},
+                               .standard_error = {}});
       return;
     }
 
@@ -793,11 +901,12 @@ class BuildDirectoryTree::Impl {
     stdexec::spawn(
         std::move(*build) |
             stdexec::upon_error([](const std::exception_ptr& error) noexcept {
-              return BuildResult(std::unexpected(to_error_code(error)));
+              return BuildResult(
+                  std::unexpected(BuildFailure(to_error_code(error))));
             }) |
             stdexec::upon_stopped([]() noexcept {
-              return BuildResult(std::unexpected(
-                  std::make_error_code(std::errc::operation_canceled)));
+              return BuildResult(std::unexpected(BuildFailure(
+                  std::make_error_code(std::errc::operation_canceled))));
             }) |
             // Recording a result allocates; with nowhere left to report that
             // to, a failure there ends the process, as it would on any thread.
@@ -864,12 +973,15 @@ class BuildDirectoryTree::Impl {
         const auto command = m_commands.find(output);
         declared = command != m_commands.end();
         if (declared) {
+          if (command->second.action == Manifest::Action::Errors) {
+            result->bytes = errors_locked();
+          }
           add_reads(output, result->inputs);
           if (m_cache != nullptr) {
             // Before any waiter is released, so a build reading this output
             // finds the hash of what it read.
             m_hashes.insert_or_assign(output, BuildCache::hash(result->bytes));
-            if (command->second.action != Manifest::Action::Tracing) {
+            if (!Manifest::is_report(command->second.action)) {
               keep = Keep{.command = command->second,
                           .inputs = result->inputs,
                           .mtime = built_at,
@@ -889,6 +1001,7 @@ class BuildDirectoryTree::Impl {
 
     std::optional<Launch> next;
     BuildCoordinator::AttemptPtr orphaned;
+    Outcome outcome;
     {
       const std::lock_guard lock(m_mutex);
       // A failure that read nothing - one stopped, or that never got to run
@@ -900,6 +1013,7 @@ class BuildDirectoryTree::Impl {
           update_dependents(output, std::move(result.error().inputs));
         }
       }
+      outcome = record_outcome(output, result);
       m_in_flight.erase(output);
       m_reads.erase(output);
       const auto attempts = m_attempts.find(output);
@@ -935,6 +1049,14 @@ class BuildDirectoryTree::Impl {
         next = claim_build(output);
       }
     }
+    // Before the release, so whoever opened the output can find it reported.
+    if (outcome.failures_changed) {
+      refresh_errors();
+    }
+    if (!outcome.report.empty() && m_on_build_report) {
+      m_on_build_report(outcome.report);
+    }
+
     // Only now the content is in place may a waiting open() be released.
     m_coordinator->complete(
         attempt, result.has_value() ? std::error_code() : result.error().error);
@@ -961,6 +1083,141 @@ class BuildDirectoryTree::Impl {
 
     if (next.has_value()) {
       launch_build(std::move(*next));
+    }
+  }
+
+  // Appends @a failure, of @a output, as a report gives it: a line saying what
+  // failed and why, followed by what it wrote to standard error, indented -
+  // or, for one that read a failed output, the line alone, naming that output.
+  static void append_failure(std::string& report,
+                             const std::filesystem::path& output,
+                             const Failure& failure) {
+    append_output(report, output);
+    if (failure.failed_input.has_value()) {
+      report += " failed because ";
+      append_output(report, *failure.failed_input);
+      report += " failed\n";
+      return;
+    }
+    report += " failed (";
+    append_reason(report, failure.error);
+    report += "): ";
+    append_command(report, failure.command);
+    report += '\n';
+    append_indented(report, failure.standard_error);
+  }
+
+  // What record_outcome found: the report of the build for the build report
+  // handler, if any, and whether the report of errors changed.
+  struct Outcome {
+    std::string report;
+    bool failures_changed = false;
+  };
+
+  // Records how @a output's build went, as @a result says: a success clears
+  // any failure it had, a failure replaces it. Reports a failure as
+  // append_failure() gives it, a success only if it wrote to standard error,
+  // and nothing for a build stopped before it could finish, which says nothing
+  // of the output.
+  // @pre m_mutex is held, and the build's reads are still in m_reads.
+  Outcome record_outcome(const std::filesystem::path& output,
+                         const BuildResult& result) {
+    const auto command = m_commands.find(output);
+    if (command == m_commands.end() ||
+        Manifest::is_report(command->second.action)) {
+      return {.report = {}, .failures_changed = m_failures.erase(output) != 0};
+    }
+    if (result.has_value()) {
+      Outcome outcome{.report = {},
+                      .failures_changed = m_failures.erase(output) != 0};
+      if (!result->standard_error.empty()) {
+        append_output(outcome.report, output);
+        outcome.report += " built: ";
+        append_command(outcome.report, command->second);
+        outcome.report += '\n';
+        append_indented(outcome.report, result->standard_error);
+      }
+      return outcome;
+    }
+    if (result.error().error == std::errc::operation_canceled) {
+      return {};
+    }
+
+    Failure failure{.command = command->second,
+                    .error = result.error().error,
+                    .standard_error = result.error().standard_error.substr(
+                        0, k_kept_standard_error),
+                    .failed_input = std::nullopt};
+    if (result.error().standard_error.size() > k_kept_standard_error) {
+      failure.standard_error += "\n... and ";
+      failure.standard_error += std::to_string(
+          result.error().standard_error.size() - k_kept_standard_error);
+      failure.standard_error += " more bytes\n";
+    }
+    // Every output it read, including the one a copy of an output copies.
+    std::vector<std::filesystem::path> read;
+    if (const auto reads = m_reads.find(output); reads != m_reads.end()) {
+      for (const std::filesystem::path& input : reads->second) {
+        if (std::optional<std::filesystem::path> named =
+                output_named_by(input)) {
+          read.push_back(std::move(*named));
+        }
+      }
+    }
+    if (command->second.action == Manifest::Action::Copy) {
+      if (std::optional<std::filesystem::path> named =
+              output_named_by(command->second.text)) {
+        read.push_back(std::move(*named));
+      }
+    }
+    for (const std::filesystem::path& input : read) {
+      if (input != output && m_failures.contains(input)) {
+        failure.failed_input = input;
+        break;
+      }
+    }
+    Outcome outcome{.report = {}, .failures_changed = true};
+    append_failure(outcome.report, output, failure);
+    m_failures.insert_or_assign(output, std::move(failure));
+    return outcome;
+  }
+
+  // Rewrites every `errors` output with the report as it is now, so one is
+  // always current: to whoever only looks up its size - a tool that skips
+  // empty files, say - as much as to whoever opens it, which needs no build.
+  // An `errors` output whose build is under way has finish_build write it.
+  void refresh_errors() {
+    const std::lock_guard layout(m_layout_mutex);
+    std::vector<std::filesystem::path> outputs;
+    std::string report;
+    {
+      const std::lock_guard lock(m_mutex);
+      for (const std::filesystem::path& output : m_errors_outputs) {
+        if (!m_in_flight.contains(output)) {
+          outputs.push_back(output);
+          m_stale.erase(output);
+        }
+      }
+      // With no `errors` rule there is nothing to write the report to.
+      if (outputs.empty()) {
+        return;
+      }
+      report = errors_locked();
+      if (m_cache != nullptr) {
+        // As finish_build does, for a build that reads one.
+        for (const std::filesystem::path& output : outputs) {
+          m_hashes.insert_or_assign(output, BuildCache::hash(report));
+        }
+      }
+    }
+    // Outside m_mutex: write_file notifies subscribers, who may read back
+    // through us.
+    const auto now = std::chrono::file_clock::now();
+    for (const std::filesystem::path& output : outputs) {
+      if (const auto current = read_all(m_structure, output);
+          !current.has_value() || *current != report) {
+        m_structure.write_file(output, report, now);
+      }
     }
   }
 
@@ -1107,7 +1364,7 @@ class BuildDirectoryTree::Impl {
     const auto command = restoring.commands.find(output);
     if (record == restoring.records.end() ||
         command == restoring.commands.end() ||
-        command->second.action == Manifest::Action::Tracing ||
+        Manifest::is_report(command->second.action) ||
         record->second->command != command->second) {
       return false;
     }
@@ -1217,12 +1474,18 @@ class BuildDirectoryTree::Impl {
   // keeps serving the current ones.
   void reload_manifest() {
     auto rules = read_rules(m_source);
+    {
+      const std::lock_guard lock(m_mutex);
+      m_manifest_problems = rules.has_value() ? std::string() : rules.error();
+    }
     if (!rules.has_value()) {
+      refresh_errors();
       if (m_on_manifest_error) {
         m_on_manifest_error(rules.error());
       }
       return;
     }
+    // Which refreshes the report.
     set_rules(std::move(*rules));
   }
 
@@ -1268,8 +1531,7 @@ class BuildDirectoryTree::Impl {
           if (it == m_commands.end()) {
             added.push_back(output);
             m_stale.insert(output);
-            if (m_materialize_all &&
-                command.action != Manifest::Action::Tracing) {
+            if (m_materialize_all && !Manifest::is_report(command.action)) {
               m_materialized.insert(output);
               // Invalidated below, which builds it as it is now materialized.
               changed.push_back(output);
@@ -1282,6 +1544,7 @@ class BuildDirectoryTree::Impl {
           m_stale.erase(output);
           m_materialized.erase(output);
           m_hashes.erase(output);
+          m_failures.erase(output);
           ++m_invalidations[output];
           // A build under way keeps its attempts until it finishes, which
           // settles whatever waits on them.
@@ -1292,6 +1555,12 @@ class BuildDirectoryTree::Impl {
           m_dependencies.erase(output);
         }
         m_commands = commands;
+        m_errors_outputs.clear();
+        for (const auto& [output, command] : m_commands) {
+          if (command.action == Manifest::Action::Errors) {
+            m_errors_outputs.push_back(output);
+          }
+        }
       }
 
       // Removals first, so a new output can take the place of a directory that
@@ -1321,6 +1590,10 @@ class BuildDirectoryTree::Impl {
     }
 
     forget_in_cache(removed);
+
+    // A new `errors` output starts out current, and a removed rule takes its
+    // failure with it.
+    refresh_errors();
 
     // Outside the layout lock, since an eager rebuild writes its result.
     invalidate(std::move(changed));
@@ -1413,23 +1686,27 @@ class BuildDirectoryTree::Impl {
 BuildDirectoryTree::BuildDirectoryTree(const DirectoryTree& source,
                                        CommandRunner runner,
                                        ManifestErrorHandler on_manifest_error,
-                                       BuildCache* cache)
+                                       BuildCache* cache,
+                                       BuildReportHandler on_build_report)
     : m_impl(std::make_unique<Impl>(source,
                                     std::move(runner),
                                     nullptr,
                                     std::move(on_manifest_error),
-                                    cache)) {}
+                                    cache,
+                                    std::move(on_build_report))) {}
 
 BuildDirectoryTree::BuildDirectoryTree(const DirectoryTree& source,
                                        CommandRunner runner,
                                        BuildCoordinator& coordinator,
                                        ManifestErrorHandler on_manifest_error,
-                                       BuildCache* cache)
+                                       BuildCache* cache,
+                                       BuildReportHandler on_build_report)
     : m_impl(std::make_unique<Impl>(source,
                                     std::move(runner),
                                     &coordinator,
                                     std::move(on_manifest_error),
-                                    cache)) {}
+                                    cache,
+                                    std::move(on_build_report))) {}
 
 BuildDirectoryTree::~BuildDirectoryTree() = default;
 
@@ -1445,6 +1722,10 @@ std::expected<std::vector<TreeEntry>, std::error_code> BuildDirectoryTree::ls(
 
 void BuildDirectoryTree::materialize_all() const {
   m_impl->materialize_all();
+}
+
+std::string BuildDirectoryTree::errors() const {
+  return m_impl->errors();
 }
 
 OpenSender BuildDirectoryTree::open(const std::filesystem::path& path,

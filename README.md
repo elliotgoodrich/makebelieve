@@ -15,8 +15,10 @@ With `run` the command writes the output itself, to the path `%out`
 stands for; with `capture` the bytes the command writes to standard
 output are the output. `copy` takes a path instead of a command and
 hands back that file's bytes, running nothing. `tracing` takes nothing
-at all and hands back a performance trace of **makebelieve** itself (see
-[`DOCS.md`](DOCS.md)).
+at all and hands back a performance trace of **makebelieve** itself, and
+`errors`, nothing too, a report of every output whose build is failing,
+with its command's exit status and standard error - empty while nothing
+is (see [`DOCS.md`](DOCS.md)).
 
 Then **makebelieve** will instantly manifest this as a folder,
 
@@ -59,6 +61,18 @@ $ makebelieve unmount ../output
 
 which asks the running instance to unmount and blocks until it has torn
 down.
+
+Reading an output whose build failed fails too. To find out why, without
+watching the terminal running the mount, add `@/errors.txt = errors` to
+the manifest and read it,
+
+```sh
+$ cat ../output/mount/errors.txt
+@/built.txt failed (exit 1): run node generate.js --output %out
+    Error: Cannot find module 'generate.js'
+```
+
+It is empty while everything builds.
 
 If one of the dependencies changes, **makebelieve** will rerun the
 command and regenerate the output, and opening the file while that is

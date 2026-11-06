@@ -297,10 +297,10 @@ std::expected<ScopedHandle, std::error_code> create_kill_on_close_job() {
 // it.
 constexpr DWORD k_pipe_bytes = 64 * 1024;
 
-// Creates the pipe a command writes its standard output to: @a read, ours,
-// opened for overlapped reads and kept out of the command, and @a write, the
-// command's, inheritable. Anonymous pipes cannot be read asynchronously, so it
-// is a named pipe with a name no other can take.
+// Creates a pipe a command writes its standard output or error to: @a read,
+// ours, opened for overlapped reads and kept out of the command, and @a write,
+// the command's, inheritable. Anonymous pipes cannot be read asynchronously, so
+// it is a named pipe with a name no other can take.
 std::error_code make_output_pipe(ScopedHandle& read, ScopedHandle& write) {
   static std::atomic<std::uint64_t> next_id{0};
   const std::wstring name = std::format(L"\\\\.\\pipe\\makebelieve-{}-{}",
@@ -333,7 +333,8 @@ std::error_code make_output_pipe(ScopedHandle& read, ScopedHandle& write) {
 
 // Collects a command's output from our end of its pipe, keeping one
 // overlapped read outstanding at a time and signalling event() whenever it
-// completes.
+// completes - and never again once the pipe has closed, so it may go on being
+// waited on alongside a pipe that is still open.
 class OutputReader {
   HANDLE m_pipe;
   ScopedHandle m_event;
@@ -342,6 +343,12 @@ class OutputReader {
   bool m_pending = false;
   bool m_open = true;
   std::string m_output;
+
+  // Stops reading, with no read outstanding to signal the event again.
+  void close() {
+    m_open = false;
+    ResetEvent(m_event.get());
+  }
 
   // Stops the outstanding read, keeping whatever it delivered first.
   void cancel() {
@@ -390,7 +397,7 @@ class OutputReader {
           }
           // ERROR_BROKEN_PIPE is end of file; anything else ends reading too.
           m_pending = false;
-          m_open = false;
+          close();
           return;
         }
         m_pending = false;
@@ -403,7 +410,7 @@ class OutputReader {
                     static_cast<DWORD>(m_buffer.size()), nullptr,
                     &m_overlapped) &&
           GetLastError() != ERROR_IO_PENDING) {
-        m_open = false;
+        close();
         return;
       }
       // Finished at once or not, GetOverlappedResult() reports it.
@@ -605,6 +612,7 @@ class ChildProcess {
     const std::string& hook;     // the DLL to inject, as Detours wants it
     const std::filesystem::path& working_directory;
     HANDLE standard_output;
+    HANDLE standard_error;
     BuildProcessTracker& tracker;         // added to before the command runs
     const std::filesystem::path& output;  // what to add the command under
     // Set to the command's record in the tracker as soon as it is added, for
@@ -639,21 +647,13 @@ class ChildProcess {
       return std::unexpected(last_error_code());
     }
     const ScopedHandle standard_input(null_device);
-    const HANDLE standard_error = GetStdHandle(STD_ERROR_HANDLE);
 
     // The command inherits its standard handles alone, not every inheritable
     // handle this process has - which includes the pipe of any other command
     // being launched meanwhile, and would hold it open for as long as this
-    // one lived. Only inheritable handles may be listed, and each once.
-    std::vector<HANDLE> inherited = {spec.standard_output,
-                                     standard_input.get()};
-    DWORD flags = 0;
-    if (standard_error != nullptr && standard_error != INVALID_HANDLE_VALUE &&
-        GetHandleInformation(standard_error, &flags) &&
-        (flags & HANDLE_FLAG_INHERIT) != 0 &&
-        std::ranges::find(inherited, standard_error) == inherited.end()) {
-      inherited.push_back(standard_error);
-    }
+    // one lived.
+    std::array<HANDLE, 3> inherited = {
+        spec.standard_output, spec.standard_error, standard_input.get()};
     SIZE_T attributes_size = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &attributes_size);
     std::vector<std::byte> attributes_buffer(attributes_size);
@@ -678,7 +678,7 @@ class ChildProcess {
                 .dwFlags = STARTF_USESTDHANDLES,
                 .hStdInput = standard_input.get(),
                 .hStdOutput = spec.standard_output,
-                .hStdError = standard_error,
+                .hStdError = spec.standard_error,
             },
         .lpAttributeList = attributes,
     };
@@ -838,11 +838,18 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
 
   ScopedHandle read_end(nullptr);
   ScopedHandle write_end(nullptr);
+  ScopedHandle error_read_end(nullptr);
+  ScopedHandle error_write_end(nullptr);
   if (const std::error_code error = make_output_pipe(read_end, write_end)) {
     co_return std::unexpected(error);
   }
+  if (const std::error_code error =
+          make_output_pipe(error_read_end, error_write_end)) {
+    co_return std::unexpected(error);
+  }
   OutputReader reader(read_end.get());
-  if (!reader.valid()) {
+  OutputReader error_reader(error_read_end.get());
+  if (!reader.valid() || !error_reader.valid()) {
     co_return std::unexpected(last_error_code());
   }
 
@@ -873,12 +880,14 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
                             .hook = (*tracing)->hook(),
                             .working_directory = working_directory,
                             .standard_output = write_end.get(),
+                            .standard_error = error_write_end.get(),
                             .tracker = tracker,
                             .output = output,
                             .added_as = added_as});
-  // Close our copy of the command's end, so only it can write to the pipe and
-  // the pipe closes once it has gone.
+  // Close our copy of the command's ends, so only it can write to the pipes
+  // and they close once it has gone.
   write_end.reset(nullptr);
+  error_write_end.reset(nullptr);
   if (!child.has_value()) {
     co_return std::unexpected(child.error());
   }
@@ -901,6 +910,7 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     constexpr int k_exited = 1;
     constexpr int k_tracing_failed = 2;
     reader.pump();
+    error_reader.pump();
     while (true) {
       auto exited = io.async_wait((*child)->exited()) |
                     stdexec::then([]() noexcept { return k_exited; }) |
@@ -909,25 +919,28 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
           io.async_wait((*tracing)->failed()) |
           stdexec::then([]() noexcept { return k_tracing_failed; }) |
           stdexec::upon_error(failed);
-      const int which =
-          reader.open()
-              ? co_await exec::when_any(
-                    io.async_wait(reader.event()) |
-                        stdexec::then([]() noexcept { return k_output; }) |
-                        stdexec::upon_error(failed),
-                    std::move(exited), std::move(tracing_failed))
-              : co_await exec::when_any(std::move(exited),
-                                        std::move(tracing_failed));
+      // A closed reader's event is never signalled again, so it is waited on
+      // all the same.
+      const int which = co_await exec::when_any(
+          io.async_wait(reader.event()) | stdexec::then([]() noexcept {
+            return k_output;
+          }) | stdexec::upon_error(failed),
+          io.async_wait(error_reader.event()) | stdexec::then([]() noexcept {
+            return k_output;
+          }) | stdexec::upon_error(failed),
+          std::move(exited), std::move(tracing_failed));
       if (which != k_output) {
         // Ended, with everything it started, by terminate() below; the
         // verdict then reports why.
         break;
       }
       reader.pump();
+      error_reader.pump();
     }
   }
   // Whatever the command wrote just before it exited.
   reader.finish();
+  error_reader.finish();
 
   // Everything the command started has gone too, and so has finished writing
   // to the trace log, once this confirms it.
@@ -954,6 +967,7 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     co_return std::unexpected(inputs.error());
   }
   co_return Output{.standard_output = std::move(reader).take(),
+                   .standard_error = std::move(error_reader).take(),
                    .inputs = std::move(*inputs),
                    .exit_status = *exit_code};
 }

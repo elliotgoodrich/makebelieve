@@ -72,8 +72,7 @@ exec::task<BuildResult> run_shell_command(
 /// `Run` command has `%out` substituted with a scratch file - with the same
 /// file name as the output it builds, so a tool that chooses its format from
 /// the extension needs no extra flag - and produces the bytes it wrote there,
-/// failing with `BuildError::out_not_written` if it left no file there; what
-/// it wrote to standard output goes to this process's standard error. A
+/// failing with `BuildError::out_not_written` if it left no file there. A
 /// `Capture` command produces the bytes it wrote to standard output. A command
 /// that exits with a nonzero status fails. Each `@/<path>` in either becomes
 /// that output's path under the mountpoint. A
@@ -81,8 +80,11 @@ exec::task<BuildResult> run_shell_command(
 /// names, read from under the working directory, and reports that file as its
 /// one input, failing with `BuildError::copy_source_unreadable` if that file
 /// cannot be read. (`BuildDirectoryTree` serves a copy of an output itself.)
-/// Either `BuildError` is explained by a line on standard error naming the
-/// output.
+///
+/// Whatever a command writes to standard error - and a `Run` command's
+/// standard output, which is not its output but may say why it failed - is
+/// kept with what it built (`BuildOutput::standard_error`), or with its
+/// failure. Either `BuildError` is explained there too, by a line of its own.
 /// Each command it runs is added to the @link BuildProcessTracker given at
 /// construction, before it runs, under the output it builds
 /// (`Command::output`).

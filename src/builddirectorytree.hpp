@@ -68,6 +68,14 @@ class BuildCoordinator;
 /// runner. Every open takes a fresh snapshot, and since that rewrite is caused
 /// by the reader it is not announced to subscribers.
 ///
+/// An `errors` rule's output is the report @link errors gives, also served by
+/// the tree itself. It is rewritten - and announced - whenever the report
+/// changes, so it is always current, even to whoever only looks up its size,
+/// and opening it builds nothing. The tree keeps each output whose last build
+/// failed - with what it ran, why it failed and what it wrote to standard
+/// error - until it next builds, or its rule goes, and why the latest change
+/// to the manifest was rejected, until one is accepted.
+///
 /// Given a @link BuildCache, the tree keeps each successful build in it, with
 /// a stamp of every input it read: a source file's mtime and size, or the hash
 /// of an output's content. On construction it serves every output whose record
@@ -75,7 +83,7 @@ class BuildCoordinator;
 /// stamped as it is now, every output it read itself restored with the content
 /// it read - and drops every other record. An output that goes stale has its
 /// record dropped at once, so a record never outlives what it describes. A
-/// `tracing` output is never kept.
+/// `tracing` or `errors` output is never kept.
 ///
 /// Subscribers are notified while an internal lock is held, so they must not
 /// call `open` from within their callback.
@@ -90,20 +98,31 @@ class BuildDirectoryTree : public DirectoryTree {
   /// thread.
   using ManifestErrorHandler = std::function<void(const std::string& problems)>;
 
+  /// Told of each build that failed, or succeeded but wrote to standard error,
+  /// as @link errors would describe it: a line naming the output, followed by
+  /// what it wrote to standard error, indented - such as
+  /// `@/foo.txt failed (exit 2): run cc foo.c` - ending in a newline. A
+  /// success is `@/foo.txt built: run cc foo.c` and its standard error. Called
+  /// on whatever thread finished the build, before anything waiting on it is
+  /// released.
+  using BuildReportHandler = std::function<void(const std::string& report)>;
+
   /// Builds the outputs declared in the `build.makebelieve` file of @a source,
   /// delegating each command to @a runner - any callable convertible to a
   /// @link CommandRunner. Throws `std::runtime_error` describing the problems
   /// if the manifest is missing, cannot be read or has lines it cannot
   /// accept; later problems of that kind go to @a on_manifest_error, if
   /// given, except that a manifest removed later leaves an empty tree until it
-  /// is written back. Builds are
-  /// kept in @a cache, if given, and restored from it.
+  /// is written back. Builds are kept in @a cache, if given, and restored from
+  /// it. Each build that fails or writes to standard error is told to
+  /// @a on_build_report, if given.
   /// @pre @a source outlives this tree; it is observed for its whole life.
   /// @pre @a cache, if given, outlives this tree.
   BuildDirectoryTree(const DirectoryTree& source,
                      CommandRunner runner,
                      ManifestErrorHandler on_manifest_error = {},
-                     BuildCache* cache = nullptr);
+                     BuildCache* cache = nullptr,
+                     BuildReportHandler on_build_report = {});
 
   /// As above, but running and waiting on builds through @a coordinator
   /// rather than one of its own, which places no limit on how many run at
@@ -113,7 +132,8 @@ class BuildDirectoryTree : public DirectoryTree {
                      CommandRunner runner,
                      BuildCoordinator& coordinator,
                      ManifestErrorHandler on_manifest_error = {},
-                     BuildCache* cache = nullptr);
+                     BuildCache* cache = nullptr,
+                     BuildReportHandler on_build_report = {});
 
   /// Cancels every build still under way and waits for each to complete, so
   /// no build outlives the tree.
@@ -143,14 +163,24 @@ class BuildDirectoryTree : public DirectoryTree {
   /// opens it, and does the same for every output declared later - by a
   /// changed manifest, or a file a wildcard comes to match - and rebuilds any
   /// whose inputs change, as it would an output that had been opened. A
-  /// `tracing` output is left alone, since each open takes a fresh trace
-  /// anyway. Returns once the builds are started, without waiting for them.
+  /// `tracing` or `errors` output is left alone, as each is always as fresh as
+  /// opening it makes it. Returns once the builds are started, without waiting
+  /// for them.
   ///
   /// These builds are nobody's request, so builds that someone does open
   /// overtake them in the coordinator's line for a permit. Call this only once
   /// whatever serves the outputs to the commands that read them - the mount -
   /// is up, as their builds may open those outputs at once.
   void materialize_all() const;
+
+  /// What is failing right now, as an `errors` output holds it: why the latest
+  /// change to the manifest was rejected, one `build.makebelieve:LINE: ...`
+  /// problem per line, then each output whose last build failed, in path
+  /// order, as @link BuildReportHandler describes it - except that one which
+  /// failed because an output it read had failed gets the single line
+  /// `@/<output> failed because @/<input> failed`. Empty when nothing is
+  /// failing. Builds nothing.
+  [[nodiscard]] std::string errors() const;
 
   /// Returns a sender reading up to @a size bytes at @a offset from @a path's
   /// last published build. Does not build; await @link open first.

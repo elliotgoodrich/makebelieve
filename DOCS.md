@@ -77,10 +77,11 @@ A build that fails makes opening its output fail with an I/O error (`EIO`
 on Linux, `STATUS_IO_DEVICE_ERROR` on Windows) - never with
 `ENOENT`, which would suggest the output does not exist. That covers a
 command exiting nonzero, a `run` command that exits successfully but
-writes nothing to `%out`, and a `copy` whose source cannot be read; the
-last two also print a line to **makebelieve**'s standard error naming the
-output and the reason. Commands' standard error goes there too, as does
-a `run` command's standard output. A failed output is retried the next
+writes nothing to `%out`, and a `copy` whose source cannot be read. Why
+it failed - the reason for the last two, and whatever the command wrote
+to standard error (or, for a `run` command, standard output) - is in an
+`errors` output (see below), and on **makebelieve**'s standard error
+under a line naming the output. A failed output is retried the next
 time it is opened, or when a file its build read changes - the fix for
 what it failed on, say, or the missing source of a `copy` appearing - just
 as a built output is rebuilt.
@@ -108,6 +109,39 @@ open of the output takes a fresh snapshot. That rewrite is not
 announced as a change, so a tool that rereads files when told they
 changed does not reread the trace forever.
 
+`errors` takes no argument either: the output is what is failing right
+now, so whoever reads the outputs - an AI agent, say, with no view of
+the terminal running the mount - can find out why. It is empty while
+nothing is, so an empty `errors` output is the check that everything
+built.
+
+```mb
+@/errors.txt = errors
+```
+
+It holds one entry per output whose most recent build failed, in path
+order: a line naming the output, why it failed - its command's exit
+status, or the error that stopped it - and its command, followed by
+whatever the command wrote to standard error, indented. An output that
+failed only because an output it read had failed gets a single line
+naming that output instead. Before them come the problems that kept the
+latest edit to the manifest from being applied, one per line, as the
+mount reports them.
+
+```text
+build.makebelieve:4: expected `@/<output> = <action> <command>`
+@/site/index.html failed because @/site/index.md failed
+@/site/index.md failed (exit 1): run pandoc --from markdown index.txt -o %out
+    pandoc: index.txt: withBinaryFile: does not exist (No such file or directory)
+```
+
+An output leaves the report once it next builds, or its rule leaves the
+manifest, and the manifest's problems once an edit to it is applied.
+Reading the report builds nothing - an output is retried when it is
+next opened, or when its inputs change - and it is always current, even
+to a tool that only looks up its size; it is rewritten, and that change
+announced, only when what is failing changes.
+
 ## Rules
 
 Reusable commands can be declared as rules:
@@ -125,7 +159,8 @@ Invoke them by name, prefixed with `!`:
 ```
 
 Without the `!`, the right-hand side is a built-in action (`run`,
-`capture`, `copy` or `tracing`) and its argument, if it takes one.
+`capture`, `copy`, `tracing` or `errors`) and its argument, if it takes
+one.
 
 ## Directory Expansion
 
@@ -195,6 +230,19 @@ makebelieve unmount <directory>
 `unmount` signals the instance serving from that directory to shut down
 and blocks until it has fully torn down.
 
+A build's standard error - and a `run` command's standard output, which
+is not its output but may say why it failed - goes to the terminal
+running the mount, each build's under a line naming its output, so
+builds running at once do not interleave:
+
+```text
+makebelieve: @/index.md failed (exit 1): run pandoc --from markdown index.txt -o %out
+    pandoc: index.txt: withBinaryFile: does not exist (No such file or directory)
+```
+
+From anywhere else, an `errors` output holds the same report for every
+output that is failing now.
+
 By default, at most one build per core holds a place to run at a time;
 `-j <builds>` sets another limit:
 
@@ -219,8 +267,9 @@ makebelieve mount --build=all <directory>
 With `--build=all`, every output is treated as already opened: outputs
 added later - by an edit to the manifest, or a new file a wildcard matches -
 are built as they appear, and an output is rebuilt whenever its inputs
-change, whether or not anything has read it. A `tracing` output is the
-exception, since every open takes a fresh trace anyway. Giving `--build`
+change, whether or not anything has read it. `tracing` and `errors`
+outputs are the exception, as each is always as fresh as opening it
+makes it. Giving `--build`
 more than once is an error, even with the same mode.
 
 Builds that something is waiting for go first. Opening an output whose build
@@ -268,7 +317,7 @@ Every other output is built on its next open, as usual, and its old build is
 discarded, as is the build of any output no longer in the manifest. The
 same goes for an output that went out of date while served but was not
 rebuilt before **makebelieve** stopped - however it stopped, a crash
-included. A `tracing` output is never kept.
+included. A `tracing` or `errors` output is never kept.
 
 Two mounts can never share one of these directories: mounting where another
 running **makebelieve** keeps its builds fails. Deleting the directory while
