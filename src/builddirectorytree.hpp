@@ -68,13 +68,17 @@ class BuildCoordinator;
 /// runner. Every open takes a fresh snapshot, and since that rewrite is caused
 /// by the reader it is not announced to subscribers.
 ///
-/// An `errors` rule's output is the report @link errors gives, also served by
-/// the tree itself. It is rewritten - and announced - whenever the report
-/// changes, so it is always current, even to whoever only looks up its size,
-/// and opening it builds nothing. The tree keeps each output whose last build
+/// A `status` rule's output is the report @link status_report gives, also
+/// served by the tree itself, and building nothing. The tree keeps each build
+/// under way - running, or waiting its turn - each output whose last build
 /// failed - with what it ran, why it failed and what it wrote to standard
 /// error - until it next builds, or its rule goes, and why the latest change
-/// to the manifest was rejected, until one is accepted.
+/// to the manifest was rejected, until one is accepted. What it shows changes
+/// as builds start and finish, so it is written when read - only if it changed
+/// since the last read, which is not announced either. Instead the first change
+/// after a read is written, and announced, at once; then nothing is until it is
+/// read again. So whatever watches it hears of a change once, however many
+/// builds come and go, and rereads it when it likes.
 ///
 /// Given a @link BuildCache, the tree keeps each successful build in it, with
 /// a stamp of every input it read: a source file's mtime and size, or the hash
@@ -83,7 +87,7 @@ class BuildCoordinator;
 /// stamped as it is now, every output it read itself restored with the content
 /// it read - and drops every other record. An output that goes stale has its
 /// record dropped at once, so a record never outlives what it describes. A
-/// `tracing` or `errors` output is never kept.
+/// `tracing` or `status` output is never kept.
 ///
 /// Subscribers are notified while an internal lock is held, so they must not
 /// call `open` from within their callback.
@@ -99,7 +103,8 @@ class BuildDirectoryTree : public DirectoryTree {
   using ManifestErrorHandler = std::function<void(const std::string& problems)>;
 
   /// Told of each build that failed, or succeeded but wrote to standard error,
-  /// as @link errors would describe it: a line naming the output, followed by
+  /// as @link status_report would describe it: a line naming the output,
+  /// followed by
   /// what it wrote to standard error, indented - such as
   /// `@/foo.txt failed (exit 2): run cc foo.c` - ending in a newline. A
   /// success is `@/foo.txt built: run cc foo.c` and its standard error. Called
@@ -163,9 +168,8 @@ class BuildDirectoryTree : public DirectoryTree {
   /// opens it, and does the same for every output declared later - by a
   /// changed manifest, or a file a wildcard comes to match - and rebuilds any
   /// whose inputs change, as it would an output that had been opened. A
-  /// `tracing` or `errors` output is left alone, as each is always as fresh as
-  /// opening it makes it. Returns once the builds are started, without waiting
-  /// for them.
+  /// `tracing` or `status` output is left alone, as nobody builds one. Returns
+  /// once the builds are started, without waiting for them.
   ///
   /// These builds are nobody's request, so builds that someone does open
   /// overtake them in the coordinator's line for a permit. Call this only once
@@ -173,14 +177,21 @@ class BuildDirectoryTree : public DirectoryTree {
   /// is up, as their builds may open those outputs at once.
   void materialize_all() const;
 
-  /// What is failing right now, as an `errors` output holds it: why the latest
-  /// change to the manifest was rejected, one `build.makebelieve:LINE: ...`
-  /// problem per line, then each output whose last build failed, in path
-  /// order, as @link BuildReportHandler describes it - except that one which
-  /// failed because an output it read had failed gets the single line
-  /// `@/<output> failed because @/<input> failed`. Empty when nothing is
-  /// failing. Builds nothing.
-  [[nodiscard]] std::string errors() const;
+  /// What makebelieve is doing and what went wrong, as a `status` output
+  /// holds it:
+  /// - why the latest change to the manifest was rejected, one
+  ///   `build.makebelieve:LINE: ...` problem per line;
+  /// - each build under way, as `@/<output> building: <command>`, or
+  ///   `@/<output> waiting to build: <command>` while it waits its turn, with
+  ///   ` (its last build failed)` after one whose last build did;
+  /// - each output whose last build failed and is not building again, as
+  ///   @link BuildReportHandler describes it - except that one which failed
+  ///   because an output it read had failed gets the single line
+  ///   `@/<output> failed because @/<input> failed`.
+  ///
+  /// Each part is in path order. Empty once everything asked for is built and
+  /// nothing is failing. Builds nothing.
+  [[nodiscard]] std::string status_report() const;
 
   /// Returns a sender reading up to @a size bytes at @a offset from @a path's
   /// last published build. Does not build; await @link open first.

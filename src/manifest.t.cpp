@@ -124,14 +124,14 @@ INSTANTIATE_TEST_SUITE_P(
                            "@/b.json = tracing\n",
                   .expected = {{"b.json", Action::Tracing, ""}},
                   .error_lines = {1}},
-        // Nor does `errors`: the output is what is failing right now.
-        ParseCase{.name = "single_errors_rule",
-                  .input = "@/errors.txt = errors\n",
-                  .expected = {{"errors.txt", Action::Errors, ""}}},
-        ParseCase{.name = "rejects_an_errors_rule_with_an_argument",
-                  .input = "@/a.txt = errors everything\n"
-                           "@/b.txt = errors\n",
-                  .expected = {{"b.txt", Action::Errors, ""}},
+        // Nor does `status`: the output is what is building and failing.
+        ParseCase{.name = "single_status_rule",
+                  .input = "@/status.txt = status\n",
+                  .expected = {{"status.txt", Action::Status, ""}}},
+        ParseCase{.name = "rejects_a_status_rule_with_an_argument",
+                  .input = "@/a.txt = status everything\n"
+                           "@/b.txt = status\n",
+                  .expected = {{"b.txt", Action::Status, ""}},
                   .error_lines = {1}},
         // A copy source is a path, not a command line, so the whole of the
         // rest of the line is the path - spaces and all.
@@ -176,7 +176,7 @@ INSTANTIATE_TEST_SUITE_P(
                            "@/output.txt =\n",
                   .expected = {},
                   .error_lines = {1, 2, 3, 4, 5}},
-        // Only `run`, `capture`, `copy`, `tracing` and `errors` name an
+        // Only `run`, `capture`, `copy`, `tracing` and `status` name an
         // action; anything else - a bare command, a word that merely starts
         // with one of them, or a rule invocation - is rejected rather than
         // guessed at.
@@ -185,7 +185,7 @@ INSTANTIATE_TEST_SUITE_P(
                            "@/output.txt = running cp input.txt %out\n"
                            "@/output.txt = copying input.txt\n"
                            "@/output.txt = tracingfile\n"
-                           "@/output.txt = errorsfile\n"
+                           "@/output.txt = statusfile\n"
                            "@/foo.o = !cc foo.cpp\n",
                   .expected = {},
                   .error_lines = {1, 2, 3, 4, 5, 6}},
@@ -253,7 +253,7 @@ INSTANTIATE_TEST_SUITE_P(
                            "@/*.o = run cc @/../gen/*.cpp\n"
                            "@/*.o = copy @/gen/*/a.o\n"
                            "@/*.json = tracing\n"
-                           "@/*.txt = errors\n",
+                           "@/*.txt = status\n",
                   .expected = {},
                   .error_lines = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}},
         // A wildcard bans what its outputs end in - whatever follows the `*` -

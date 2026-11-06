@@ -70,7 +70,7 @@ struct Command {
 
   /// The command to run for `Run` and `Capture`; for `Copy`, the path of the
   /// file to read, relative to the source tree's root; empty for `Tracing`
-  /// and `Errors`.
+  /// and `Status`.
   std::string text;
 
   [[nodiscard]] friend bool operator==(const Command&,

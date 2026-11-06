@@ -1,12 +1,15 @@
 # A manifest whose builds fail on purpose, one way each, to show what the
-# `errors` output reports. Like the basic example, every command uses
+# `status` output reports. Like the basic example, every command uses
 # `cmake -E` or `cmake -P`, so it works under sh or cmd.exe alike.
 
-# What is failing right now - empty once everything builds.
-@/errors.txt = errors
+# What is building and what failed - empty once everything is built.
+@/status.txt = status
 
 # This one builds.
 @/good.txt = capture cmake -E echo "this one builds"
+
+# This one builds too, but takes a while, so is building for a time.
+@/slow.txt = capture cmake -E sleep 20 && cmake -E echo "this one took a while"
 
 # A command that exits nonzero, explaining itself on standard error the way a
 # compiler does.

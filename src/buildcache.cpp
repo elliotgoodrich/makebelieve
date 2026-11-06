@@ -210,8 +210,8 @@ std::string_view to_text(Manifest::Action action) {
       return "copy";
     case Manifest::Action::Tracing:
       return "tracing";
-    case Manifest::Action::Errors:
-      return "errors";
+    case Manifest::Action::Status:
+      return "status";
   }
   return "unknown";
 }
@@ -222,7 +222,7 @@ std::optional<Manifest::Action> action_from_text(std::string_view text) {
            Manifest::Action::Capture,
            Manifest::Action::Copy,
            Manifest::Action::Tracing,
-           Manifest::Action::Errors,
+           Manifest::Action::Status,
        }) {
     if (to_text(action) == text) {
       return action;

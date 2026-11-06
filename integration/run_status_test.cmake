@@ -1,8 +1,8 @@
 # Black-box test of finding out why builds fail without watching the mount:
-# mounts a manifest with an `errors` rule, fails a build in each way an agent
+# mounts a manifest with a `status` rule, fails a build in each way an agent
 # might - a command that exits nonzero, a tool that does not exist, an output
 # reading one that failed, and a broken edit to the manifest - and checks that
-# both `errors.txt` and the mount's own stderr say so,
+# both `status.txt` and the mount's own stderr say so,
 # then that fixing each clears it.
 #
 # Expected -D variables:
@@ -21,7 +21,7 @@ file(REMOVE_RECURSE "${WORK_DIR}")
 file(MAKE_DIRECTORY "${SRC}")
 
 set(RULES
-  "@/errors.txt = errors\n"
+  "@/status.txt = status\n"
   "@/good.txt = capture cmake -E echo good\n"
   "@/downstream.txt = run cmake -E copy @/bad.txt %out\n")
 file(WRITE "${SRC}/build.makebelieve" ${RULES}
@@ -47,7 +47,7 @@ else()
 endif()
 set(MOUNTED FALSE)
 foreach(attempt RANGE 1 200)
-  if(EXISTS "${MNT}/errors.txt")
+  if(EXISTS "${MNT}/status.txt")
     set(MOUNTED TRUE)
     break()
   endif()
@@ -87,25 +87,25 @@ function(expect_contains stage text expected)
   endif()
 endfunction()
 
-# Waits until errors.txt, read afresh, contains `expected` - a change to the
+# Waits until status.txt, read afresh, contains `expected` - a change to the
 # manifest lands in its own time - and fails, naming `stage`, if it never does.
-function(wait_for_errors stage expected)
+function(wait_for_status stage expected)
   foreach(attempt RANGE 1 200)
-    read_output(errors.txt errors)
-    string(FIND "${errors}" "${expected}" at)
+    read_output(status.txt status)
+    string(FIND "${status}" "${expected}" at)
     if(NOT at EQUAL -1)
       return()
     endif()
     execute_process(COMMAND "${CMAKE_COMMAND}" -E sleep 0.05)
   endforeach()
-  set(FAILURES "${FAILURES};${stage}: errors.txt never held '${expected}', last '${errors}'"
+  set(FAILURES "${FAILURES};${stage}: status.txt never held '${expected}', last '${status}'"
       PARENT_SCOPE)
 endfunction()
 
 # Nothing has failed yet.
-read_output(errors.txt errors)
-if(NOT errors_OK OR NOT errors STREQUAL "")
-  list(APPEND FAILURES "at first: errors.txt read '${errors}' (ok: ${errors_OK}), expected it empty")
+read_output(status.txt status)
+if(NOT status_OK OR NOT status STREQUAL "")
+  list(APPEND FAILURES "at first: status.txt read '${status}' (ok: ${status_OK}), expected it empty")
 endif()
 
 # Fail every way but the manifest.
@@ -120,30 +120,30 @@ foreach(output bad.txt downstream.txt missing.txt)
   endif()
 endforeach()
 
-read_output(errors.txt errors)
-expect_contains("after failing" "${errors}"
+read_output(status.txt status)
+expect_contains("after failing" "${status}"
   "@/bad.txt failed (exit 3): capture cmake -E echo broken 1>&2 && exit 3\n    broken\n")
-expect_contains("after failing" "${errors}"
+expect_contains("after failing" "${status}"
   "@/downstream.txt failed because @/bad.txt failed\n")
-expect_contains("after failing" "${errors}"
+expect_contains("after failing" "${status}"
   "@/missing.txt failed (exit ")
-expect_contains("after failing" "${errors}" "makebelieve-no-such-tool")
-string(FIND "${errors}" "good.txt" at)
+expect_contains("after failing" "${status}" "makebelieve-no-such-tool")
+string(FIND "${status}" "good.txt" at)
 if(NOT at EQUAL -1)
-  list(APPEND FAILURES "after failing: errors.txt names good.txt: '${errors}'")
+  list(APPEND FAILURES "after failing: status.txt names good.txt: '${status}'")
 endif()
 
 # A broken edit to the manifest is reported in its own terms.
 file(APPEND "${SRC}/build.makebelieve" "not a rule\n")
-wait_for_errors("broken manifest" "build.makebelieve:6: ")
+wait_for_status("broken manifest" "build.makebelieve:6: ")
 
 # Fixing everything clears it all, once each output builds again.
 file(WRITE "${SRC}/build.makebelieve" ${RULES}
   "@/bad.txt = capture cmake -E echo fixed\n")
 foreach(attempt RANGE 1 200)
-  read_output(errors.txt errors)
-  string(FIND "${errors}" "build.makebelieve:" at)
-  string(FIND "${errors}" "missing.txt" missing_at)
+  read_output(status.txt status)
+  string(FIND "${status}" "build.makebelieve:" at)
+  string(FIND "${status}" "missing.txt" missing_at)
   if(at EQUAL -1 AND missing_at EQUAL -1)
     break()
   endif()
@@ -153,9 +153,9 @@ read_output(downstream.txt downstream)
 if(NOT downstream_OK)
   list(APPEND FAILURES "downstream.txt still fails once bad.txt is fixed")
 endif()
-read_output(errors.txt errors)
-if(NOT errors STREQUAL "")
-  list(APPEND FAILURES "once fixed: errors.txt read '${errors}', expected it empty")
+read_output(status.txt status)
+if(NOT status STREQUAL "")
+  list(APPEND FAILURES "once fixed: status.txt read '${status}', expected it empty")
 endif()
 
 execute_process(COMMAND "${MAKEBELIEVE_EXE}" unmount "${BUILD_DIR}"
@@ -173,6 +173,6 @@ expect_contains("the mount's stderr" "${log}" "    broken")
 if(FAILURES)
   list(REMOVE_ITEM FAILURES "")
   string(JOIN "\n  - " joined ${FAILURES})
-  message(FATAL_ERROR "makebelieve errors test failed:\n  - ${joined}")
+  message(FATAL_ERROR "makebelieve status test failed:\n  - ${joined}")
 endif()
-message(STATUS "makebelieve errors test passed")
+message(STATUS "makebelieve status test passed")

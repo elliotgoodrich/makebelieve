@@ -223,12 +223,12 @@ if(BUILD_TESTING)
   set_tests_properties(makebelieve_resume PROPERTIES TIMEOUT 300)
 
   # Why builds fail, told without watching the mount
-  add_test(NAME makebelieve_errors
+  add_test(NAME makebelieve_status
     COMMAND "${CMAKE_COMMAND}"
       "-DMAKEBELIEVE_EXE=$<TARGET_FILE:makebelieve>"
-      "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/integration/errors-work"
-      -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_errors_test.cmake")
-  set_tests_properties(makebelieve_errors PROPERTIES TIMEOUT 300)
+      "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/integration/status-work"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_status_test.cmake")
+  set_tests_properties(makebelieve_status PROPERTIES TIMEOUT 300)
 
   # Outputs run as programs rather than read
   add_executable(makebelieve_hello integration/executable/hello.m.cpp)

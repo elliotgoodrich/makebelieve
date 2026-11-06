@@ -31,17 +31,18 @@ class Manifest {
     /// `tracing`: the output is a trace of what makebelieve has been doing, in
     /// the Trace Event Format. Takes no argument.
     Tracing,
-    /// `errors`: the output is a report of what is failing right now - each
-    /// output whose last build failed, and why a change to the manifest was
-    /// rejected - empty while nothing is. Takes no argument.
-    Errors,
+    /// `status`: the output is a report of what makebelieve is doing and what
+    /// went wrong - each output building or waiting to, each whose last build
+    /// failed, and why a change to the manifest was rejected - empty once
+    /// everything is built. Takes no argument.
+    Status,
   };
 
   /// Whether @a action is one whose output reports on makebelieve itself -
-  /// `Tracing` or `Errors` - rather than being built: it takes no argument,
-  /// cannot be a wildcard, and is served fresh on every open.
+  /// `Tracing` or `Status` - rather than being built: it takes no argument,
+  /// cannot be a wildcard, and is served by the tree itself.
   [[nodiscard]] static constexpr bool is_report(Action action) {
-    return action == Action::Tracing || action == Action::Errors;
+    return action == Action::Tracing || action == Action::Status;
   }
 
   /// A single `@/output = <action> <argument>` rule: the output path with its
@@ -56,7 +57,7 @@ class Manifest {
     /// The command to run for `Run` and `Capture`, taken verbatim; for `Copy`,
     /// the normalised path of the file to copy, relative to the manifest's
     /// directory, or `@/` and the output to copy; empty for `Tracing` and
-    /// `Errors`.
+    /// `Status`.
     std::string command;
 
     /// For a wildcard rule, the normalised pattern its sources match, with a
@@ -80,7 +81,7 @@ class Manifest {
   /// Parses @a text into a `Manifest`. Blank lines and `#` comments are
   /// skipped. Every other line must be a simple `@/output = run <command>`,
   /// `@/output = capture <command>`, `@/output = copy <path>`,
-  /// `@/output = tracing` or `@/output = errors` rule - the
+  /// `@/output = tracing` or `@/output = status` rule - the
   /// richer manifest features (variables, `rule` declarations,
   /// placeholders) are not handled yet - naming a file inside the output
   /// directory that no earlier rule declared, either as that file or as one of

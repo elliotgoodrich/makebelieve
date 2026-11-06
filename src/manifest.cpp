@@ -57,8 +57,8 @@ std::optional<Manifest::Action> to_action(std::string_view word) {
   if (word == "tracing") {
     return Manifest::Action::Tracing;
   }
-  if (word == "errors") {
-    return Manifest::Action::Errors;
+  if (word == "status") {
+    return Manifest::Action::Status;
   }
   return std::nullopt;
 }
@@ -246,7 +246,7 @@ Manifest Manifest::parse(std::string_view text) {
       reject(
           std::format("`{}` must be assigned `run <command>`, "
                       "`capture <command>`, `copy <path>`, `tracing` or "
-                      "`errors`",
+                      "`status`",
                       left));
       continue;
     }
