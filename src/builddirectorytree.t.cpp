@@ -2,6 +2,10 @@
 #include "builddirectorytree.hpp"
 
 #include "buildcache.hpp"
+#include "buildcoordinator.hpp"
+#include "buildpermits.hpp"
+#include "buildprocesstracker.hpp"
+#include "buildqueue.hpp"
 #include "directorytreeutil.hpp"
 #include "filesystemutil.hpp"
 #include "inmemorydirectorytree.hpp"
@@ -23,7 +27,9 @@
 #include <deque>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <future>
 #include <ios>
 #include <map>
 #include <memory>
@@ -1511,6 +1517,806 @@ TEST_F(BuildDirectoryTreeTest, AFailureWhoseInputChangedMidBuildIsRetried) {
   EXPECT_EQ(output_size(tree, "output.txt"), std::string("fixed").size());
 }
 
+// A runner whose builds of the outputs in @a failures fail as given there, and
+// whose others build "built", counting them all in @a runs.
+CommandRunner failing(
+    int& runs,
+    const std::map<std::filesystem::path, BuildResult>& failures) {
+  return [&runs, &failures](const Command& command) {
+    ++runs;
+    const auto failure = failures.find(command.output);
+    return finished(failure != failures.end() ? failure->second
+                                              : built("built"));
+  };
+}
+
+// Nothing has failed, so there is nothing to report - and reading the report
+// builds nothing.
+TEST_F(BuildDirectoryTreeTest, AStatusOutputIsEmptyWhileNothingIsToDo) {
+  write_manifest(
+      "@/status.txt = status\n"
+      "@/output.txt = run build %out\n");
+
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
+
+  // Current from the start, rather than the placeholder of an unbuilt output.
+  EXPECT_EQ(output_size(tree, "status.txt"), 0U);
+  EXPECT_EQ(read_output(tree, "status.txt"), "");
+  EXPECT_EQ(runs, 0);
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+  EXPECT_EQ(read_output(tree, "status.txt"), "");
+  EXPECT_EQ(tree.status_report(), "");
+}
+
+// A failed build is reported with what it ran, its exit status and what it
+// wrote to standard error, until it next builds.
+TEST_F(BuildDirectoryTreeTest, AStatusOutputReportsAFailureUntilItBuilds) {
+  write_manifest(
+      "@/status.txt = status\n"
+      "@/bad.txt = run build %out\n");
+
+  int runs = 0;
+  std::map<std::filesystem::path, BuildResult> failures;
+  failures.emplace("bad.txt",
+                   std::unexpected(BuildFailure(exit_status_error(2), {},
+                                                "oops\r\n\nagain\n\n\r\n")));
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  // A blank line within what it wrote is kept, but not those at the end.
+  const std::string report =
+      "@/bad.txt failed (exit 2): run build %out\n"
+      "    oops\n"
+      "\n"
+      "    again\n";
+  EXPECT_EQ(read_output(tree, "status.txt"), report);
+  EXPECT_EQ(tree.status_report(), report);
+  EXPECT_EQ(runs, 1);
+
+  failures.clear();
+  EXPECT_EQ(read_output(tree, "bad.txt"), "built");
+  EXPECT_EQ(read_output(tree, "status.txt"), "");
+}
+
+// An error that is no exit status is reported as itself.
+TEST_F(BuildDirectoryTreeTest, AStatusOutputReportsAnyError) {
+  write_manifest("@/bad.txt = copy missing.txt\n");
+
+  int runs = 0;
+  const std::error_code error =
+      std::make_error_code(std::errc::no_such_file_or_directory);
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"bad.txt", std::unexpected(error)}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  EXPECT_EQ(tree.status_report(), std::format("@/bad.txt failed ({}): copy "
+                                              "missing.txt\n",
+                                              error.message()));
+}
+
+// An output that failed only because one it read had failed says so in a
+// line, rather than repeating that output's failure.
+TEST_F(BuildDirectoryTreeTest, AnOutputThatReadAFailureIsReportedInALine) {
+  write_manifest(
+      "@/copy.txt = copy @/original.txt\n"
+      "@/original.txt = run build %out\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"original.txt",
+       std::unexpected(BuildFailure(exit_status_error(3), {}, "broken\n"))}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "copy.txt").has_value());
+  EXPECT_EQ(tree.status_report(),
+            "@/copy.txt failed because @/original.txt failed\n"
+            "@/original.txt failed (exit 3): run build %out\n"
+            "    broken\n");
+}
+
+// A rule that is gone takes its failure with it.
+TEST_F(BuildDirectoryTreeTest, RemovingARuleDropsItsFailure) {
+  write_manifest(
+      "@/bad.txt = run build %out\n"
+      "@/also-bad.txt = run build %out\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"bad.txt", std::unexpected(exit_status_error(1))},
+      {"also-bad.txt", std::unexpected(exit_status_error(1))}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "also-bad.txt").has_value());
+
+  write_manifest("@/also-bad.txt = run build %out\n");
+  EXPECT_EQ(tree.status_report(),
+            "@/also-bad.txt failed (exit 1): run build %out\n");
+}
+
+// Why a change to the manifest was rejected is reported, in the manifest's
+// own terms, until a change is accepted.
+TEST_F(BuildDirectoryTreeTest, AStatusOutputReportsARejectedManifest) {
+  write_manifest("@/status.txt = status\n");
+
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}),
+                                [](const std::string&) {});
+
+  write_manifest("@/status.txt = status\n@/b.txt run b %out\n");
+  const std::string report = read_output(tree, "status.txt");
+  EXPECT_TRUE(report.starts_with("build.makebelieve:2: ")) << report;
+  EXPECT_TRUE(report.ends_with("\n")) << report;
+  EXPECT_EQ(std::ranges::count(report, '\n'), 1);
+
+  write_manifest("@/status.txt = status\n@/b.txt = run b %out\n");
+  EXPECT_EQ(read_output(tree, "status.txt"), "");
+}
+
+// Each build that fails is told to the build failure handler as it finishes,
+// in the same terms; one that builds is not.
+TEST_F(BuildDirectoryTreeTest, TellsTheBuildFailureHandlerOfEachFailure) {
+  write_manifest(
+      "@/bad.txt = run build %out\n"
+      "@/warned.txt = capture build\n"
+      "@/quiet.txt = capture build\n");
+
+  int runs = 0;
+  std::map<std::filesystem::path, BuildResult> failures = {
+      {"bad.txt",
+       std::unexpected(BuildFailure(exit_status_error(2), {}, "no\n"))},
+      {"warned.txt", BuildOutput{.bytes = "ok", .inputs = {}}}};
+  std::vector<std::string> reports;
+  const BuildDirectoryTree tree(
+      source, failing(runs, failures), {}, nullptr,
+      [&reports](const std::string& report) { reports.push_back(report); });
+
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  EXPECT_EQ(read_output(tree, "warned.txt"), "ok");
+  EXPECT_EQ(read_output(tree, "quiet.txt"), "built");
+  EXPECT_EQ(reports,
+            (std::vector<std::string>{
+                "@/bad.txt failed (exit 2): run build %out\n    no\n"}));
+  EXPECT_EQ(tree.status_report(),
+            "@/bad.txt failed (exit 2): run build %out\n    no\n");
+}
+
+// Whether @a holds comes to be true within a generous timeout, checking often.
+template <class Predicate>
+bool eventually(const Predicate& holds) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!holds()) {
+    if (std::chrono::steady_clock::now() > deadline) {
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+
+// A build under way is reported as building, then leaves the report once it
+// has built.
+TEST_F(BuildDirectoryTreeTest, AStatusOutputShowsABuildUnderWay) {
+  write_manifest(
+      "@/status.txt = status\n"
+      "@/slow.txt = run build %out\n");
+
+  const DeferredRunner builds;
+  const BuildDirectoryTree tree(source, builds.runner());
+  std::thread reader([&tree] {
+    EXPECT_TRUE(DirectoryTreeUtil::open(tree, "slow.txt").has_value());
+  });
+  ASSERT_TRUE(builds.wait_for_runs(1));
+  EXPECT_EQ(read_output(tree, "status.txt"),
+            "@/slow.txt building: run build %out\n");
+
+  builds.complete(built("built"));
+  reader.join();
+  EXPECT_EQ(read_output(tree, "status.txt"), "");
+}
+
+// A build waiting its turn for a permit says so, as does one retrying an
+// output whose last build failed.
+TEST_F(BuildDirectoryTreeTest, AStatusOutputShowsABuildWaitingItsTurn) {
+  write_manifest(
+      "@/a.txt = run build a %out\n"
+      "@/b.txt = run build b %out\n");
+
+  exec::static_thread_pool pool(1);
+  BuildQueue queue(1, pool.get_scheduler());
+  BuildCoordinator coordinator(permits_from(queue), BuildProcessTracker::none(),
+                               pool.get_scheduler());
+  const DeferredRunner builds;
+  const BuildDirectoryTree tree(source, builds.runner(), coordinator);
+  tree.materialize_all();
+  ASSERT_TRUE(builds.wait_for_runs(1));
+  EXPECT_EQ(tree.status_report(),
+            "@/a.txt building: run build a %out\n"
+            "@/b.txt waiting to build: run build b %out\n");
+
+  // Its permit given back, the other runs.
+  builds.complete(std::unexpected(exit_status_error(1)));
+  ASSERT_TRUE(builds.wait_for_runs(2));
+  EXPECT_EQ(tree.status_report(),
+            "@/b.txt building: run build b %out\n"
+            "@/a.txt failed (exit 1): run build a %out\n");
+
+  // Retried, the failure shows as the build under way.
+  std::thread reader([&tree] {
+    EXPECT_FALSE(DirectoryTreeUtil::open(tree, "a.txt").has_value());
+  });
+  ASSERT_TRUE(eventually([&tree] {
+    return tree.status_report().contains("@/a.txt waiting to build");
+  }));
+  EXPECT_EQ(tree.status_report(),
+            "@/a.txt waiting to build: run build a %out (its last build "
+            "failed)\n"
+            "@/b.txt building: run build b %out\n");
+  builds.complete(built("b"));
+  ASSERT_TRUE(builds.wait_for_runs(3));
+  builds.complete(std::unexpected(exit_status_error(1)));
+  reader.join();
+  EXPECT_EQ(tree.status_report(),
+            "@/a.txt failed (exit 1): run build a %out\n");
+}
+
+// Whatever watches the report hears that it changed once after each read of
+// it, however much changes before the next: the first change is announced, and
+// nothing more until it is read again - which is no announcement either.
+TEST_F(BuildDirectoryTreeTest, AStatusOutputIsAnnouncedOnceAfterEachRead) {
+  write_manifest(
+      "@/status.txt = status\n"
+      "@/bad.txt = run build %out\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"bad.txt", std::unexpected(exit_status_error(1))}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+  std::vector<std::filesystem::path> changed;
+  const Subscription subscription =
+      tree.subscribe_to_changes([&changed](const DirectoryTreeDiff& diff) {
+        changed.insert(changed.end(), diff.entries_changed.begin(),
+                       diff.entries_changed.end());
+      });
+
+  read_output(tree, "status.txt");
+  read_output(tree, "status.txt");
+  EXPECT_TRUE(changed.empty());
+
+  // Waiting, running and failing are three changes, announced once.
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  EXPECT_EQ(changed, std::vector<std::filesystem::path>{"status.txt"});
+
+  // Until it is read, nothing more is.
+  changed.clear();
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  EXPECT_TRUE(changed.empty());
+
+  // Reading it shows what it shows now, and rearms the announcement.
+  EXPECT_EQ(read_output(tree, "status.txt"),
+            "@/bad.txt failed (exit 1): run build %out\n");
+  EXPECT_TRUE(changed.empty());
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  EXPECT_EQ(changed, std::vector<std::filesystem::path>{"status.txt"});
+  EXPECT_EQ(runs, 3);
+}
+
+// Something that changes nothing the report shows - reading a trace, say -
+// does not use up the one announcement a change after a read gets.
+TEST_F(BuildDirectoryTreeTracingTest,
+       AStatusOutputIsAnnouncedAfterATraceIsRead) {
+  write_manifest(
+      "@/status.txt = status\n"
+      "@/trace.json = tracing\n"
+      "@/bad.txt = run build %out\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"bad.txt", std::unexpected(exit_status_error(1))}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+  std::vector<std::filesystem::path> changed;
+  const Subscription subscription =
+      tree.subscribe_to_changes([&changed](const DirectoryTreeDiff& diff) {
+        changed.insert(changed.end(), diff.entries_changed.begin(),
+                       diff.entries_changed.end());
+      });
+
+  read_output(tree, "status.txt");
+  read_output(tree, "trace.json");
+  EXPECT_TRUE(changed.empty());
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  EXPECT_EQ(changed, std::vector<std::filesystem::path>{"status.txt"});
+}
+
+// A rule changed to `status` holds the report from then on, building nothing,
+// and one changed back is built again.
+TEST_F(BuildDirectoryTreeTest, ARuleChangedToOrFromStatusFollowsIt) {
+  write_manifest("@/out.txt = run build %out\n");
+
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
+  EXPECT_EQ(read_output(tree, "out.txt"), "build 1");
+
+  write_manifest("@/out.txt = status\n");
+  EXPECT_EQ(read_output(tree, "out.txt"), "");
+  EXPECT_EQ(runs, 1);
+
+  write_manifest("@/out.txt = run build %out\n");
+  EXPECT_EQ(read_output(tree, "out.txt"), "build 2");
+  EXPECT_EQ(runs, 2);
+}
+
+// A failure of what an output used to run says nothing of what it runs now,
+// so it goes when the command changes, and the output - watched, as it was
+// opened - rebuilds with its new command.
+TEST_F(BuildDirectoryTreeTest, AChangedCommandDropsItsOldFailure) {
+  write_manifest("@/bad.txt = run build %out\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"bad.txt", std::unexpected(exit_status_error(1))}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  EXPECT_EQ(tree.status_report(),
+            "@/bad.txt failed (exit 1): run build %out\n");
+
+  write_manifest("@/bad.txt = run rebuild %out\n");
+  EXPECT_EQ(runs, 2);
+  EXPECT_EQ(tree.status_report(),
+            "@/bad.txt failed (exit 1): run rebuild %out\n");
+}
+
+// An output blamed on one it read that failed is reported in full once that
+// one builds, since the blame no longer explains it.
+TEST_F(BuildDirectoryTreeTest, AnInputThatBuildsTakesNoMoreBlame) {
+  write_manifest(
+      "@/copy.txt = copy @/original.txt\n"
+      "@/original.txt = run build %out\n");
+
+  int runs = 0;
+  std::map<std::filesystem::path, BuildResult> failures = {
+      {"original.txt", std::unexpected(exit_status_error(3))}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "copy.txt").has_value());
+  EXPECT_EQ(tree.status_report(),
+            "@/copy.txt failed because @/original.txt failed\n"
+            "@/original.txt failed (exit 3): run build %out\n");
+
+  failures.clear();
+  EXPECT_EQ(read_output(tree, "original.txt"), "built");
+  EXPECT_EQ(tree.status_report(),
+            "@/copy.txt failed (exit 3): copy @/original.txt\n");
+}
+
+// A build of a command that was changed while it ran says nothing of the
+// command now: its failure is not kept, and the output - watched, as it was
+// opened - builds with its new command, which has never failed.
+TEST_F(BuildDirectoryTreeTest, AFailureOfACommandSinceChangedIsNotKept) {
+  write_manifest("@/out.txt = run old %out\n");
+
+  const DeferredRunner builds;
+  std::vector<std::string> failures;
+  const BuildDirectoryTree tree(
+      source, builds.runner(), {}, nullptr,
+      [&failures](const std::string& failure) { failures.push_back(failure); });
+  std::thread reader([&tree] {
+    EXPECT_FALSE(DirectoryTreeUtil::open(tree, "out.txt").has_value());
+  });
+  ASSERT_TRUE(builds.wait_for_runs(1));
+  write_manifest("@/out.txt = run new %out\n");
+  builds.complete(std::unexpected(
+      BuildFailure(exit_status_error(1), {}, "the old one broke\n")));
+  reader.join();
+
+  ASSERT_TRUE(builds.wait_for_runs(2));
+  EXPECT_EQ(tree.status_report(), "@/out.txt building: run new %out\n");
+  // What happened is still told, as it happened.
+  EXPECT_EQ(failures,
+            std::vector<std::string>{"@/out.txt failed (exit 1): run old %out\n"
+                                     "    the old one broke\n"});
+  builds.complete(built("new"));
+  EXPECT_EQ(tree.status_report(), "");
+}
+
+// A rule changed from `status` to a command is built at once under
+// `--build=all`, as a new rule would be.
+TEST_F(BuildDirectoryTreeTest, ARuleChangedFromStatusIsBuiltWhenAllAre) {
+  write_manifest("@/out.txt = status\n");
+
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
+  tree.materialize_all();
+  EXPECT_EQ(runs, 0);
+
+  write_manifest("@/out.txt = run build %out\n");
+  EXPECT_EQ(runs, 1);
+  EXPECT_EQ(output_size(tree, "out.txt"), std::string("build 1").size());
+}
+
+// A rule changed to `status` while its build runs stops showing as building
+// at once, and that build ending - however it ends - changes nothing.
+TEST_F(BuildDirectoryTreeTest, ARuleChangedToStatusMidBuildLeavesTheReport) {
+  write_manifest(
+      "@/status.txt = status\n"
+      "@/out.txt = run build %out\n");
+
+  const DeferredRunner builds;
+  const BuildDirectoryTree tree(source, builds.runner());
+  std::thread reader([&tree] {
+    EXPECT_FALSE(DirectoryTreeUtil::open(tree, "out.txt").has_value());
+  });
+  ASSERT_TRUE(builds.wait_for_runs(1));
+  EXPECT_EQ(read_output(tree, "status.txt"),
+            "@/out.txt building: run build %out\n");
+
+  write_manifest(
+      "@/status.txt = status\n"
+      "@/out.txt = status\n");
+  EXPECT_EQ(read_output(tree, "status.txt"), "");
+  builds.complete(std::unexpected(exit_status_error(1)));
+  reader.join();
+  EXPECT_EQ(read_output(tree, "status.txt"), "");
+  EXPECT_EQ(read_output(tree, "out.txt"), "");
+  EXPECT_EQ(builds.runs(), 1);
+}
+
+// A build waiting its turn whose rule goes leaves the report with it.
+TEST_F(BuildDirectoryTreeTest, AStatusOutputForgetsAWaitingBuildWhoseRuleWent) {
+  write_manifest(
+      "@/a.txt = run build a %out\n"
+      "@/b.txt = run build b %out\n");
+
+  exec::static_thread_pool pool(1);
+  BuildQueue queue(1, pool.get_scheduler());
+  BuildCoordinator coordinator(permits_from(queue), BuildProcessTracker::none(),
+                               pool.get_scheduler());
+  const DeferredRunner builds;
+  const BuildDirectoryTree tree(source, builds.runner(), coordinator);
+  tree.materialize_all();
+  ASSERT_TRUE(builds.wait_for_runs(1));
+  EXPECT_EQ(tree.status_report(),
+            "@/a.txt building: run build a %out\n"
+            "@/b.txt waiting to build: run build b %out\n");
+
+  write_manifest("@/a.txt = run build a %out\n");
+  EXPECT_EQ(tree.status_report(), "@/a.txt building: run build a %out\n");
+  builds.complete(built("a"));
+  EXPECT_EQ(tree.status_report(), "");
+}
+
+// A subscriber told that the report changed may read it at once, from within
+// its callback, without waiting on the tree for good - and, having read it,
+// hears of the next change, so one that reads only when told sees each change
+// through to the last.
+TEST_F(BuildDirectoryTreeTest, AStatusOutputCanBeReadWhenItIsAnnounced) {
+  write_manifest(
+      "@/status.txt = status\n"
+      "@/bad.txt = run build %out\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"bad.txt", std::unexpected(exit_status_error(1))}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+  std::vector<std::string> seen;
+  const Subscription subscription =
+      tree.subscribe_to_changes([&](const DirectoryTreeDiff& diff) {
+        if (std::ranges::contains(diff.entries_changed,
+                                  std::filesystem::path("status.txt"))) {
+          seen.push_back(read_output(tree, "status.txt"));
+        }
+      });
+
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+  EXPECT_EQ(seen, (std::vector<std::string>{
+                      "@/bad.txt waiting to build: run build %out\n",
+                      "@/bad.txt building: run build %out\n",
+                      "@/bad.txt failed (exit 1): run build %out\n"}));
+}
+
+// A change that comes while another is being announced - a second build
+// failing as the first's failure is being read - is announced in turn once
+// the reader has read the first, so it is not left behind.
+TEST_F(BuildDirectoryTreeTest, AStatusChangeDuringAnAnnouncementIsAnnounced) {
+  write_manifest(
+      "@/status.txt = status\n"
+      "@/a.txt = run build a %out\n"
+      "@/b.txt = run build b %out\n");
+
+  exec::static_thread_pool pool(4);
+  BuildCoordinator coordinator(unlimited_permits(), BuildProcessTracker::none(),
+                               pool.get_scheduler());
+  const DeferredRunner builds;
+  const BuildDirectoryTree tree(source, builds.runner(), coordinator);
+  std::thread a([&tree] {
+    EXPECT_FALSE(DirectoryTreeUtil::open(tree, "a.txt").has_value());
+  });
+  ASSERT_TRUE(builds.wait_for_runs(1));
+  std::thread b([&tree] {
+    EXPECT_FALSE(DirectoryTreeUtil::open(tree, "b.txt").has_value());
+  });
+  ASSERT_TRUE(builds.wait_for_runs(2));
+  read_output(tree, "status.txt");
+
+  std::mutex mutex;
+  std::vector<std::string> seen;
+  bool held = false;
+  const Subscription subscription =
+      tree.subscribe_to_changes([&](const DirectoryTreeDiff& diff) {
+        if (!std::ranges::contains(diff.entries_changed,
+                                   std::filesystem::path("status.txt"))) {
+          return;
+        }
+        // The first time a's failure is announced, b fails before the
+        // announcement is read.
+        if (!std::exchange(held, true)) {
+          builds.complete(std::unexpected(exit_status_error(2)));
+          EXPECT_TRUE(eventually([&tree] {
+            return tree.status_report().contains("@/b.txt failed");
+          }));
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        std::string report = read_output(tree, "status.txt");
+        const std::lock_guard lock(mutex);
+        seen.push_back(std::move(report));
+      });
+
+  builds.complete(std::unexpected(exit_status_error(1)));
+  a.join();
+  b.join();
+  const std::string report =
+      "@/a.txt failed (exit 1): run build a %out\n"
+      "@/b.txt failed (exit 2): run build b %out\n";
+  ASSERT_TRUE(eventually([&] {
+    const std::lock_guard lock(mutex);
+    return !seen.empty() && seen.back() == report;
+  }));
+  EXPECT_EQ(read_output(tree, "status.txt"), report);
+}
+
+// A subscriber to one tree reading another tree's `status` output from its
+// callback reads it as any other reader would, bringing it up to date.
+TEST_F(BuildDirectoryTreeTest,
+       AStatusOutputReadFromAnotherTreesCallbackIsFresh) {
+  InMemoryDirectoryTree other_source;
+  other_source.write_file("build.makebelieve",
+                          "@/status.txt = status\n"
+                          "@/x.txt = run build x %out\n"
+                          "@/y.txt = run build y %out\n");
+  write_manifest(
+      "@/status.txt = status\n"
+      "@/a.txt = run build a %out\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"a.txt", std::unexpected(exit_status_error(1))},
+      {"x.txt", std::unexpected(exit_status_error(1))},
+      {"y.txt", std::unexpected(exit_status_error(1))}};
+  const BuildDirectoryTree other(other_source, failing(runs, failures));
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+
+  // x's failure is announced; y's, unread since, is not yet written.
+  read_output(other, "status.txt");
+  EXPECT_FALSE(DirectoryTreeUtil::open(other, "x.txt").has_value());
+  EXPECT_FALSE(DirectoryTreeUtil::open(other, "y.txt").has_value());
+
+  std::vector<std::string> seen;
+  const Subscription subscription =
+      tree.subscribe_to_changes([&](const DirectoryTreeDiff& diff) {
+        if (std::ranges::contains(diff.entries_changed,
+                                  std::filesystem::path("status.txt"))) {
+          seen.push_back(read_output(other, "status.txt"));
+        }
+      });
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "a.txt").has_value());
+
+  const std::string report =
+      "@/x.txt failed (exit 1): run build x %out\n"
+      "@/y.txt failed (exit 1): run build y %out\n";
+  ASSERT_FALSE(seen.empty());
+  EXPECT_EQ(seen.back(), report);
+  EXPECT_EQ(read_output(other, "status.txt"), report);
+}
+
+// Two trees whose subscribers each read the other's `status` output as they
+// are told of a change to their own wait on neither, even when both are told
+// at once.
+TEST_F(BuildDirectoryTreeTest, TreesReadingEachOthersStatusDoNotDeadlock) {
+  InMemoryDirectoryTree other_source;
+  other_source.write_file("build.makebelieve",
+                          "@/status.txt = status\n"
+                          "@/x.txt = run build x %out\n");
+  write_manifest(
+      "@/status.txt = status\n"
+      "@/a.txt = run build a %out\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"a.txt", std::unexpected(exit_status_error(1))},
+      {"x.txt", std::unexpected(exit_status_error(1))}};
+  std::mutex runs_mutex;
+  const auto runner = [&](const Command& command) {
+    {
+      const std::lock_guard lock(runs_mutex);
+      ++runs;
+    }
+    return finished(failures.at(command.output));
+  };
+  const BuildDirectoryTree tree(source, runner);
+  const BuildDirectoryTree other(other_source, runner);
+
+  // Each subscriber, told of its tree's first change, waits until the other is
+  // told of its own too - holding whatever it holds - and only then reads the
+  // other tree's `status` output.
+  std::mutex mutex;
+  std::condition_variable told;
+  int arrived = 0;
+  const auto meet_then_read = [&](const BuildDirectoryTree& them) {
+    {
+      std::unique_lock lock(mutex);
+      ++arrived;
+      told.notify_all();
+      told.wait_for(lock, std::chrono::seconds(10),
+                    [&] { return arrived >= 2; });
+    }
+    read_output(them, "status.txt");
+  };
+  bool tree_told = false;
+  bool other_told = false;
+  const Subscription a_subscription =
+      tree.subscribe_to_changes([&](const DirectoryTreeDiff& diff) {
+        if (std::ranges::contains(diff.entries_changed,
+                                  std::filesystem::path("status.txt")) &&
+            !std::exchange(tree_told, true)) {
+          meet_then_read(other);
+        }
+      });
+  const Subscription x_subscription =
+      other.subscribe_to_changes([&](const DirectoryTreeDiff& diff) {
+        if (std::ranges::contains(diff.entries_changed,
+                                  std::filesystem::path("status.txt")) &&
+            !std::exchange(other_told, true)) {
+          meet_then_read(tree);
+        }
+      });
+
+  auto a = std::async(std::launch::async, [&] {
+    return DirectoryTreeUtil::open(tree, "a.txt").has_value();
+  });
+  auto x = std::async(std::launch::async, [&] {
+    return DirectoryTreeUtil::open(other, "x.txt").has_value();
+  });
+  ASSERT_EQ(a.wait_for(std::chrono::seconds(30)), std::future_status::ready);
+  ASSERT_EQ(x.wait_for(std::chrono::seconds(30)), std::future_status::ready);
+  EXPECT_FALSE(a.get());
+  EXPECT_FALSE(x.get());
+  EXPECT_EQ(read_output(tree, "status.txt"),
+            "@/a.txt failed (exit 1): run build a %out\n");
+  EXPECT_EQ(read_output(other, "status.txt"),
+            "@/x.txt failed (exit 1): run build x %out\n");
+}
+
+// A build that counts a change to the status just as the last `status` rule
+// goes - before writing it - finds nothing left to bring up to date, and
+// finishes.
+TEST_F(BuildDirectoryTreeTest, RemovingTheLastStatusRuleMidAnnouncementIsFine) {
+  write_manifest(
+      "@/status.txt = status\n"
+      "@/bad.txt = run build %out\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"bad.txt", std::unexpected(exit_status_error(1))}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+  BuildDirectoryTreeTestUtil::before_next_status_write(
+      [this] { write_manifest("@/bad.txt = run build %out\n"); });
+
+  auto opened = std::async(std::launch::async, [&tree] {
+    return DirectoryTreeUtil::open(tree, "bad.txt").has_value();
+  });
+  ASSERT_EQ(opened.wait_for(std::chrono::seconds(10)),
+            std::future_status::ready);
+  EXPECT_FALSE(opened.get());
+  EXPECT_FALSE(tree.status("status.txt").has_value());
+}
+
+// An output that read one whose rule becomes `status` read something else
+// now, so is rebuilt, reading the report.
+TEST_F(BuildDirectoryTreeTest, AReaderOfARuleChangedToStatusIsRebuilt) {
+  write_manifest(
+      "@/a.txt = capture build\n"
+      "@/b.txt = copy @/a.txt\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures;
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+  EXPECT_EQ(read_output(tree, "b.txt"), "built");
+
+  // Its rebuild copies the report as it is then, which shows that rebuild.
+  write_manifest(
+      "@/a.txt = status\n"
+      "@/b.txt = copy @/a.txt\n");
+  EXPECT_EQ(read_output(tree, "b.txt"), "@/b.txt building: copy @/a.txt\n");
+}
+
+// A command that read a failed output may have dealt with that and failed for
+// a reason of its own, so its own error is kept, with the output it read named
+// beside it - unlike a copy of a failed output, whose only reason that is.
+TEST_F(BuildDirectoryTreeTest, AFailureThatReadAFailedOutputKeepsItsOwnError) {
+  write_manifest(
+      "@/a.txt = run build a %out\n"
+      "@/b.txt = run build b %out\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"a.txt", std::unexpected(exit_status_error(1))},
+      {"b.txt",
+       std::unexpected(BuildFailure(exit_status_error(2),
+                                    {std::filesystem::path("@") / "a.txt"},
+                                    "b broke on its own\n"))}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "a.txt").has_value());
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "b.txt").has_value());
+  EXPECT_EQ(tree.status_report(),
+            "@/a.txt failed (exit 1): run build a %out\n"
+            "@/b.txt failed (exit 2; it read @/a.txt, which failed): run build "
+            "b %out\n"
+            "    b broke on its own\n");
+}
+
+// A build under way is reported with the command it runs, not one its rule
+// was changed to meanwhile - until that one starts.
+TEST_F(BuildDirectoryTreeTest, AStatusOutputShowsTheCommandThatIsRunning) {
+  write_manifest("@/out.txt = run old %out\n");
+
+  const DeferredRunner builds;
+  const BuildDirectoryTree tree(source, builds.runner());
+  std::thread reader([&tree] {
+    EXPECT_TRUE(DirectoryTreeUtil::open(tree, "out.txt").has_value());
+  });
+  ASSERT_TRUE(builds.wait_for_runs(1));
+  write_manifest("@/out.txt = run new %out\n");
+  EXPECT_EQ(tree.status_report(), "@/out.txt building: run old %out\n");
+
+  builds.complete(built("old"));
+  reader.join();
+  ASSERT_TRUE(builds.wait_for_runs(2));
+  EXPECT_EQ(tree.status_report(), "@/out.txt building: run new %out\n");
+  builds.complete(built("new"));
+  EXPECT_EQ(tree.status_report(), "");
+}
+
+// A `status` output added by an edit holds the report at once - before
+// anything opens it - rather than an unbuilt output's placeholder.
+TEST_F(BuildDirectoryTreeTest, AStatusOutputAddedLaterHoldsTheReportAtOnce) {
+  write_manifest("@/bad.txt = run build %out\n");
+
+  int runs = 0;
+  const std::map<std::filesystem::path, BuildResult> failures = {
+      {"bad.txt", std::unexpected(exit_status_error(1))}};
+  const BuildDirectoryTree tree(source, failing(runs, failures));
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "bad.txt").has_value());
+
+  write_manifest(
+      "@/bad.txt = run build %out\n"
+      "@/status.txt = status\n");
+  const std::string report = "@/bad.txt failed (exit 1): run build %out\n";
+  EXPECT_EQ(output_size(tree, "status.txt"), report.size());
+  EXPECT_EQ(DirectoryTreeUtil::read(tree, "status.txt", 0, 1024), report);
+}
+
+// Nor does building every output build the report, which nobody builds.
+TEST_F(BuildDirectoryTreeTest, MaterializingAllLeavesAStatusOutputAlone) {
+  write_manifest("@/status.txt = status\n");
+
+  int runs = 0;
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
+  tree.materialize_all();
+  EXPECT_EQ(output_size(tree, "status.txt"), 0U);
+  EXPECT_EQ(runs, 0);
+}
+
 // Builds share a pool of rows in the trace: one row each while they overlap,
 // and a row goes back in the pool for the next build once its own span is
 // closed.
@@ -2009,6 +2815,13 @@ TEST_F(BuildDirectoryTreeCacheTest, ATraceIsNeverKept) {
   write_manifest("@/trace.json = tracing\n");
   const BuildDirectoryTree tree(source, returning("unused"), {}, &*cache);
   read_output(tree, "trace.json");
+  EXPECT_TRUE(recorded().empty());
+}
+
+TEST_F(BuildDirectoryTreeCacheTest, AStatusOutputIsNeverKept) {
+  write_manifest("@/status.txt = status\n");
+  const BuildDirectoryTree tree(source, returning("unused"), {}, &*cache);
+  read_output(tree, "status.txt");
   EXPECT_TRUE(recorded().empty());
 }
 

@@ -11,11 +11,9 @@
 #include <stdexec/execution.hpp>
 
 #include <cstddef>
-#include <cstdio>
 #include <expected>
 #include <filesystem>
 #include <optional>
-#include <print>
 #include <random>
 #include <string>
 #include <string_view>
@@ -241,11 +239,16 @@ std::vector<std::filesystem::path> relativize(
   return result;
 }
 
-// Explains on standard error why building @a output failed, as `@/<output>:
-// <reason>`, so the reader that sees only an I/O error can find out.
-void report(const std::filesystem::path& output, std::string_view reason) {
-  std::println(stderr, "makebelieve: @/{}: {}", output.generic_string(),
-               reason);
+// @a diagnostics - what a command wrote, if anything - followed by @a reason on
+// a line of its own: the standard error of a build that failed for a reason
+// the command itself did not give, so whoever reads the failure finds out.
+std::string with_reason(std::string diagnostics, std::string_view reason) {
+  if (!diagnostics.empty() && !diagnostics.ends_with('\n')) {
+    diagnostics += '\n';
+  }
+  diagnostics += reason;
+  diagnostics += '\n';
+  return diagnostics;
 }
 
 }  // namespace
@@ -284,10 +287,10 @@ exec::task<BuildResult> detail::run_shell_command(
     // still its input, so creating or fixing it retries the copy: a tracer
     // records only the files that opened, so nothing else would.
     if (!bytes.has_value()) {
-      report(command.output, "cannot copy [" + source.generic_string() +
-                                 "]: " + bytes.error().message());
       co_return std::unexpected(BuildFailure(
-          make_error_code(BuildError::copy_source_unreadable), {source}));
+          make_error_code(BuildError::copy_source_unreadable), {source},
+          with_reason({}, "cannot copy [" + source.generic_string() +
+                              "]: " + bytes.error().message())));
     }
     co_return BuildOutput{.bytes = std::move(*bytes), .inputs = {source}};
   }
@@ -317,28 +320,50 @@ exec::task<BuildResult> detail::run_shell_command(
   if (!capture) {
     text = substitute_out(text, out_path);
   }
+  // A `capture` command's standard output is its output, so all of it is
+  // kept; the rest only explains a failure.
   ProcessUtil::Result result = co_await ProcessUtil::run(
-      io, working_directory, text, tracker, command.output, stop);
+      io, working_directory, text, tracker, command.output, stop,
+      CaptureLimits{.standard_output = capture ? CaptureLimits{}.standard_output
+                                               : k_kept_diagnostics,
+                    .standard_error = k_kept_diagnostics});
   if (!result.has_value()) {
     co_return std::unexpected(result.error());
   }
   // A `run` command's standard output is not its output, but may say why it
-  // failed, so it goes where its standard error does.
-  if (!capture && !result->standard_output.empty()) {
-    std::fwrite(result->standard_output.data(), 1,
-                result->standard_output.size(), stderr);
-    std::fflush(stderr);
+  // failed - MSVC's tools give their errors there - so it is kept with its
+  // standard error, ahead of it, as how the two interleaved is lost. No more
+  // than k_kept_diagnostics of the two is, with a line saying how much more
+  // there was.
+  std::string diagnostics;
+  std::size_t omitted = result->standard_error_omitted;
+  if (!capture) {
+    diagnostics = std::move(result->standard_output);
+    omitted += result->standard_output_omitted;
+  }
+  diagnostics += result->standard_error;
+  if (diagnostics.size() > k_kept_diagnostics) {
+    omitted += diagnostics.size() - k_kept_diagnostics;
+    diagnostics.resize(k_kept_diagnostics);
+  }
+  if (omitted != 0) {
+    diagnostics =
+        with_reason(std::move(diagnostics),
+                    "... and " + std::to_string(omitted) + " more bytes");
   }
   // What it read, whether or not it built anything: a failure is retried when
   // one of these changes, as a success is rebuilt.
   std::vector<std::filesystem::path> inputs =
       relativize(result->inputs, working_directory);
-  const auto fail = [&inputs](std::error_code error) {
-    return std::unexpected(BuildFailure(error, std::move(inputs)));
+  const auto fail = [&inputs](std::error_code error,
+                              std::string standard_error) {
+    return std::unexpected(
+        BuildFailure(error, std::move(inputs), std::move(standard_error)));
   };
   // A command that reports failure has not built its output.
   if (result->exit_status != 0) {
-    co_return fail(exit_status_error(result->exit_status));
+    co_return fail(exit_status_error(result->exit_status),
+                   std::move(diagnostics));
   }
   std::string bytes;
   if (capture) {
@@ -349,17 +374,20 @@ exec::task<BuildResult> detail::run_shell_command(
     // read as being about the output.
     std::expected<std::string, std::error_code> written = read_file(out_path);
     if (!written.has_value()) {
-      report(command.output,
-             written.error() == std::errc::no_such_file_or_directory
-                 ? std::string(
-                       "command exited successfully but wrote nothing to %out")
-                 : "command exited successfully but its %out could not be "
-                   "read: " +
-                       written.error().message());
-      co_return fail(make_error_code(BuildError::out_not_written));
+      co_return fail(
+          make_error_code(BuildError::out_not_written),
+          with_reason(
+              std::move(diagnostics),
+              written.error() == std::errc::no_such_file_or_directory
+                  ? std::string(
+                        "command exited successfully but wrote nothing to %out")
+                  : "command exited successfully but its %out could not be "
+                    "read: " +
+                        written.error().message()));
     }
     bytes = std::move(*written);
   }
+  // What it printed is dropped: it built, so there is nothing to explain.
   co_return BuildOutput{.bytes = std::move(bytes), .inputs = std::move(inputs)};
 }
 

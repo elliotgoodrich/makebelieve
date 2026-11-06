@@ -1,0 +1,28 @@
+# A manifest whose builds fail on purpose, one way each, to show what the
+# `status` output reports. Like the basic example, every command uses
+# `cmake -E` or `cmake -P`, so it works under sh or cmd.exe alike.
+
+# What is building and what failed - empty once everything is built.
+@/status.txt = status
+
+# This one builds.
+@/good.txt = capture cmake -E echo "this one builds"
+
+# This one builds too, but takes a while, so is building for a time.
+@/slow.txt = capture cmake -E sleep 20 && cmake -E echo "this one took a while"
+
+# A command that exits nonzero, explaining itself on standard error the way a
+# compiler does.
+@/compiled.txt = capture cmake -DINPUT=source.txt -P compile.cmake
+
+# A tool that is not installed.
+@/missing-tool.txt = capture makebelieve-example-no-such-tool --version
+
+# A `run` command that succeeds but never writes its output to %out.
+@/forgot-out.txt = run cmake -E echo "built it, honest"
+
+# A copy of a file that does not exist.
+@/missing-source.txt = copy does-not-exist.txt
+
+# An output that reads one that fails, so fails too.
+@/downstream.txt = run cmake -E copy @/compiled.txt %out
