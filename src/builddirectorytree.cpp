@@ -8,6 +8,7 @@
 #include "inmemorydirectorytree.hpp"
 #include "manifest.hpp"
 #include "processinfo.hpp"
+#include "scopeguard.hpp"
 #include "shellrunner.hpp"
 #include "tracer.hpp"
 
@@ -146,9 +147,6 @@ std::string_view to_string(Manifest::Action action) {
 std::string trace_snapshot() {
   return g_tracer != nullptr ? g_tracer->snapshot() : std::string("[]\n");
 }
-
-// How much of what a build wrote to standard error is kept with its failure.
-constexpr std::size_t k_kept_standard_error = std::size_t{16} * 1024;
 
 // Appends @a output as a manifest names it, `@/` and all.
 void append_output(std::string& report, const std::filesystem::path& output) {
@@ -300,7 +298,8 @@ std::map<std::filesystem::path, Command> expand_rules(
 class BuildDirectoryTree::Impl {
   // The directory structure and file contents we present. Each declared output
   // starts as a placeholder, replaced by real content once its command
-  // succeeds.
+  // succeeds - but for a `status` output, which holds its report from the
+  // start.
   InMemoryDirectoryTree m_structure;
 
   // The manifest's home, observed for input and manifest changes.
@@ -329,8 +328,9 @@ class BuildDirectoryTree::Impl {
   // the manifest and the files its wildcards match as they change.
   std::map<std::filesystem::path, Command> m_commands;
 
-  // Outputs that need (re)building: every output starts stale, a successful
-  // build clears it, an input change marks it stale again.
+  // Outputs that need (re)building: every output but a `status` output, which
+  // nobody builds, starts stale; a successful build clears it, an input change
+  // marks it stale again.
   std::set<std::filesystem::path> m_stale;
 
   // Outputs whose build has started and is awaiting completion, so a second
@@ -419,7 +419,7 @@ class BuildDirectoryTree::Impl {
   ManifestErrorHandler m_on_manifest_error;
 
   // Told of each build that failed; may be empty.
-  BuildReportHandler m_on_build_report;
+  BuildFailureHandler m_on_build_failure;
 
   // Why an output's last build failed: what it ran, and either how that went
   // wrong or the output it read that had failed, which is the reason enough.
@@ -440,8 +440,9 @@ class BuildDirectoryTree::Impl {
   // Every declared `status` output, kept in step with m_commands.
   std::vector<std::filesystem::path> m_status_outputs;
 
-  // Whether what a `status` output shows may have changed since one was last
-  // read - and so has been announced, once.
+  // Whether a change to what a `status` output shows has been written, and so
+  // announced, since one was last read: until it is read again, further changes
+  // are not.
   bool m_status_changed = false;
 
   // Set, under m_layout_mutex, while `status` outputs are rewritten for a
@@ -476,13 +477,13 @@ class BuildDirectoryTree::Impl {
        BuildCoordinator* coordinator,
        ManifestErrorHandler on_manifest_error,
        BuildCache* cache,
-       BuildReportHandler on_build_report)
+       BuildFailureHandler on_build_failure)
       : m_source(source),
         m_cache(cache),
         m_runner(std::move(runner)),
         m_coordinator(coordinator),
         m_on_manifest_error(std::move(on_manifest_error)),
-        m_on_build_report(std::move(on_build_report)) {
+        m_on_build_failure(std::move(on_build_failure)) {
     if (m_coordinator == nullptr) {
       m_coordinator = &m_own_coordinator.emplace(
           unlimited_permits(), BuildProcessTracker::none(),
@@ -598,7 +599,9 @@ class BuildDirectoryTree::Impl {
     }
     for (const auto& [output, failure] : m_failures) {
       if (!m_in_flight.contains(output)) {
-        append_failure(report, output, failure);
+        append_failure(report, output, failure,
+                       failure.failed_input.has_value() &&
+                           m_failures.contains(*failure.failed_input));
       }
     }
     return report;
@@ -743,24 +746,17 @@ class BuildDirectoryTree::Impl {
     BuildCoordinator::AttemptPtr target;
     std::optional<Launch> launch;
     bool status_output = false;
-    bool rewrite_status = false;
     {
       const std::lock_guard lock(m_mutex);
       const auto command = m_commands.find(output);
       if (command == m_commands.end()) {
         return nullptr;
       }
-      // Built by nobody, so never stale: rewritten for this read only if what
-      // it shows changed since the last, which also rearms status_changed().
       status_output = command->second.action == Manifest::Action::Status;
-      if (status_output) {
-        rewrite_status = std::exchange(m_status_changed, false);
-      }
     }
+    // Built by nobody, so never stale.
     if (status_output) {
-      if (rewrite_status) {
-        write_status(/*for_a_read=*/true);
-      }
+      read_status();
       return nullptr;
     }
     {
@@ -894,12 +890,15 @@ class BuildDirectoryTree::Impl {
   void launch_build(Launch launch) {
     const std::filesystem::path output = launch.output;
     const std::uint64_t build_id = launch.build_id;
+    // As it ran, which the runner takes, for whatever its failure is put down
+    // to.
+    const Command command = launch.command;
 
     // Served by the tree itself rather than the runner. A status report is
     // filled in by finish_build, under the lock that orders it with
     // write_status, so it cannot overwrite a newer one.
     if (Manifest::is_report(launch.command.action)) {
-      finish_build(output, launch.attempt, build_id,
+      finish_build(output, launch.command, launch.attempt, build_id,
                    BuildOutput{.bytes = launch.command.action ==
                                                 Manifest::Action::Tracing
                                             ? trace_snapshot()
@@ -959,7 +958,7 @@ class BuildDirectoryTree::Impl {
           });
       build.emplace(m_coordinator->run(launch.attempt, std::move(running)));
     } catch (...) {
-      finish_build(output, launch.attempt, build_id,
+      finish_build(output, command, launch.attempt, build_id,
                    std::unexpected(to_error_code(std::current_exception())));
       return;
     }
@@ -981,9 +980,10 @@ class BuildDirectoryTree::Impl {
             // to, a failure there ends the process, as it would on any thread.
             stdexec::then(
                 // NOLINTNEXTLINE(bugprone-exception-escape)
-                [this, output, attempt = std::move(launch.attempt),
+                [this, output, command, attempt = std::move(launch.attempt),
                  build_id](BuildResult result) noexcept {
-                  finish_build(output, attempt, build_id, std::move(result));
+                  finish_build(output, command, attempt, build_id,
+                               std::move(result));
                 }),
         m_builds.get_token());
   }
@@ -1022,11 +1022,12 @@ class BuildDirectoryTree::Impl {
     }
   }
 
-  // Records the outcome of @a attempt, a build of @a output, then hands it to
-  // everything waiting on that attempt. @a build_id is 0 for one left out of
-  // the trace.
+  // Records the outcome of @a attempt, a build of @a output by @a ran, then
+  // hands it to everything waiting on that attempt. @a build_id is 0 for one
+  // left out of the trace.
   // NOLINTNEXTLINE(misc-no-recursion): see launch_build.
   void finish_build(const std::filesystem::path& output,
+                    const Command& ran,
                     const BuildCoordinator::AttemptPtr& attempt,
                     std::uint64_t build_id,
                     BuildResult result) {
@@ -1070,7 +1071,7 @@ class BuildDirectoryTree::Impl {
 
     std::optional<Launch> next;
     BuildCoordinator::AttemptPtr orphaned;
-    Outcome outcome;
+    std::string failure_report;
     {
       const std::lock_guard lock(m_mutex);
       // A failure that read nothing - one stopped, or that never got to run
@@ -1082,7 +1083,7 @@ class BuildDirectoryTree::Impl {
           update_dependents(output, std::move(result.error().inputs));
         }
       }
-      outcome = record_outcome(output, result);
+      failure_report = record_outcome(output, ran, result);
       m_in_flight.erase(output);
       m_running.erase(output);
       m_reads.erase(output);
@@ -1108,8 +1109,10 @@ class BuildDirectoryTree::Impl {
         const bool stopped =
             !result.has_value() &&
             result.error().error == std::errc::operation_canceled;
-        // A failed build stays stale, so a later open or input change retries.
-        if (!result.has_value()) {
+        // A failed build stays stale, so a later open or input change retries -
+        // unless its rule became a report's mid-build, which nobody builds.
+        if (!result.has_value() &&
+            !Manifest::is_report(m_commands.at(output).action)) {
           m_stale.insert(output);
         }
         rebuild = waited_on ||
@@ -1122,8 +1125,8 @@ class BuildDirectoryTree::Impl {
     // Before the release, so whoever opened the output can find it reported.
     // Finished, so no longer building, whatever happened.
     status_changed();
-    if (!outcome.report.empty() && m_on_build_report) {
-      m_on_build_report(outcome.report);
+    if (!failure_report.empty() && m_on_build_failure) {
+      m_on_build_failure(failure_report);
     }
 
     // Only now the content is in place may a waiting open() be released.
@@ -1157,12 +1160,13 @@ class BuildDirectoryTree::Impl {
 
   // Appends @a failure, of @a output, as a report gives it: a line saying what
   // failed and why, followed by what it wrote to standard error, indented -
-  // or, for one that read a failed output, the line alone, naming that output.
+  // or, if @a blame_input, the line alone, naming the failed output it read.
   static void append_failure(std::string& report,
                              const std::filesystem::path& output,
-                             const Failure& failure) {
+                             const Failure& failure,
+                             bool blame_input) {
     append_output(report, output);
-    if (failure.failed_input.has_value()) {
+    if (blame_input && failure.failed_input.has_value()) {
       report += " failed because ";
       append_output(report, *failure.failed_input);
       report += " failed\n";
@@ -1176,43 +1180,34 @@ class BuildDirectoryTree::Impl {
     append_indented(report, failure.standard_error);
   }
 
-  // What record_outcome found: the report of the build for the build report
-  // handler, if any, and whether the outputs that failed changed.
-  struct Outcome {
-    std::string report;
-    bool failures_changed = false;
-  };
-
-  // Records how @a output's build went, as @a result says: a success clears
-  // any failure it had, a failure replaces it. Reports a failure as
-  // append_failure() gives it, and nothing for a success, or for a build
-  // stopped before it could finish, which says nothing of the output.
+  // Records how @a output's build by @a ran went, as @a result says: a success
+  // clears any failure it had, a failure replaces it - unless the rule changed
+  // mid-build, when it says nothing of the rule now. Returns the failure as
+  // append_failure() gives it, for the build failure handler - one whose rule
+  // changed included, as it did fail - and nothing for a success, for an
+  // output whose rule went, or for a build stopped before it could finish,
+  // which says nothing of the output.
   // @pre m_mutex is held, and the build's reads are still in m_reads.
-  Outcome record_outcome(const std::filesystem::path& output,
-                         const BuildResult& result) {
+  std::string record_outcome(const std::filesystem::path& output,
+                             const Command& ran,
+                             const BuildResult& result) {
     const auto command = m_commands.find(output);
+    const bool current = command != m_commands.end() && command->second == ran;
+    if (Manifest::is_report(ran.action) || result.has_value()) {
+      if (current) {
+        m_failures.erase(output);
+      }
+      return {};
+    }
     if (command == m_commands.end() ||
-        Manifest::is_report(command->second.action)) {
-      return {.report = {}, .failures_changed = m_failures.erase(output) != 0};
-    }
-    if (result.has_value()) {
-      return {.report = {}, .failures_changed = m_failures.erase(output) != 0};
-    }
-    if (result.error().error == std::errc::operation_canceled) {
+        result.error().error == std::errc::operation_canceled) {
       return {};
     }
 
-    Failure failure{.command = command->second,
+    Failure failure{.command = ran,
                     .error = result.error().error,
-                    .standard_error = result.error().standard_error.substr(
-                        0, k_kept_standard_error),
+                    .standard_error = result.error().standard_error,
                     .failed_input = std::nullopt};
-    if (result.error().standard_error.size() > k_kept_standard_error) {
-      failure.standard_error += "\n... and ";
-      failure.standard_error += std::to_string(
-          result.error().standard_error.size() - k_kept_standard_error);
-      failure.standard_error += " more bytes\n";
-    }
     // Every output it read, including the one a copy of an output copies.
     std::vector<std::filesystem::path> read;
     if (const auto reads = m_reads.find(output); reads != m_reads.end()) {
@@ -1223,9 +1218,9 @@ class BuildDirectoryTree::Impl {
         }
       }
     }
-    if (command->second.action == Manifest::Action::Copy) {
+    if (ran.action == Manifest::Action::Copy) {
       if (std::optional<std::filesystem::path> named =
-              output_named_by(command->second.text)) {
+              output_named_by(ran.text)) {
         read.push_back(std::move(*named));
       }
     }
@@ -1235,10 +1230,12 @@ class BuildDirectoryTree::Impl {
         break;
       }
     }
-    Outcome outcome{.report = {}, .failures_changed = true};
-    append_failure(outcome.report, output, failure);
-    m_failures.insert_or_assign(output, std::move(failure));
-    return outcome;
+    std::string report;
+    append_failure(report, output, failure, failure.failed_input.has_value());
+    if (current) {
+      m_failures.insert_or_assign(output, std::move(failure));
+    }
+    return report;
   }
 
   // Says that what a `status` output shows may have changed. The first such
@@ -1246,51 +1243,92 @@ class BuildDirectoryTree::Impl {
   // after that nothing is, until the next read writes what it shows then. So
   // whoever reads one hears of a change once, however many builds start and
   // finish meanwhile, and decides for themselves when to look again.
-  void status_changed() {
-    {
-      const std::lock_guard lock(m_mutex);
-      if (m_status_outputs.empty() || std::exchange(m_status_changed, true)) {
+  // Best-effort: a status that cannot be written is only out of date, so this
+  // never throws into the build that changed it.
+  void status_changed() noexcept {
+    try {
+      // Checked first without the layout lock, which every build would
+      // otherwise queue on, then again once it is held.
+      const auto announced = [this] {
+        const std::lock_guard lock(m_mutex);
+        return m_status_outputs.empty() || m_status_changed;
+      };
+      if (announced()) {
         return;
       }
+      const std::lock_guard layout(m_layout_mutex);
+      if (announced()) {
+        return;
+      }
+      if (write_status(/*for_a_read=*/false)) {
+        const std::lock_guard lock(m_mutex);
+        m_status_changed = true;
+      }
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
     }
-    write_status(/*for_a_read=*/false);
+  }
+
+  // Brings every `status` output up to date for a read, unannounced - which
+  // a reader needs only if a change was announced since the last read - and
+  // rearms status_changed().
+  void read_status() {
+    const std::lock_guard layout(m_layout_mutex);
+    bool changed = false;
+    {
+      const std::lock_guard lock(m_mutex);
+      changed = std::exchange(m_status_changed, false);
+    }
+    if (changed) {
+      write_status(/*for_a_read=*/true);
+    }
   }
 
   // Rewrites every `status` output with what it shows now - announcing the
-  // change, unless @a for_a_read - leaving be one that already holds it.
-  void write_status(bool for_a_read) {
-    const std::lock_guard layout(m_layout_mutex);
+  // change, unless @a for_a_read - leaving be one that already holds it, and
+  // returns whether it wrote any.
+  // @pre m_layout_mutex is held.
+  bool write_status(bool for_a_read) {
     std::vector<std::filesystem::path> outputs;
     std::string report;
     {
       const std::lock_guard lock(m_mutex);
-      for (const std::filesystem::path& output : m_status_outputs) {
-        if (!m_in_flight.contains(output)) {
-          outputs.push_back(output);
-        }
-      }
+      outputs = m_status_outputs;
       if (outputs.empty()) {
-        return;
+        return false;
       }
       report = status_report_locked();
-      if (m_cache != nullptr) {
-        // As finish_build does, for a build that reads one.
-        for (const std::filesystem::path& output : outputs) {
-          m_hashes.insert_or_assign(output, BuildCache::hash(report));
-        }
-      }
     }
     // Outside m_mutex: write_file notifies subscribers, who may read back
     // through us.
     m_rewriting_status_for_a_read = for_a_read;
+    const ScopeGuard rewritten(
+        [this] { m_rewriting_status_for_a_read = false; });
     const auto now = std::chrono::file_clock::now();
+    bool wrote = false;
     for (const std::filesystem::path& output : outputs) {
       if (const auto current = read_all(m_structure, output);
           !current.has_value() || *current != report) {
         m_structure.write_file(output, report, now);
+        wrote = true;
       }
     }
-    m_rewriting_status_for_a_read = false;
+    if (wrote) {
+      note_status_hash(report);
+    }
+    return wrote;
+  }
+
+  // Keeps the hash of @a report as that of every `status` output, for a build
+  // that reads one, as finish_build does for other outputs.
+  void note_status_hash(const std::string& report) {
+    if (m_cache == nullptr) {
+      return;
+    }
+    const std::string hash = BuildCache::hash(report);
+    const std::lock_guard lock(m_mutex);
+    for (const std::filesystem::path& output : m_status_outputs) {
+      m_hashes.insert_or_assign(output, hash);
+    }
   }
 
   // The stamp of the source file or directory @a path as it is now, or
@@ -1593,7 +1631,10 @@ class BuildDirectoryTree::Impl {
     std::vector<std::filesystem::path> removed;
     std::vector<std::filesystem::path> added;
     std::vector<std::filesystem::path> changed;
-    bool failures_removed = false;
+    // Outputs that were not `status` outputs before, but are now.
+    std::vector<std::filesystem::path> now_status;
+    // What a `status` output that is new shows from the start.
+    std::string report;
     {
       const std::lock_guard layout(m_layout_mutex);
       {
@@ -1608,7 +1649,9 @@ class BuildDirectoryTree::Impl {
           if (it == m_commands.end()) {
             added.push_back(output);
             // Nobody builds a `status` output, so it is never stale.
-            if (command.action != Manifest::Action::Status) {
+            if (command.action == Manifest::Action::Status) {
+              now_status.push_back(output);
+            } else {
               m_stale.insert(output);
             }
             if (m_materialize_all && !Manifest::is_report(command.action)) {
@@ -1617,14 +1660,28 @@ class BuildDirectoryTree::Impl {
               changed.push_back(output);
             }
           } else if (it->second != command) {
-            changed.push_back(output);
+            // A failure of what it used to run says nothing of what it runs
+            // now; one that is watched rebuilds at once, showing as building.
+            m_failures.erase(output);
+            if (command.action == Manifest::Action::Status) {
+              // Built by nobody: it holds the report from now on.
+              m_stale.erase(output);
+              m_materialized.erase(output);
+              now_status.push_back(output);
+            } else {
+              // A report's output was never treated as opened.
+              if (m_materialize_all && !Manifest::is_report(command.action)) {
+                m_materialized.insert(output);
+              }
+              changed.push_back(output);
+            }
           }
         }
         for (const std::filesystem::path& output : removed) {
           m_stale.erase(output);
           m_materialized.erase(output);
           m_hashes.erase(output);
-          failures_removed |= m_failures.erase(output) != 0;
+          m_failures.erase(output);
           ++m_invalidations[output];
           // A build under way keeps its attempts until it finishes, which
           // settles whatever waits on them.
@@ -1641,16 +1698,33 @@ class BuildDirectoryTree::Impl {
             m_status_outputs.push_back(output);
           }
         }
+        if (!now_status.empty()) {
+          report = status_report_locked();
+          if (m_cache != nullptr) {
+            const std::string hash = BuildCache::hash(report);
+            for (const std::filesystem::path& output : m_status_outputs) {
+              m_hashes.insert_or_assign(output, hash);
+            }
+          }
+        }
       }
 
       // Removals first, so a new output can take the place of a directory that
-      // only removed outputs occupied.
+      // only removed outputs occupied. A `status` output holds what it shows
+      // from the start, never a placeholder.
       for (const std::filesystem::path& output : removed) {
         remove_with_empty_parents(m_structure, output);
       }
       for (const std::filesystem::path& output : added) {
         ensure_parent_directories(m_structure, output);
-        m_structure.write_file(output, k_placeholder_content);
+        m_structure.write_file(output, std::ranges::contains(now_status, output)
+                                           ? std::string_view(report)
+                                           : k_placeholder_content);
+      }
+      for (const std::filesystem::path& output : now_status) {
+        if (!std::ranges::contains(added, output)) {
+          m_structure.write_file(output, report);
+        }
       }
     }
 
@@ -1671,16 +1745,10 @@ class BuildDirectoryTree::Impl {
 
     forget_in_cache(removed);
 
-    // A new `status` output holds what it shows from the start, and a removed
-    // rule takes its failure with it.
-    if (std::ranges::any_of(added, [&](const std::filesystem::path& output) {
-          return std::ranges::contains(m_status_outputs, output);
-        })) {
-      write_status(/*for_a_read=*/true);
-    }
-    if (failures_removed) {
-      status_changed();
-    }
+    // A rule removed or changed takes its failure with it, and one under way
+    // shows differently, or not at all. Nothing is announced if nothing shows
+    // differently.
+    status_changed();
 
     // Outside the layout lock, since an eager rebuild writes its result.
     invalidate(std::move(changed));
@@ -1740,7 +1808,9 @@ class BuildDirectoryTree::Impl {
       while (!outputs.empty()) {
         const std::filesystem::path output = std::move(outputs.back());
         outputs.pop_back();
-        if (!m_commands.contains(output) || !seen.insert(output).second) {
+        const auto command = m_commands.find(output);
+        if (command == m_commands.end() || !seen.insert(output).second ||
+            command->second.action == Manifest::Action::Status) {
           continue;
         }
         m_stale.insert(output);
@@ -1774,26 +1844,26 @@ BuildDirectoryTree::BuildDirectoryTree(const DirectoryTree& source,
                                        CommandRunner runner,
                                        ManifestErrorHandler on_manifest_error,
                                        BuildCache* cache,
-                                       BuildReportHandler on_build_report)
+                                       BuildFailureHandler on_build_failure)
     : m_impl(std::make_unique<Impl>(source,
                                     std::move(runner),
                                     nullptr,
                                     std::move(on_manifest_error),
                                     cache,
-                                    std::move(on_build_report))) {}
+                                    std::move(on_build_failure))) {}
 
 BuildDirectoryTree::BuildDirectoryTree(const DirectoryTree& source,
                                        CommandRunner runner,
                                        BuildCoordinator& coordinator,
                                        ManifestErrorHandler on_manifest_error,
                                        BuildCache* cache,
-                                       BuildReportHandler on_build_report)
+                                       BuildFailureHandler on_build_failure)
     : m_impl(std::make_unique<Impl>(source,
                                     std::move(runner),
                                     &coordinator,
                                     std::move(on_manifest_error),
                                     cache,
-                                    std::move(on_build_report))) {}
+                                    std::move(on_build_failure))) {}
 
 BuildDirectoryTree::~BuildDirectoryTree() = default;
 

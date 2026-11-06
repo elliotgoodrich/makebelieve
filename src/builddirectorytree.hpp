@@ -78,7 +78,9 @@ class BuildCoordinator;
 /// since the last read, which is not announced either. Instead the first change
 /// after a read is written, and announced, at once; then nothing is until it is
 /// read again. So whatever watches it hears of a change once, however many
-/// builds come and go, and rereads it when it likes.
+/// builds come and go, and rereads it when it likes. An output whose command
+/// reads a `status` output gets what it showed then, and is not rebuilt as it
+/// changes.
 ///
 /// Given a @link BuildCache, the tree keeps each successful build in it, with
 /// a stamp of every input it read: a source file's mtime and size, or the hash
@@ -108,7 +110,7 @@ class BuildDirectoryTree : public DirectoryTree {
   /// a newline. Not told of a build stopped before it could finish. Called on
   /// whatever thread finished the build, before anything waiting on it is
   /// released.
-  using BuildReportHandler = std::function<void(const std::string& report)>;
+  using BuildFailureHandler = std::function<void(const std::string& report)>;
 
   /// Builds the outputs declared in the `build.makebelieve` file of @a source,
   /// delegating each command to @a runner - any callable convertible to a
@@ -117,14 +119,14 @@ class BuildDirectoryTree : public DirectoryTree {
   /// accept; later problems of that kind go to @a on_manifest_error, if
   /// given, except that a manifest removed later leaves an empty tree until it
   /// is written back. Builds are kept in @a cache, if given, and restored from
-  /// it. Each build that fails is told to @a on_build_report, if given.
+  /// it. Each build that fails is told to @a on_build_failure, if given.
   /// @pre @a source outlives this tree; it is observed for its whole life.
   /// @pre @a cache, if given, outlives this tree.
   BuildDirectoryTree(const DirectoryTree& source,
                      CommandRunner runner,
                      ManifestErrorHandler on_manifest_error = {},
                      BuildCache* cache = nullptr,
-                     BuildReportHandler on_build_report = {});
+                     BuildFailureHandler on_build_failure = {});
 
   /// As above, but running and waiting on builds through @a coordinator
   /// rather than one of its own, which places no limit on how many run at
@@ -135,7 +137,7 @@ class BuildDirectoryTree : public DirectoryTree {
                      BuildCoordinator& coordinator,
                      ManifestErrorHandler on_manifest_error = {},
                      BuildCache* cache = nullptr,
-                     BuildReportHandler on_build_report = {});
+                     BuildFailureHandler on_build_failure = {});
 
   /// Cancels every build still under way and waits for each to complete, so
   /// no build outlives the tree.
@@ -165,7 +167,8 @@ class BuildDirectoryTree : public DirectoryTree {
   /// opens it, and does the same for every output declared later - by a
   /// changed manifest, or a file a wildcard comes to match - and rebuilds any
   /// whose inputs change, as it would an output that had been opened. A
-  /// `tracing` or `status` output is left alone, as nobody builds one. Returns
+  /// `tracing` or `status` output is left alone, as opening one is what
+  /// brings it up to date. Returns
   /// once the builds are started, without waiting for them.
   ///
   /// These builds are nobody's request, so builds that someone does open
@@ -182,12 +185,13 @@ class BuildDirectoryTree : public DirectoryTree {
   ///   `@/<output> waiting to build: <command>` while it waits its turn, with
   ///   ` (its last build failed)` after one whose last build did;
   /// - each output whose last build failed and is not building again, as
-  ///   @link BuildReportHandler describes it - except that one which failed
+  ///   @link BuildFailureHandler describes it - except that one which failed
   ///   because an output it read had failed gets the single line
   ///   `@/<output> failed because @/<input> failed`.
   ///
   /// Each part is in path order. Empty once everything asked for is built and
-  /// nothing is failing. Builds nothing.
+  /// nothing is failing. Builds nothing. What a `status` output serves, for
+  /// whatever wants it without reading one - tests, say.
   [[nodiscard]] std::string status_report() const;
 
   /// Returns a sender reading up to @a size bytes at @a offset from @a path's

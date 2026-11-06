@@ -6,8 +6,10 @@
 #include <exec/task.hpp>
 #include <stdexec/execution.hpp>
 
+#include <cstddef>
 #include <expected>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -16,6 +18,14 @@
 namespace makebelieve {
 
 class IoContext;
+
+/// At most how much of each of its output streams a run of a command keeps:
+/// the rest is counted, but not kept, so a command that writes without end
+/// cannot use up memory.
+struct CaptureLimits {
+  std::size_t standard_output = std::numeric_limits<std::size_t>::max();
+  std::size_t standard_error = std::numeric_limits<std::size_t>::max();
+};
 
 /// @class ProcessUtil
 /// Provides a namespace for running external commands.
@@ -38,6 +48,11 @@ struct ProcessUtil {
     /// that ended it, if one did, as a shell reports it. What a nonzero
     /// status means is for the caller to decide.
     int exit_status = 0;
+
+    /// How many bytes it wrote to standard output and to standard error beyond
+    /// what @link CaptureLimits let the run keep.
+    std::size_t standard_output_omitted = 0;
+    std::size_t standard_error_omitted = 0;
   };
 
   /// The Output a command produced, or an `error_code` when it could not be
@@ -48,7 +63,8 @@ struct ProcessUtil {
   /// working directory set to @a working_directory, and completes with its
   /// standard output and standard error, the files it read (see
   /// Output::inputs) and its exit status once it has run to completion,
-  /// whatever that status. It completes with `std::errc::operation_canceled`
+  /// whatever that status - keeping no more of each stream than @a limits
+  /// allows. It completes with `std::errc::operation_canceled`
   /// if @a stop was requested, in which case the command is terminated first,
   /// or with the platform error if the command could not be started or waited
   /// on - or could not be traced, whether because tracing could not be set up
@@ -79,10 +95,11 @@ struct ProcessUtil {
                                 std::string command,
                                 BuildProcessTracker& tracker,
                                 std::filesystem::path output,
-                                stdexec::inplace_stop_token stop) {
+                                stdexec::inplace_stop_token stop,
+                                CaptureLimits limits = {}) {
     return stdexec::write_env(
         run_task(io, std::move(working_directory), std::move(command), tracker,
-                 std::move(output), stop),
+                 std::move(output), stop, limits),
         stdexec::prop{stdexec::get_stop_token, stdexec::never_stop_token{}});
   }
 
@@ -92,7 +109,8 @@ struct ProcessUtil {
                                      std::string command,
                                      BuildProcessTracker& tracker,
                                      std::filesystem::path output,
-                                     stdexec::inplace_stop_token stop);
+                                     stdexec::inplace_stop_token stop,
+                                     CaptureLimits limits);
 };
 
 /// @class ProcessUtilTestUtil

@@ -320,17 +320,36 @@ exec::task<BuildResult> detail::run_shell_command(
   if (!capture) {
     text = substitute_out(text, out_path);
   }
+  // A `capture` command's standard output is its output, so all of it is
+  // kept; the rest only explains a failure.
   ProcessUtil::Result result = co_await ProcessUtil::run(
-      io, working_directory, text, tracker, command.output, stop);
+      io, working_directory, text, tracker, command.output, stop,
+      CaptureLimits{.standard_output = capture ? CaptureLimits{}.standard_output
+                                               : k_kept_diagnostics,
+                    .standard_error = k_kept_diagnostics});
   if (!result.has_value()) {
     co_return std::unexpected(result.error());
   }
   // A `run` command's standard output is not its output, but may say why it
   // failed - MSVC's tools give their errors there - so it is kept with its
-  // standard error, ahead of it, as how the two interleaved is lost.
-  std::string diagnostics = std::move(result->standard_error);
-  if (!capture && !result->standard_output.empty()) {
-    diagnostics.insert(0, result->standard_output);
+  // standard error, ahead of it, as how the two interleaved is lost. No more
+  // than k_kept_diagnostics of the two is, with a line saying how much more
+  // there was.
+  std::string diagnostics;
+  std::size_t omitted = result->standard_error_omitted;
+  if (!capture) {
+    diagnostics = std::move(result->standard_output);
+    omitted += result->standard_output_omitted;
+  }
+  diagnostics += result->standard_error;
+  if (diagnostics.size() > k_kept_diagnostics) {
+    omitted += diagnostics.size() - k_kept_diagnostics;
+    diagnostics.resize(k_kept_diagnostics);
+  }
+  if (omitted != 0) {
+    diagnostics =
+        with_reason(std::move(diagnostics),
+                    "... and " + std::to_string(omitted) + " more bytes");
   }
   // What it read, whether or not it built anything: a failure is retried when
   // one of these changes, as a success is rebuilt.

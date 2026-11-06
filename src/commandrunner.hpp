@@ -32,7 +32,8 @@ struct BuildOutput {
 /// Why a build failed: the error; the input files it read on the way, relative
 /// to the source tree's root - so a change to one, the fix for what failed,
 /// say, retries it as it would rebuild a successful build; and whatever its
-/// command wrote to standard error before failing, if it ran one.
+/// command wrote to standard error before failing, if it ran one, which the
+/// tree keeps as it is, so a runner keeps it short.
 struct BuildFailure {
   std::error_code error;
   std::vector<std::filesystem::path> inputs;

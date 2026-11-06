@@ -7,6 +7,7 @@
 #include <exec/task.hpp>
 #include <stdexec/execution.hpp>
 
+#include <cstddef>
 #include <filesystem>
 #include <system_error>
 #include <utility>
@@ -18,6 +19,10 @@ class IoContext;
 /// The category of the error a build fails with when its command exits with a
 /// nonzero status, whose value is that status.
 [[nodiscard]] const std::error_category& exit_status_category();
+
+/// At most how much of what a command wrote - to standard error, and for a
+/// `Run` command standard output - is kept with its failure.
+inline constexpr std::size_t k_kept_diagnostics = std::size_t{16} * 1024;
 
 /// The error a build fails with when its command exits with @a status.
 [[nodiscard]] inline std::error_code exit_status_error(int status) {
@@ -83,10 +88,12 @@ exec::task<BuildResult> run_shell_command(
 ///
 /// Whatever a command writes to standard error - and a `Run` command's
 /// standard output, which is not its output but may say why it failed - is
-/// kept with its failure (`BuildFailure::standard_error`), and dropped once it
-/// builds. Either `BuildError` is explained there too, by a line of its own.
-/// Each command it runs is added to the @link BuildProcessTracker given at
-/// construction, before it runs, under the output it builds
+/// kept with its failure (`BuildFailure::standard_error`) - its first
+/// @link k_kept_diagnostics bytes, and a line saying how many more there were -
+/// and dropped once it builds. Either `BuildError` is explained there too, by a
+/// line of its own. Each command it runs is added to the @link
+/// BuildProcessTracker given at construction, before it runs, under the output
+/// it builds
 /// (`Command::output`).
 /// Traced inputs are reported relative to the working directory, so for
 /// dependency tracking to line up it should be the filesystem root that the

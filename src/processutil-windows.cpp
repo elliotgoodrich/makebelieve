@@ -343,6 +343,16 @@ class OutputReader {
   bool m_pending = false;
   bool m_open = true;
   std::string m_output;
+  std::size_t m_limit;
+  std::size_t m_omitted = 0;
+
+  // Keeps the @a size bytes at @a data, as far as the limit allows, and
+  // counts the rest.
+  void keep(const char* data, std::size_t size) {
+    const std::size_t kept = std::min(size, m_limit - m_output.size());
+    m_output.append(data, kept);
+    m_omitted += size - kept;
+  }
 
   // Stops reading, with no read outstanding to signal the event again.
   void close() {
@@ -358,16 +368,18 @@ class OutputReader {
     CancelIoEx(m_pipe, &m_overlapped);
     DWORD bytes = 0;
     if (GetOverlappedResult(m_pipe, &m_overlapped, &bytes, TRUE)) {
-      m_output.append(m_buffer.data(), bytes);
+      keep(m_buffer.data(), bytes);
     }
     m_pending = false;
   }
 
  public:
   // Manual reset, so a read that completes before the wait on it starts is
-  // not missed.
-  explicit OutputReader(HANDLE pipe)
-      : m_pipe(pipe), m_event(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
+  // not missed. Keeps no more than @a limit bytes.
+  OutputReader(HANDLE pipe, std::size_t limit)
+      : m_pipe(pipe),
+        m_event(CreateEventW(nullptr, TRUE, FALSE, nullptr)),
+        m_limit(limit) {}
 
   // The kernel may yet write into m_buffer, so no read may outlive it.
   ~OutputReader() { cancel(); }
@@ -401,7 +413,7 @@ class OutputReader {
           return;
         }
         m_pending = false;
-        m_output.append(m_buffer.data(), bytes);
+        keep(m_buffer.data(), bytes);
       }
       ResetEvent(m_event.get());
       m_overlapped = OVERLAPPED{};
@@ -426,6 +438,9 @@ class OutputReader {
   }
 
   [[nodiscard]] std::string take() && { return std::move(m_output); }
+
+  // How many bytes it read beyond its limit.
+  [[nodiscard]] std::size_t omitted() const { return m_omitted; }
 };
 
 // Traces the files one command, and everything it starts, reads under a root:
@@ -824,7 +839,8 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     std::string command,
     BuildProcessTracker& tracker,
     std::filesystem::path output,
-    stdexec::inplace_stop_token stop) {
+    stdexec::inplace_stop_token stop,
+    CaptureLimits limits) {
   if (stop.stop_requested()) {
     co_return std::unexpected(
         std::make_error_code(std::errc::operation_canceled));
@@ -847,8 +863,8 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
           make_output_pipe(error_read_end, error_write_end)) {
     co_return std::unexpected(error);
   }
-  OutputReader reader(read_end.get());
-  OutputReader error_reader(error_read_end.get());
+  OutputReader reader(read_end.get(), limits.standard_output);
+  OutputReader error_reader(error_read_end.get(), limits.standard_error);
   if (!reader.valid() || !error_reader.valid()) {
     co_return std::unexpected(last_error_code());
   }
@@ -966,10 +982,14 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
   if (!inputs.has_value()) {
     co_return std::unexpected(inputs.error());
   }
+  const std::size_t output_omitted = reader.omitted();
+  const std::size_t error_omitted = error_reader.omitted();
   co_return Output{.standard_output = std::move(reader).take(),
                    .standard_error = std::move(error_reader).take(),
                    .inputs = std::move(*inputs),
-                   .exit_status = *exit_code};
+                   .exit_status = *exit_code,
+                   .standard_output_omitted = output_omitted,
+                   .standard_error_omitted = error_omitted};
 }
 
 }  // namespace makebelieve

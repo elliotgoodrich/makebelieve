@@ -325,6 +325,23 @@ TEST_F(ShellRunnerTest, KeepsWhatAFailingCommandWroteToStandardError) {
       << built.result.error().standard_error;
 }
 
+// Only the start of what a failing command wrote is kept - and nothing
+// unbounded is held while it runs - with a line saying how much more there
+// was.
+TEST_F(ShellRunnerTest, KeepsOnlyTheStartOfWhatAFailingCommandWrote) {
+  constexpr std::size_t k_written = 100000;
+  write_input("big.txt", std::string(k_written, 'x'));
+  const Built built = build({.output = "output.txt",
+                             .action = Manifest::Action::Capture,
+                             .text = "cmake -E cat big.txt 1>&2 && exit 1"});
+  ASSERT_FALSE(built.result.has_value());
+  const std::string& kept = built.result.error().standard_error;
+  EXPECT_EQ(kept,
+            std::string(makebelieve::k_kept_diagnostics, 'x') + "\n... and " +
+                std::to_string(k_written - makebelieve::k_kept_diagnostics) +
+                " more bytes\n");
+}
+
 // A command that succeeds may still have warned, but it built, so that is not
 // mixed into the output it built.
 TEST_F(ShellRunnerTest, KeepsWhatASucceedingCommandWarnedOutOfItsOutput) {

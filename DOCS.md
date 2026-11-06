@@ -130,9 +130,10 @@ It holds, each part in path order:
 - each output whose most recent build failed: a line naming the output,
   why it failed - its command's exit status, or the error that stopped
   it - and its command, followed by whatever the command wrote to
-  standard error, indented. An output that failed only because an
-  output it read had failed gets a single line naming that output
-  instead.
+  standard error, indented: its first 16 KiB, and a line saying how much
+  more there was. An output that failed only because an output it read
+  had failed - and is failing still - gets a single line naming that
+  output instead.
 
 ```text
 build.makebelieve:4: expected `@/<output> = <action> <command>`
@@ -154,7 +155,9 @@ when read. A tool that rereads a file when told it changed hears once,
 the first time anything changes after it read the report, and then
 nothing until it reads it again - however many builds come and go
 meanwhile - so it can reread as often as suits it. Between reads, the
-size it reports before being opened may be out of date.
+size it reports before being opened may be out of date. A command that
+reads a `status` output gets what it showed then, and its output is not
+rebuilt as the report changes.
 
 ## Rules
 
