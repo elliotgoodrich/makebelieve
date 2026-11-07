@@ -252,7 +252,15 @@ int mount(const MountOptions& options) {
         } catch (...) {  // NOLINT(bugprone-empty-catch)
         }
       },
-      &cache);
+      &cache,
+      [](const std::string& report) {
+        // Best-effort, as this runs wherever the build finished. One print,
+        // so builds finishing at once do not interleave.
+        try {
+          std::print(stderr, "makebelieve: {}", report);
+        } catch (...) {  // NOLINT(bugprone-empty-catch)
+        }
+      });
 
   const VirtualFileSystem vfs(build_tree, mountpoint, workers.get_scheduler());
 

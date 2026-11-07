@@ -57,6 +57,9 @@ std::optional<Manifest::Action> to_action(std::string_view word) {
   if (word == "tracing") {
     return Manifest::Action::Tracing;
   }
+  if (word == "status") {
+    return Manifest::Action::Status;
+  }
   return std::nullopt;
 }
 
@@ -242,17 +245,18 @@ Manifest Manifest::parse(std::string_view text) {
     if (!action.has_value()) {
       reject(
           std::format("`{}` must be assigned `run <command>`, "
-                      "`capture <command>`, `copy <path>` or `tracing`",
+                      "`capture <command>`, `copy <path>`, `tracing` or "
+                      "`status`",
                       left));
       continue;
     }
     const std::string_view argument = trim(value.substr(word.size()));
-    if (*action == Manifest::Action::Tracing) {
+    if (Manifest::is_report(*action)) {
       if (!argument.empty()) {
         reject(
-            std::format("`{}` is assigned `tracing`, which takes no "
+            std::format("`{}` is assigned `{}`, which takes no "
                         "argument, but was given `{}`",
-                        left, argument));
+                        left, word, argument));
         continue;
       }
     } else if (argument.empty()) {
@@ -277,9 +281,9 @@ Manifest Manifest::parse(std::string_view text) {
     std::filesystem::path wildcard_source;
     bool over_outputs = false;
     if (wildcard) {
-      if (*action == Manifest::Action::Tracing) {
-        reject(
-            std::format("`{}` is a wildcard, which `tracing` cannot be", left));
+      if (Manifest::is_report(*action)) {
+        reject(std::format("`{}` is a wildcard, which `{}` cannot be", left,
+                           word));
         continue;
       }
       const std::string_view pattern = *action == Manifest::Action::Copy
