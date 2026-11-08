@@ -90,6 +90,7 @@ bool same_version(const struct stat& a, const struct stat& b) {
 
 class RealDirectoryTree::Impl {
   std::filesystem::path m_root;
+  BuildPaths m_excluded;
   IoContext& m_io;
 
   // Everything below is mutable because the whole interface is const: these
@@ -121,8 +122,10 @@ class RealDirectoryTree::Impl {
   mutable bool m_watching_started = false;
 
  public:
-  Impl(const std::filesystem::path& root, IoContext& io)
-      : m_root(std::filesystem::weakly_canonical(root)), m_io(io) {}
+  Impl(const std::filesystem::path& root, IoContext& io, BuildPaths excluded)
+      : m_root(std::filesystem::weakly_canonical(root)),
+        m_excluded(std::move(excluded)),
+        m_io(io) {}
 
   ~Impl() {
     if (m_watching_started) {
@@ -208,7 +211,11 @@ std::optional<std::filesystem::path> RealDirectoryTree::Impl::resolve(
     return std::nullopt;
   }
 
-  return m_root / normal;
+  const auto resolved = m_root / normal;
+  if (m_excluded.contains_resolved(resolved)) {
+    return std::nullopt;
+  }
+  return resolved;
 }
 
 std::expected<EntryInfo, std::error_code> RealDirectoryTree::Impl::status(
@@ -264,7 +271,9 @@ RealDirectoryTree::Impl::ls(const std::filesystem::path& path) const {
     }
 
     const std::string_view name = entry->d_name;
-    if (name == "." || name == "..") {
+    if (name == "." || name == ".." || m_excluded.contains(*resolved / name) ||
+        ((entry->d_type == DT_LNK || entry->d_type == DT_UNKNOWN) &&
+         m_excluded.contains_resolved(*resolved / name))) {
       continue;
     }
     // fstatat relative to the directory fd avoids rebuilding a full path
@@ -390,6 +399,9 @@ void RealDirectoryTree::Impl::start_watcher() const {
 
 // NOLINTNEXTLINE(misc-no-recursion): see the declaration.
 void RealDirectoryTree::Impl::add_watch(const WatchTarget& target) const {
+  if (m_excluded.contains(target.absolute)) {
+    return;
+  }
   const int wd =
       ::inotify_add_watch(m_inotify_fd, target.absolute.c_str(), k_watch_mask);
   if (wd >= 0) {
@@ -465,6 +477,9 @@ void RealDirectoryTree::Impl::drain_events() const {
             directory.empty() ? std::filesystem::path(event->name)
                               : directory / event->name;
 
+        if (m_excluded.contains(m_root / relative)) {
+          continue;
+        }
         // Every record names something whose own identity moved.
         files.insert(relative);
 
@@ -517,8 +532,9 @@ void RealDirectoryTree::Impl::notify_subscribers(
 }
 
 RealDirectoryTree::RealDirectoryTree(const std::filesystem::path& root,
-                                     IoContext& io)
-    : m_impl(std::make_unique<Impl>(root, io)) {}
+                                     IoContext& io,
+                                     BuildPaths excluded)
+    : m_impl(std::make_unique<Impl>(root, io, std::move(excluded))) {}
 
 RealDirectoryTree::~RealDirectoryTree() = default;
 

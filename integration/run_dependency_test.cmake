@@ -18,7 +18,14 @@
 #                     that every output gets built without anything opening it
 
 set(SRC "${WORK_DIR}/src")
-set(BUILD_DIR "${WORK_DIR}/out")
+if(BUILD_ALL)
+  set(BUILD_ARG ".")
+elseif(JOBS_AFTER_MOUNTPOINT)
+  set(BUILD_ARG "nested/out")
+else()
+  set(BUILD_ARG "../out")
+endif()
+get_filename_component(BUILD_DIR "${BUILD_ARG}" ABSOLUTE BASE_DIR "${SRC}")
 set(MNT "${BUILD_DIR}/mount")
 
 # How long any one read may take before it counts as a hang.
@@ -27,6 +34,15 @@ set(READ_TIMEOUT 60)
 file(REMOVE_RECURSE "${WORK_DIR}")
 file(MAKE_DIRECTORY "${SRC}")
 file(COPY "${FIXTURE_DIR}/" DESTINATION "${SRC}")
+if(JOBS_AFTER_MOUNTPOINT)
+  file(MAKE_DIRECTORY "${SRC}/temp")
+  if(WIN32)
+    set(ENV{TMP} "${SRC}/temp")
+    set(ENV{TEMP} "${SRC}/temp")
+  else()
+    set(ENV{TMPDIR} "${SRC}/temp")
+  endif()
+endif()
 # Exceed the previous 64-parked-open limit with real traced child commands.
 foreach(link RANGE 1 79)
   math(EXPR next "${link} + 1")
@@ -35,15 +51,26 @@ foreach(link RANGE 1 79)
 endforeach()
 file(APPEND "${SRC}/build.makebelieve" "\n@/deep80.txt = capture cmake -E cat leaf.txt\n")
 
+# Each ordinary path names an existing file. Opening either through a command
+# (including its child cmake process) must fail, even with a warm output.
+file(APPEND "${SRC}/build.makebelieve"
+  "@/raw-mount = run cmake -E copy \"${BUILD_ARG}/mount/chain1.txt\" %out\n"
+  "@/raw-cache = run cmake -E copy \"${BUILD_DIR}/.makebelieve/CACHEDIR.TAG\" %out\n"
+  "@/raw-write = capture cmake -E touch \"${BUILD_DIR}/.makebelieve/forbidden-write\"\n")
+if(BUILD_ALL OR JOBS_AFTER_MOUNTPOINT)
+  file(APPEND "${SRC}/build.makebelieve"
+    "@/raw-copy = copy ${BUILD_ARG}/mount/chain1.txt\n")
+endif()
+
 file(READ "${SRC}/leaf.txt" LEAF)
 file(READ "${SRC}/shared-leaf.txt" SHARED_LEAF)
 
 # Launched as the main integration test launches it; see the notes there.
 if(WIN32)
   if(JOBS_AFTER_MOUNTPOINT)
-    set(mount_arguments "'mount','${BUILD_DIR}','-j','1'")
+    set(mount_arguments "'mount','${BUILD_ARG}','-j','1'")
   else()
-    set(mount_arguments "'mount','-j','1','${BUILD_DIR}'")
+    set(mount_arguments "'mount','-j','1','${BUILD_ARG}'")
   endif()
   if(BUILD_ALL)
     string(APPEND mount_arguments ",'--build=all'")
@@ -53,9 +80,9 @@ if(WIN32)
     "$ErrorActionPreference='Stop'; Start-Process -FilePath '${MAKEBELIEVE_EXE}' -ArgumentList ${mount_arguments} -WorkingDirectory '${SRC}' -WindowStyle Hidden")
 else()
   if(JOBS_AFTER_MOUNTPOINT)
-    set(mount_arguments "mount \"${BUILD_DIR}\" -j 1")
+    set(mount_arguments "mount \"${BUILD_ARG}\" -j 1")
   else()
-    set(mount_arguments "mount -j 1 \"${BUILD_DIR}\"")
+    set(mount_arguments "mount -j 1 \"${BUILD_ARG}\"")
   endif()
   if(BUILD_ALL)
     string(APPEND mount_arguments " --build=all")
@@ -145,6 +172,22 @@ if(MOUNTED)
     list(APPEND FAILURES "80-command dependency chain failed")
   endif()
 
+  set(forbidden_outputs raw-cache raw-mount raw-write)
+  if(BUILD_ALL OR JOBS_AFTER_MOUNTPOINT)
+    list(APPEND forbidden_outputs raw-copy)
+  endif()
+  foreach(output IN LISTS forbidden_outputs)
+    execute_process(COMMAND "${CMAKE_COMMAND}" -E copy "${MNT}/${output}" "${WORK_DIR}/forbidden-output"
+                    RESULT_VARIABLE rc OUTPUT_QUIET ERROR_QUIET TIMEOUT 10)
+    if(NOT rc MATCHES "^[1-9][0-9]*$")
+      list(APPEND FAILURES "reading ${output} should fail promptly (got ${rc})")
+    endif()
+  endforeach()
+
+  if(EXISTS "${BUILD_DIR}/.makebelieve/forbidden-write")
+    list(APPEND FAILURES "a command wrote into the cache")
+  endif()
+
   # The fan-in, opened at once: execute_process runs its commands side by
   # side, as a pipeline. Each copies its output to a file rather than printing
   # it, so no stage writes into a pipe a later stage may already have closed.
@@ -197,7 +240,8 @@ if(MOUNTED)
   endforeach()
 endif()
 
-execute_process(COMMAND "${MAKEBELIEVE_EXE}" unmount "${BUILD_DIR}"
+execute_process(COMMAND "${MAKEBELIEVE_EXE}" unmount "${BUILD_ARG}"
+                WORKING_DIRECTORY "${SRC}"
                 RESULT_VARIABLE unmount_result OUTPUT_QUIET ERROR_QUIET
                 TIMEOUT ${READ_TIMEOUT})
 if(NOT unmount_result EQUAL 0)

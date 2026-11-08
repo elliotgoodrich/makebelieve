@@ -590,6 +590,49 @@ class ChangeLog {
   }
 };
 
+TEST_F(RealDirectoryTree, ExcludesOnlyTheMountAndCache) {
+  const auto base = std::filesystem::canonical(root()) / "sub";
+  makebelieve::BuildPaths excluded{.mount = base / "mount",
+                                   .cache = base / ".makebelieve"};
+  std::filesystem::create_directory(excluded.cache);
+  const makebelieve::RealDirectoryTree source(root(), io(), excluded);
+  ChangeLog log;
+  const auto subscription = source.subscribe_to_changes(log.callback());
+  std::filesystem::create_directory(excluded.mount);
+  write_file(excluded.mount / "output", "built");
+  write_file(excluded.cache / "object", "cached");
+  write_file(base / "mount-other", "source");
+  ASSERT_TRUE(log.wait_for_entry("sub/mount-other"));
+  EXPECT_FALSE(log.has([](const auto& diff) {
+    return diff.everything_dirty ||
+           std::ranges::any_of(diff.entries_changed, [](const auto& path) {
+             return makebelieve::BuildPaths::within(path, "sub/mount") ||
+                    makebelieve::BuildPaths::within(path, "sub/.makebelieve");
+           });
+  }));
+  EXPECT_FALSE(source.status("sub/mount/output"));
+  EXPECT_FALSE(read_whole(source, "sub/.makebelieve/object"));
+  const auto entries = source.ls("sub");
+  ASSERT_TRUE(entries);
+  EXPECT_EQ(sorted_names(*entries),
+            (std::vector<std::string>{"deeper", "mount-other", "nested.txt"}));
+}
+
+TEST_F(RealDirectoryTree, WatchesNewSourceDirectoriesAlongsideTheMount) {
+  const auto base = std::filesystem::canonical(root()) / "sub";
+  makebelieve::RealDirectoryTree source(
+      root(), io(), {.mount = base / "mount", .cache = base / ".makebelieve"});
+  ChangeLog log;
+  const auto subscription = source.subscribe_to_changes(log.callback());
+  std::filesystem::create_directory(base / "inputs");
+  ASSERT_TRUE(log.wait_for_entry("sub/inputs"));
+  write_file(base / "inputs" / "one", "first");
+  ASSERT_TRUE(log.wait_for([](const auto& diff) {
+    return std::ranges::contains(diff.entries_changed,
+                                 std::filesystem::path("sub/inputs/one"));
+  }));
+}
+
 // Made the moment the subscription is in place, with no retry: the watch has
 // to be armed before subscribe_to_changes returns.
 TEST_F(RealDirectoryTree, ReportsAChangeMadeRightAfterSubscribing) {

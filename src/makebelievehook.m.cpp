@@ -38,6 +38,7 @@
 
 #include <detours.h>
 
+#include "buildpaths.hpp"
 #include "scopeguard.hpp"
 #include "stringutil.hpp"
 #include "tracestatus.hpp"
@@ -70,6 +71,7 @@ HANDLE g_failed = nullptr;
 
 // What a process that cannot be traced exits with: the status the loader gives
 // a process whose DLL failed to initialize.
+constexpr NTSTATUS k_access_denied = static_cast<NTSTATUS>(0xC0000022L);
 constexpr UINT k_untraceable_exit = 0xC0000142;  // STATUS_DLL_INIT_FAILED
 
 // Whether the detours were applied in this process, and so must be removed.
@@ -79,17 +81,15 @@ bool g_attached = false;
 // process it starts is given in turn.
 std::wstring g_log_path;
 std::wstring g_root;
+BuildPaths g_excluded;
 std::wstring g_status_name;
 std::wstring g_test_failure;
 
 std::wstring g_root_prefix_lower;  // lowercased, with a trailing separator
 std::string g_hook_dll_utf8;       // as Detours wants it
 
-// Set while this thread is inside record_if_interesting, so the file opens our
-// own bookkeeping does (writing the log, and GetFinalPathNameByHandleW's own
-// resolution) re-enter the Nt hooks without being recorded. The command's real
-// open is never suppressed: the hooks always call the true Nt* function first,
-// and only the recording that follows is guarded.
+// Resolving names and appending to the trace log can open files themselves.
+// Bypass the hooks only while this thread is doing that bookkeeping.
 thread_local bool g_recording = false;
 
 // The ntdll entry points we patch, resolved by name at attach time. Detours
@@ -172,7 +172,9 @@ void append_log_line(std::wstring_view path) {
 /// GENERIC_READ onto the specific FILE_GENERIC_READ rights before NtCreateFile,
 /// so the generic bit is usually gone by here. GENERIC_READ is checked too, for
 /// a caller that hands it straight to NtCreateFile.
-void record_if_interesting(ACCESS_MASK desired_access, HANDLE handle) {
+void record_if_interesting(ACCESS_MASK desired_access,
+                           HANDLE handle,
+                           std::wstring_view resolved) {
   if (handle == nullptr || handle == INVALID_HANDLE_VALUE ||
       (desired_access & (FILE_READ_DATA | GENERIC_READ)) == 0 ||
       g_root_prefix_lower.empty()) {
@@ -185,24 +187,6 @@ void record_if_interesting(ACCESS_MASK desired_access, HANDLE handle) {
     return;
   }
 
-  wchar_t full[32768];
-  const DWORD full_len = ::GetFinalPathNameByHandleW(
-      handle, full, static_cast<DWORD>(std::size(full)),
-      FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-  if (full_len == 0 || full_len >= std::size(full)) {
-    return;
-  }
-
-  std::wstring_view resolved(full, full_len);
-  // GetFinalPathNameByHandleW returns an extended-length ("\\?\") path; strip
-  // that prefix so the report and the root check use ordinary DOS paths. A UNC
-  // result ("\\?\UNC\...") keeps its remainder and simply won't match a
-  // drive-letter root, which is correct - it is outside it.
-  constexpr std::wstring_view k_extended_prefix = L"\\\\?\\";
-  if (resolved.starts_with(k_extended_prefix)) {
-    resolved.remove_prefix(k_extended_prefix.size());
-  }
-
   const std::wstring lower = to_lower(resolved);
   if (lower.size() <= g_root_prefix_lower.size() ||
       lower.compare(0, g_root_prefix_lower.size(), g_root_prefix_lower) != 0) {
@@ -212,16 +196,66 @@ void record_if_interesting(ACCESS_MASK desired_access, HANDLE handle) {
   append_log_line(resolved);
 }
 
-/// Shared tail of both file hooks: on a successful open, record the file behind
-/// the out-handle. Guarded by g_recording so the recording's own opens do not
-/// re-enter it.
-void maybe_record(NTSTATUS status, PHANDLE file_handle, ACCESS_MASK access) {
-  if (g_recording || !NT_SUCCESS(status) || file_handle == nullptr) {
-    return;
+// Convert DOS-device paths and UNC names to the same form as the protected
+// roots. RootDirectory-relative requests use the directory handle's final name.
+std::filesystem::path dos_path(std::wstring_view name) {
+  if (name.starts_with(L"\\??\\") || name.starts_with(L"\\\\?\\")) {
+    name.remove_prefix(4);
+    if (name.starts_with(L"UNC\\")) {
+      return L"\\\\" + std::wstring(name.substr(4));
+    }
+  }
+  return std::filesystem::path(name);
+}
+
+std::filesystem::path handle_path(HANDLE handle) {
+  wchar_t full[32768];
+  const DWORD size = GetFinalPathNameByHandleW(
+      handle, full, static_cast<DWORD>(std::size(full)),
+      FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+  return size && size < std::size(full) ? dos_path({full, size})
+                                        : std::filesystem::path{};
+}
+
+bool forbidden(POBJECT_ATTRIBUTES attributes, bool may_modify) {
+  if (g_recording || !attributes || !attributes->ObjectName ||
+      g_excluded.cache.empty()) {
+    return false;
   }
   g_recording = true;
-  record_if_interesting(access, *file_handle);
-  g_recording = false;
+  const ScopeGuard reset([] { g_recording = false; });
+  const auto* name = attributes->ObjectName;
+  auto path = dos_path({name->Buffer, name->Length / sizeof(wchar_t)});
+  if (attributes->RootDirectory && path.is_relative()) {
+    path = handle_path(attributes->RootDirectory) / path;
+  }
+  if (g_excluded.contains(path.lexically_normal())) {
+    return true;
+  }
+  // Resolve junctions before an open that can create or truncate. Read-only
+  // opens can check the actual handle before handing it back to the command.
+  return may_modify && path.is_absolute() && g_excluded.contains_resolved(path);
+}
+
+NTSTATUS checked_open(NTSTATUS status,
+                      PHANDLE handle,
+                      ACCESS_MASK access,
+                      PIO_STATUS_BLOCK io) {
+  if (g_recording || !NT_SUCCESS(status) || !handle ||
+      GetFileType(*handle) != FILE_TYPE_DISK) {
+    return status;
+  }
+  g_recording = true;
+  const ScopeGuard reset([] { g_recording = false; });
+  const auto resolved = handle_path(*handle);
+  if (g_excluded.contains(resolved)) {
+    CloseHandle(*handle);
+    *handle = nullptr;
+    io->Information = 0;
+    return io->Status = k_access_denied;
+  }
+  record_if_interesting(access, *handle, resolved.native());
+  return status;
 }
 
 NTSTATUS NTAPI HookedNtCreateFile(PHANDLE file_handle,
@@ -235,12 +269,17 @@ NTSTATUS NTAPI HookedNtCreateFile(PHANDLE file_handle,
                                   ULONG create_options,
                                   PVOID ea_buffer,
                                   ULONG ea_length) {
+  if (forbidden(object_attributes,
+                create_disposition != FILE_OPEN ||
+                    (create_options & FILE_DELETE_ON_CLOSE) != 0)) {
+    io_status_block->Information = 0;
+    return io_status_block->Status = k_access_denied;
+  }
   const NTSTATUS status = TrueNtCreateFile(
       file_handle, desired_access, object_attributes, io_status_block,
       allocation_size, file_attributes, share_access, create_disposition,
       create_options, ea_buffer, ea_length);
-  maybe_record(status, file_handle, desired_access);
-  return status;
+  return checked_open(status, file_handle, desired_access, io_status_block);
 }
 
 NTSTATUS NTAPI HookedNtOpenFile(PHANDLE file_handle,
@@ -249,11 +288,15 @@ NTSTATUS NTAPI HookedNtOpenFile(PHANDLE file_handle,
                                 PIO_STATUS_BLOCK io_status_block,
                                 ULONG share_access,
                                 ULONG open_options) {
+  if (forbidden(object_attributes,
+                (open_options & FILE_DELETE_ON_CLOSE) != 0)) {
+    io_status_block->Information = 0;
+    return io_status_block->Status = k_access_denied;
+  }
   const NTSTATUS status =
       TrueNtOpenFile(file_handle, desired_access, object_attributes,
                      io_status_block, share_access, open_options);
-  maybe_record(status, file_handle, desired_access);
-  return status;
+  return checked_open(status, file_handle, desired_access, io_status_block);
 }
 
 /// Resolves the ntdll file-open stubs we detour by name. GetModuleHandle/
@@ -285,6 +328,8 @@ std::wstring child_environment(LPVOID environment, bool unicode) {
   std::vector<TracingEnvironment::Variable> tracing = {
       {TraceStatus::k_log_var, g_log_path},
       {TraceStatus::k_root_var, g_root},
+      {TraceStatus::k_mount_var, g_excluded.mount.native()},
+      {TraceStatus::k_cache_var, g_excluded.cache.native()},
       {TraceStatus::k_status_var, g_status_name}};
   if (!g_test_failure.empty()) {
     tracing.emplace_back(
@@ -403,6 +448,8 @@ void open_status() {
 // status block; false if anything needed to trace is missing.
 bool read_config(HINSTANCE hinst) {
   g_log_path = environment_variable(TraceStatus::k_log_var);
+  g_excluded.mount = environment_variable(TraceStatus::k_mount_var);
+  g_excluded.cache = environment_variable(TraceStatus::k_cache_var);
   g_root = environment_variable(TraceStatus::k_root_var);
   g_status_name = environment_variable(TraceStatus::k_status_var);
   if (!g_root.empty()) {

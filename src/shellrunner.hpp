@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include "buildpaths.hpp"
 #include "buildprocesstracker.hpp"
 #include "commandrunner.hpp"
 
@@ -58,6 +59,7 @@ exec::task<BuildResult> run_shell_command(
     IoContext& io,
     std::filesystem::path working_directory,
     std::filesystem::path mountpoint,
+    BuildPaths excluded,
     Command command,
     BuildProcessTracker& tracker,
     stdexec::inplace_stop_token stop);
@@ -111,6 +113,7 @@ template <stdexec::scheduler Scheduler>
 class ShellRunner {
   std::filesystem::path m_working_directory;
   std::filesystem::path m_mountpoint;
+  BuildPaths m_excluded;
   IoContext* m_io;
   BuildProcessTracker* m_tracker;
   Scheduler m_scheduler;
@@ -127,9 +130,11 @@ class ShellRunner {
               std::filesystem::path mountpoint,
               IoContext& io,
               BuildProcessTracker& tracker,
-              Scheduler scheduler)
+              Scheduler scheduler,
+              BuildPaths excluded = {})
       : m_working_directory(std::move(working_directory)),
         m_mountpoint(std::move(mountpoint)),
+        m_excluded(std::move(excluded)),
         m_io(&io),
         m_tracker(&tracker),
         m_scheduler(std::move(scheduler)) {}
@@ -142,12 +147,12 @@ class ShellRunner {
     return stdexec::schedule(m_scheduler) |
            stdexec::let_value([io = m_io, tracker = m_tracker,
                                working_directory = m_working_directory,
-                               mountpoint = m_mountpoint,
+                               mountpoint = m_mountpoint, excluded = m_excluded,
                                command = std::move(command)]() mutable {
              return stdexec::read_env(stdexec::get_stop_token) |
                     stdexec::let_value([&](stdexec::inplace_stop_token stop) {
                       return detail::run_shell_command(
-                          *io, working_directory, mountpoint,
+                          *io, working_directory, mountpoint, excluded,
                           std::move(command), *tracker, stop);
                     });
            });

@@ -119,7 +119,12 @@ EntryInfo make_info(DWORD attributes,
 // Directories land in entries_changed alongside files. The notification
 // carries no way to tell them apart, and stat-ing each one to find out
 // would cost a round trip per change.
-DirectoryTreeDiff parse_changes(const std::byte* buffer, DWORD bytes) {
+DirectoryTreeDiff parse_changes(const std::byte* buffer,
+                                DWORD bytes,
+                                const std::filesystem::path& root,
+                                const BuildPaths& excluded,
+                                const std::filesystem::path& relative,
+                                std::set<std::filesystem::path>* renamed) {
   // Ordered sets: one directory gaining a thousand entries has to collapse
   // to a single child_lists_changed entry, and sorted output is what
   // makes each list cheap to merge against state a subscriber already holds.
@@ -133,13 +138,24 @@ DirectoryTreeDiff parse_changes(const std::byte* buffer, DWORD bytes) {
         reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buffer + offset);
     const std::wstring_view name(record->FileName,
                                  record->FileNameLength / sizeof(WCHAR));
-    const auto it = files.emplace(name).first;
+    const auto path = relative / name;
+    if (excluded.contains(root / path)) {
+      if (record->NextEntryOffset == 0) {
+        break;
+      }
+      offset += record->NextEntryOffset;
+      continue;
+    }
+    const auto it = files.emplace(path).first;
 
     switch (record->Action) {
       case FILE_ACTION_ADDED:
       case FILE_ACTION_REMOVED:
       case FILE_ACTION_RENAMED_OLD_NAME:
       case FILE_ACTION_RENAMED_NEW_NAME:
+        if (renamed) {
+          renamed->insert(path);
+        }
         // parent_path() of a root-level entry is the empty path, which is
         // exactly how the interface spells the tree root.
         directories.emplace(it->parent_path());
@@ -167,10 +183,50 @@ DirectoryTreeDiff parse_changes(const std::byte* buffer, DWORD bytes) {
   return diff;
 }
 
+// ReadDirectoryChangesW cannot exclude a subtree. Each ancestor of an
+// exclusion gets a shallow watch. Its other children each get one recursive
+// watch, so a disjoint build directory still needs just one watch in total.
+struct DirectoryWatch {
+  std::filesystem::path relative;
+  bool recursive = false;
+  HANDLE directory = INVALID_HANDLE_VALUE;
+  HANDLE event = nullptr;
+  OVERLAPPED overlapped{};
+  std::vector<std::byte> buffer;
+  bool pending = false;
+  stdexec::counting_scope waiting;
+
+  ~DirectoryWatch() {
+    if (pending) {
+      DWORD bytes;
+      CancelIoEx(directory, &overlapped);
+      GetOverlappedResult(directory, &overlapped, &bytes, TRUE);
+    }
+    if (directory != INVALID_HANDLE_VALUE) {
+      CloseHandle(directory);
+    }
+    if (event) {
+      CloseHandle(event);
+    }
+  }
+
+  bool issue_read() {
+    ResetEvent(event);
+    overlapped = {};
+    overlapped.hEvent = event;
+    pending = ReadDirectoryChangesW(directory, buffer.data(),
+                                    static_cast<DWORD>(buffer.size()),
+                                    recursive, k_watch_filter, nullptr,
+                                    &overlapped, nullptr) != 0;
+    return pending;
+  }
+};
+
 }  // namespace
 
 class RealDirectoryTree::Impl {
   std::filesystem::path m_root;
+  BuildPaths m_excluded;
   IoContext& m_io;
 
   // Everything below is mutable because the whole interface is const: these
@@ -188,44 +244,24 @@ class RealDirectoryTree::Impl {
   // Taken before m_mutex.
   mutable std::recursive_mutex m_notifying;
 
-  // The root, opened with FILE_FLAG_OVERLAPPED, and the one
-  // ReadDirectoryChangesW read kept outstanding on it: its buffer - on the
-  // heap, as overlapped use requires, and DWORD-aligned by coming from the
-  // allocator - and the manual-reset event it signals. Created lazily by
-  // start_watcher(), then touched only on the context's thread (which issues
-  // every read, so none is cancelled by the thread that issued it exiting)
-  // until the destructor.
-  mutable HANDLE m_directory = INVALID_HANDLE_VALUE;
-  mutable HANDLE m_change_event = nullptr;
-  mutable OVERLAPPED m_overlapped{};
-  mutable std::vector<std::byte> m_buffer;
-  mutable bool m_read_pending = false;
-
-  // The wait on m_change_event, stopped and joined on destruction.
-  mutable stdexec::counting_scope m_watching;
+  // Changed only on the IoContext thread. A removed directory's event and
+  // buffer outlive its last callback, even if its name is immediately reused.
+  mutable std::map<std::filesystem::path, std::shared_ptr<DirectoryWatch>>
+      m_watches;
+  mutable stdexec::counting_scope m_retiring;
   mutable bool m_watching_started = false;
 
  public:
-  Impl(const std::filesystem::path& root, IoContext& io)
-      : m_root(std::filesystem::weakly_canonical(root)), m_io(io) {}
+  Impl(const std::filesystem::path& root, IoContext& io, BuildPaths excluded)
+      : m_root(std::filesystem::weakly_canonical(root)),
+        m_excluded(std::move(excluded)),
+        m_io(io) {}
 
   ~Impl() {
     if (m_watching_started) {
-      m_watching.request_stop();
-      stdexec::sync_wait(m_watching.join());
-    }
-    if (m_read_pending) {
-      // The kernel may yet write into m_buffer, so cancel the read and block
-      // until the cancellation is acknowledged before releasing it.
-      DWORD bytes = 0;
-      CancelIoEx(m_directory, &m_overlapped);
-      GetOverlappedResult(m_directory, &m_overlapped, &bytes, TRUE);
-    }
-    if (m_directory != INVALID_HANDLE_VALUE) {
-      CloseHandle(m_directory);
-    }
-    if (m_change_event != nullptr) {
-      CloseHandle(m_change_event);
+      stdexec::sync_wait(stdexec::schedule(m_io.get_scheduler()) |
+                         stdexec::then([this] { retire_watches({}); }));
+      stdexec::sync_wait(m_retiring.join());
     }
   }
 
@@ -258,13 +294,10 @@ class RealDirectoryTree::Impl {
   // m_mutex held.
   void start_watcher() const;
 
-  // Issues the next read into m_buffer, returning whether it is outstanding.
-  // On the context's thread.
-  bool issue_read() const noexcept;
-
-  // Turns the read that just completed into a diff for the subscribers and
-  // issues the next. On the context's thread.
-  void on_change() const;
+  void add_watch(const std::filesystem::path& relative) const;
+  void watch_children(const DirectoryWatch& parent) const;
+  void retire_watches(const std::filesystem::path& relative) const;
+  void on_change(DirectoryWatch& watch) const;
 
   // Invokes every registered callback with `diff`. Takes a copy of the
   // callback list so that a callback which unsubscribes cannot deadlock
@@ -292,7 +325,11 @@ std::optional<std::filesystem::path> RealDirectoryTree::Impl::resolve(
     return std::nullopt;
   }
 
-  return m_root / normal;
+  const auto resolved = m_root / normal;
+  if (m_excluded.contains_resolved(resolved)) {
+    return std::nullopt;
+  }
+  return resolved;
 }
 
 std::expected<EntryInfo, std::error_code> RealDirectoryTree::Impl::status(
@@ -344,7 +381,10 @@ RealDirectoryTree::Impl::ls(const std::filesystem::path& path) const {
   std::vector<TreeEntry> entries;
   do {
     const std::wstring_view name = data.cFileName;
-    if (name == L"." || name == L"..") {
+    if (name == L"." || name == L".." ||
+        m_excluded.contains(*resolved / name) ||
+        ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+         m_excluded.contains_resolved(*resolved / name))) {
       continue;
     }
     entries.emplace_back(std::filesystem::path(name),
@@ -452,90 +492,144 @@ Subscription RealDirectoryTree::Impl::subscribe_to_changes(
 }
 
 void RealDirectoryTree::Impl::start_watcher() const {
-  // Manual reset, so a change that lands before the wait on it starts is not
-  // missed; issue_read() resets it for each read.
-  m_change_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  if (m_change_event == nullptr) {
+  m_watching_started = true;
+  stdexec::sync_wait(stdexec::schedule(m_io.get_scheduler()) |
+                     stdexec::then([this] { add_watch({}); }));
+}
+
+void RealDirectoryTree::Impl::add_watch(
+    const std::filesystem::path& relative) const {
+  const auto path = relative.empty() ? m_root : m_root / relative;
+  if (m_excluded.contains(path) || m_watches.contains(relative)) {
+    return;
+  }
+  const DWORD attributes = GetFileAttributesW(path.c_str());
+  if (!relative.empty() && (attributes == INVALID_FILE_ATTRIBUTES ||
+                            !(attributes & FILE_ATTRIBUTE_DIRECTORY) ||
+                            (attributes & FILE_ATTRIBUTE_REPARSE_POINT))) {
+    return;
+  }
+  auto watch = std::make_shared<DirectoryWatch>();
+  watch->relative = relative;
+  watch->recursive = !BuildPaths::within(m_excluded.mount, path) &&
+                     !BuildPaths::within(m_excluded.cache, path) &&
+                     !BuildPaths::within(m_excluded.scratch, path);
+  watch->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!watch->event) {
     throw_last_error("CreateEventW");
   }
-
-  // FILE_LIST_DIRECTORY is the access right ReadDirectoryChangesW needs;
-  // BACKUP_SEMANTICS is what allows a directory handle at all.
-  m_directory =
-      CreateFileW(m_root.c_str(), FILE_LIST_DIRECTORY,
+  watch->directory =
+      CreateFileW(path.c_str(), FILE_LIST_DIRECTORY,
                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                   nullptr, OPEN_EXISTING,
                   FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
-  if (m_directory == INVALID_HANDLE_VALUE) {
-    throw_last_error("CreateFileW (watch root)");
+  if (watch->directory == INVALID_HANDLE_VALUE) {
+    if (!relative.empty() && (GetLastError() == ERROR_FILE_NOT_FOUND ||
+                              GetLastError() == ERROR_PATH_NOT_FOUND)) {
+      return;
+    }
+    throw_last_error("CreateFileW (watch directory)");
   }
-
-  m_buffer.resize(k_watch_buffer_bytes);
-
-  // Issued, on the context's thread, before this returns, so a change made
-  // once the subscription is in place is caught.
-  const std::optional issued = stdexec::sync_wait(
-      stdexec::schedule(m_io.get_scheduler()) |
-      stdexec::then([this]() noexcept { return issue_read(); }));
-  if (!issued.has_value() || !std::get<0>(*issued)) {
+  watch->buffer.resize(k_watch_buffer_bytes);
+  if (!watch->issue_read()) {
     throw_last_error("ReadDirectoryChangesW");
   }
-
+  m_watches.emplace(relative, watch);
   m_io.spawn_watch(
-      m_change_event, m_watching,
-      [this]() noexcept {
-        // Best-effort: a change dropped for want of memory is lost, as one
-        // the buffer overflows on is.
+      watch->event, watch->waiting,
+      [this, watch]() noexcept {
         try {
-          on_change();
-        } catch (...) {  // NOLINT(bugprone-empty-catch)
+          on_change(*watch);
+        } catch (const std::exception& error) {
+          m_io.report_watch_failure();
+          std::println(stderr, "makebelieve: watching the source directory: {}",
+                       error.what());
         }
       },
       [](std::error_code error) noexcept {
-        // Best-effort, as this runs on the IoContext's thread.
-        try {
-          std::println(stderr,
-                       "makebelieve: stopped watching the source directory: {}",
-                       error.message());
-        } catch (...) {  // NOLINT(bugprone-empty-catch)
-        }
+        std::println(stderr,
+                     "makebelieve: stopped watching the source directory: {}",
+                     error.message());
       });
-  m_watching_started = true;
+  if (!watch->recursive) {
+    watch_children(*watch);
+  }
 }
 
-bool RealDirectoryTree::Impl::issue_read() const noexcept {
-  ResetEvent(m_change_event);
-  m_overlapped = OVERLAPPED{};
-  m_overlapped.hEvent = m_change_event;
-  m_read_pending = ReadDirectoryChangesW(m_directory, m_buffer.data(),
-                                         static_cast<DWORD>(m_buffer.size()),
-                                         TRUE, k_watch_filter, nullptr,
-                                         &m_overlapped, nullptr) != 0;
-  return m_read_pending;
+void RealDirectoryTree::Impl::watch_children(
+    const DirectoryWatch& parent) const {
+  for (const auto& child :
+       std::filesystem::directory_iterator(m_root / parent.relative)) {
+    add_watch(parent.relative / child.path().filename());
+  }
 }
 
-void RealDirectoryTree::Impl::on_change() const {
+void RealDirectoryTree::Impl::retire_watches(
+    const std::filesystem::path& relative) const {
+  for (auto it = m_watches.begin(); it != m_watches.end();) {
+    if (!relative.empty() && !BuildPaths::within(it->first, relative)) {
+      ++it;
+      continue;
+    }
+    auto watch = it->second;
+    it = m_watches.erase(it);
+    watch->waiting.request_stop();
+    stdexec::spawn(
+        stdexec::write_env(
+            watch->waiting.join(),
+            stdexec::prop{stdexec::get_start_scheduler, m_io.get_scheduler()}) |
+            stdexec::then([watch]() noexcept {}),
+        m_retiring.get_token());
+  }
+}
+
+void RealDirectoryTree::Impl::on_change(DirectoryWatch& watch) const {
   DWORD bytes = 0;
-  m_read_pending = false;
-  if (!GetOverlappedResult(m_directory, &m_overlapped, &bytes, FALSE)) {
-    // The watch has failed for good. Leave the event unsignalled so the wait
-    // on it stays quiet until the destructor stops it.
-    ResetEvent(m_change_event);
+  watch.pending = false;
+  if (!GetOverlappedResult(watch.directory, &watch.overlapped, &bytes, FALSE)) {
+    ResetEvent(watch.event);
     return;
   }
-
-  // bytes == 0 means the buffer overflowed and the kernel discarded the
-  // records. The changes still happened but their identities are gone, so
-  // there is nothing to hand over but the blanket signal.
-  const DirectoryTreeDiff diff =
-      bytes == 0 ? DirectoryTreeDiff{.everything_dirty = true}
-                 : parse_changes(m_buffer.data(), bytes);
-
-  // The next read goes out before anyone hears of this one, so nothing that
-  // changes while they react is missed. A read that will not issue leaves the
-  // event reset, quietening the wait as above.
-  issue_read();
-  notify_subscribers(diff);
+  std::set<std::filesystem::path> renamed;
+  DirectoryTreeDiff diff =
+      bytes == 0
+          ? DirectoryTreeDiff{.everything_dirty = true}
+          : parse_changes(watch.buffer.data(), bytes, m_root, m_excluded,
+                          watch.relative, watch.recursive ? nullptr : &renamed);
+  if (!watch.issue_read()) {
+    throw_last_error("ReadDirectoryChangesW");
+  }
+  if (!watch.recursive && diff.everything_dirty) {
+    // The names that changed were lost. Re-open children so a replacement at
+    // the same name gets a watch on the new directory.
+    std::vector<std::filesystem::path> children;
+    for (const auto& [name, child] : m_watches) {
+      if (!name.empty() && name.parent_path() == watch.relative) {
+        children.push_back(name);
+      }
+    }
+    for (const auto& child : children) {
+      retire_watches(child);
+    }
+    watch_children(watch);
+  } else {
+    bool changed_subtree = false;
+    for (const auto& path : renamed) {
+      changed_subtree |= m_watches.contains(path);
+      retire_watches(path);
+      add_watch(path);
+      changed_subtree |= m_watches.contains(path);
+    }
+    // Files may have changed before a newly attached directory's watch was
+    // armed, or a directory full of previously tracked inputs may have gone.
+    if (changed_subtree) {
+      diff = DirectoryTreeDiff{.everything_dirty = true};
+    }
+  }
+  if (diff.everything_dirty || !diff.entries_changed.empty() ||
+      !diff.child_lists_changed.empty()) {
+    notify_subscribers(diff);
+  }
 }
 
 void RealDirectoryTree::Impl::notify_subscribers(
@@ -553,8 +647,9 @@ void RealDirectoryTree::Impl::notify_subscribers(
 }
 
 RealDirectoryTree::RealDirectoryTree(const std::filesystem::path& root,
-                                     IoContext& io)
-    : m_impl(std::make_unique<Impl>(root, io)) {}
+                                     IoContext& io,
+                                     BuildPaths excluded)
+    : m_impl(std::make_unique<Impl>(root, io, std::move(excluded))) {}
 
 RealDirectoryTree::~RealDirectoryTree() = default;
 

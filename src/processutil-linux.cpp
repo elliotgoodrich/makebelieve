@@ -224,6 +224,7 @@ class Tracer {
   // Set when a request could not be handled, which may have lost a read.
   std::atomic<bool> m_failed = false;
   UniqueFd m_root;
+  BuildPaths m_excluded;
   std::unordered_map<fuse_ino_t, Inode> m_inodes;
   std::map<std::pair<dev_t, ino_t>, fuse_ino_t> m_by_dev_ino;
   fuse_ino_t m_next_ino = FUSE_ROOT_ID + 1;
@@ -240,7 +241,10 @@ class Tracer {
 
  public:
   // @pre @a root_fd is open on @a root.
-  Tracer(int root_fd, const std::filesystem::path& root) : m_root(root_fd) {
+  Tracer(int root_fd,
+         const std::filesystem::path& root,
+         const BuildPaths& excluded)
+      : m_root(root_fd), m_excluded(excluded) {
     struct stat st {};
     ::fstat(root_fd, &st);
     m_inodes.try_emplace(FUSE_ROOT_ID, ".", root, st.st_dev, st.st_ino);
@@ -267,6 +271,10 @@ class Tracer {
     const std::filesystem::path child = parent == FUSE_ROOT_ID
                                             ? std::filesystem::path(name)
                                             : p->relative / name;
+    if (m_excluded.contains(p->real_path / name)) {
+      fuse_reply_err(req, EACCES);
+      return;
+    }
     const UniqueFd fd = open_beneath(m_root.get(), child, O_PATH);
     if (!fd) {
       fuse_reply_err(req, errno);
@@ -660,6 +668,7 @@ int shell_status(int status) noexcept {
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
 [[noreturn]] void run_traced_child(const std::filesystem::path& cwd,
                                    const std::string& command,
+                                   const BuildPaths& excluded,
                                    int stdout_fd,
                                    int stderr_fd,
                                    std::string_view uid_map,
@@ -705,6 +714,16 @@ int shell_status(int status) noexcept {
       ::mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC,
               nullptr) != 0) {
     fail(errno);
+  }
+
+  // The source passthrough refuses these paths itself. Mask them in the
+  // command's namespace too, for paths outside that passthrough.
+  for (const auto* path : {&excluded.mount, &excluded.cache}) {
+    if (!path->empty() && ::mount("tmpfs", path->c_str(), "tmpfs",
+                                  MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                                  "size=4k,mode=000") != 0) {
+      fail(errno);
+    }
   }
 
   // Opened fresh, in the new namespaces - a pre-fork-opened /dev/fuse fd
@@ -985,8 +1004,11 @@ class TracingSession {
   // ProcessUtilTestUtil's tracing_service, due at the first request.
   std::optional<std::error_code> m_forced_error;
 
-  TracingSession(int root_fd, const std::filesystem::path& root, int descriptor)
-      : m_tracer(root_fd, root), m_descriptor(descriptor) {}
+  TracingSession(int root_fd,
+                 const std::filesystem::path& root,
+                 int descriptor,
+                 const BuildPaths& excluded)
+      : m_tracer(root_fd, root, excluded), m_descriptor(descriptor) {}
 
   // Whether a session has more requests to come.
   enum class Serving : bool { more, ended };
@@ -1026,7 +1048,8 @@ class TracingSession {
   // why it cannot.
   static std::expected<std::unique_ptr<TracingSession>, std::error_code> open(
       const std::filesystem::path& root,
-      UniqueFd fuse_fd) {
+      UniqueFd fuse_fd,
+      const BuildPaths& excluded) {
     // The parent's own passthrough root, resolved in the parent's namespace
     // and so unaffected by the child's private mount.
     const int root_fd = ::open(root.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
@@ -1034,7 +1057,7 @@ class TracingSession {
       return std::unexpected(last_error_code());
     }
     std::unique_ptr<TracingSession> session(
-        new TracingSession(root_fd, root, fuse_fd.get()));
+        new TracingSession(root_fd, root, fuse_fd.get(), excluded));
 
     session->m_session =
         fuse_session_new(&session->m_args, &k_ops, sizeof(fuse_lowlevel_ops),
@@ -1216,12 +1239,13 @@ class TracingSetup {
   // @a forced_error is set, fails setup with it first. Never returns.
   [[noreturn]] void run_child(const std::filesystem::path& root,
                               const std::string& command,
+                              const BuildPaths& excluded,
                               int stdout_fd,
                               int stderr_fd,
                               int forced_error) {
     m_parent.reset();
-    run_traced_child(root, command, stdout_fd, stderr_fd, m_uid_map, m_gid_map,
-                     m_child.release(), forced_error);
+    run_traced_child(root, command, excluded, stdout_fd, stderr_fd, m_uid_map,
+                     m_gid_map, m_child.release(), forced_error);
   }
 
   // In the parent, once the child is launched: lets go of its end.
@@ -1230,13 +1254,14 @@ class TracingSetup {
   // Serves the device the child handed back as a passthrough onto @a root, or
   // reports why the child could not set up.
   std::expected<std::unique_ptr<TracingSession>, std::error_code> attach(
-      const std::filesystem::path& root) {
+      const std::filesystem::path& root,
+      const BuildPaths& excluded) {
     std::expected<UniqueFd, std::error_code> fuse_fd =
         recv_result(m_parent.get());
     if (!fuse_fd.has_value()) {
       return std::unexpected(fuse_fd.error());
     }
-    return TracingSession::open(root, std::move(*fuse_fd));
+    return TracingSession::open(root, std::move(*fuse_fd), excluded);
   }
 
   // Tells the child the session is ready, so its command may run.
@@ -1258,7 +1283,8 @@ exec::task<ProcessUtil::Result> run_traced(IoContext& io,
                                            BuildProcessTracker& tracker,
                                            std::filesystem::path output,
                                            stdexec::inplace_stop_token stop,
-                                           CaptureLimits limits) {
+                                           CaptureLimits limits,
+                                           BuildPaths excluded) {
   // Close-on-exec, so that only this command gets the write ends - as its
   // stdout and stderr, which dup2() leaves inheritable - and no other launched
   // meanwhile gets any end.
@@ -1305,7 +1331,7 @@ exec::task<ProcessUtil::Result> run_traced(IoContext& io,
   if (pid == 0) {
     out_read.reset();
     err_read.reset();
-    setup->run_child(root, command, out_write.get(), err_write.get(),
+    setup->run_child(root, command, excluded, out_write.get(), err_write.get(),
                      forced_setup_error);
   }
   ChildProcess child(pid, UniqueFd(pidfd));
@@ -1315,7 +1341,7 @@ exec::task<ProcessUtil::Result> run_traced(IoContext& io,
   err_write.reset();
 
   std::expected<std::unique_ptr<TracingSession>, std::error_code> session =
-      setup->attach(root);
+      setup->attach(root, excluded);
   if (!session.has_value()) {
     co_await child.terminate(io);
     co_return std::unexpected(session.error());
@@ -1373,7 +1399,8 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     BuildProcessTracker& tracker,
     std::filesystem::path output,
     stdexec::inplace_stop_token stop,
-    CaptureLimits limits) {
+    CaptureLimits limits,
+    BuildPaths excluded) {
   if (stop.stop_requested()) {
     co_return std::unexpected(
         std::make_error_code(std::errc::operation_canceled));
@@ -1389,7 +1416,8 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     root = working_directory;
   }
   co_return co_await run_traced(io, std::move(root), std::move(command),
-                                tracker, std::move(output), stop, limits);
+                                tracker, std::move(output), stop, limits,
+                                std::move(excluded));
 }
 
 }  // namespace makebelieve

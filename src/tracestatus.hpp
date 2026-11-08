@@ -23,6 +23,10 @@ struct TraceStatus {
   /// each read to.
   static constexpr wchar_t k_log_var[] = L"MAKEBELIEVE_TRACE_LOG";
 
+  /// Absolute directories that traced commands cannot open directly.
+  static constexpr wchar_t k_mount_var[] = L"MAKEBELIEVE_TRACE_MOUNT";
+  static constexpr wchar_t k_cache_var[] = L"MAKEBELIEVE_TRACE_CACHE";
+
   /// The environment variable naming the root whose reads are recorded.
   static constexpr wchar_t k_root_var[] = L"MAKEBELIEVE_TRACE_ROOT";
 

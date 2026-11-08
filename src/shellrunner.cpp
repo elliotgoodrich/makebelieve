@@ -5,6 +5,7 @@
 #include "iocontext.hpp"
 #include "manifest.hpp"
 #include "processutil.hpp"
+#include "tempdirectory.hpp"
 #include "tracer.hpp"
 
 #include <exec/task.hpp>
@@ -14,7 +15,6 @@
 #include <expected>
 #include <filesystem>
 #include <optional>
-#include <random>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -63,54 +63,6 @@ constexpr std::string_view k_word_enders = "\"'<>|;&()";
 
 bool is_space(char c) {
   return c == ' ' || c == '\t' || c == '\r' || c == '\n';
-}
-
-// Removes a directory and everything beneath it on destruction, so a command's
-// scratch space does not outlive the build it was created for.
-class TempDirectory {
-  std::filesystem::path m_path;
-
- public:
-  explicit TempDirectory(std::filesystem::path path)
-      : m_path(std::move(path)) {}
-
-  ~TempDirectory() {
-    std::error_code ec;
-    std::filesystem::remove_all(m_path, ec);
-  }
-
-  TempDirectory(const TempDirectory&) = delete;
-  TempDirectory& operator=(const TempDirectory&) = delete;
-  TempDirectory(TempDirectory&&) = delete;
-  TempDirectory& operator=(TempDirectory&&) = delete;
-
-  [[nodiscard]] const std::filesystem::path& path() const { return m_path; }
-};
-
-// Creates a fresh directory under the system's temporary one, or says why it
-// could not. Only a name that is taken already is retried.
-std::expected<std::filesystem::path, std::error_code> make_temp_directory() {
-  std::error_code ec;
-  const std::filesystem::path base = std::filesystem::temp_directory_path(ec);
-  if (ec) {
-    return std::unexpected(ec);
-  }
-  std::random_device device;
-  std::uniform_int_distribution<unsigned> digit(0, 0xffffffU);
-  constexpr int k_attempts = 100;
-  for (int attempt = 0; attempt < k_attempts; ++attempt) {
-    std::filesystem::path candidate =
-        base / ("makebelieve-build-" + std::to_string(digit(device)));
-    if (std::filesystem::create_directory(candidate, ec)) {
-      return candidate;
-    }
-    // A directory already there is reported as nothing created; a file
-    // there, as file_exists. Anything else will not go away by retrying.
-    if (ec && ec != std::errc::file_exists) {
-      return std::unexpected(ec);
-    }
-  }
-  return std::unexpected(std::make_error_code(std::errc::file_exists));
 }
 
 // Replaces every `%out` in @a command with @a out_path, quoted so paths
@@ -210,7 +162,8 @@ std::expected<std::string, std::error_code> read_file(
 // any that fall outside it.
 std::vector<std::filesystem::path> relativize(
     const std::vector<std::filesystem::path>& inputs,
-    const std::filesystem::path& root) {
+    const std::filesystem::path& root,
+    const std::filesystem::path& scratch) {
   // relative() is lexical, so it only cancels root against an input whose
   // leading components match exactly. Traced inputs are canonicalised and can
   // differ in case from root as given, so canonicalise root to match.
@@ -224,6 +177,9 @@ std::vector<std::filesystem::path> relativize(
   std::vector<std::filesystem::path> result;
   result.reserve(inputs.size());
   for (const std::filesystem::path& input : inputs) {
+    if (BuildPaths::within(input, scratch)) {
+      continue;
+    }
     std::error_code relative_ec;
     const std::filesystem::path relative =
         std::filesystem::relative(input, canonical_root, relative_ec);
@@ -268,6 +224,7 @@ exec::task<BuildResult> detail::run_shell_command(
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): named by the header
     std::filesystem::path working_directory,
     std::filesystem::path mountpoint,
+    BuildPaths excluded,
     Command command,
     BuildProcessTracker& tracker,
     stdexec::inplace_stop_token stop) {
@@ -280,8 +237,14 @@ exec::task<BuildResult> detail::run_shell_command(
   // working directory.
   if (command.action == Manifest::Action::Copy) {
     const std::filesystem::path source = command.text;
-    std::expected<std::string, std::error_code> bytes =
-        read_file(working_directory / source);
+    const auto input = working_directory / source;
+    if (excluded.contains_resolved(input)) {
+      co_return std::unexpected(
+          BuildFailure(std::make_error_code(std::errc::permission_denied), {},
+                       "cannot copy from the build mount or cache; use @/ for "
+                       "generated inputs"));
+    }
+    std::expected<std::string, std::error_code> bytes = read_file(input);
     // The reader sees the output, so the source's own error - that it does
     // not exist, say - would read as being about the output. The source is
     // still its input, so creating or fixing it retries the copy: a tracer
@@ -295,6 +258,8 @@ exec::task<BuildResult> detail::run_shell_command(
     co_return BuildOutput{.bytes = std::move(*bytes), .inputs = {source}};
   }
 
+  const auto scratch_root = excluded.mount.empty() ? std::filesystem::path{}
+                                                   : mountpoint.parent_path();
   const bool capture = command.action == Manifest::Action::Capture;
 
   // A `run` command gets a private file to write its output to - with the
@@ -308,7 +273,7 @@ exec::task<BuildResult> detail::run_shell_command(
   std::filesystem::path out_path;
   if (!capture) {
     std::expected<std::filesystem::path, std::error_code> directory =
-        make_temp_directory();
+        make_temp_directory(scratch_root);
     if (!directory.has_value()) {
       co_return std::unexpected(directory.error());
     }
@@ -326,7 +291,8 @@ exec::task<BuildResult> detail::run_shell_command(
       io, working_directory, text, tracker, command.output, stop,
       CaptureLimits{.standard_output = capture ? CaptureLimits{}.standard_output
                                                : k_kept_diagnostics,
-                    .standard_error = k_kept_diagnostics});
+                    .standard_error = k_kept_diagnostics},
+      excluded);
   if (!result.has_value()) {
     co_return std::unexpected(result.error());
   }
@@ -354,7 +320,7 @@ exec::task<BuildResult> detail::run_shell_command(
   // What it read, whether or not it built anything: a failure is retried when
   // one of these changes, as a success is rebuilt.
   std::vector<std::filesystem::path> inputs =
-      relativize(result->inputs, working_directory);
+      relativize(result->inputs, working_directory, scratch_root);
   const auto fail = [&inputs](std::error_code error,
                               std::string standard_error) {
     return std::unexpected(

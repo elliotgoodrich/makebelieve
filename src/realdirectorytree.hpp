@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include "buildpaths.hpp"
 #include "directorytree.hpp"
 
 #include <cstddef>
@@ -29,8 +30,12 @@ class RealDirectoryTree : public DirectoryTree {
   /// @a io's thread. If @a root does not exist then construction still
   /// succeeds and every query fails with
   /// `std::errc::no_such_file_or_directory`.
+  /// The directories in @a excluded are absent from both the source tree and
+  /// its watches.
   /// @pre @a io outlives this object.
-  RealDirectoryTree(const std::filesystem::path& root, IoContext& io);
+  RealDirectoryTree(const std::filesystem::path& root,
+                    IoContext& io,
+                    BuildPaths excluded = {});
 
   /// @pre Not called from the thread of the `IoContext` it watches through.
   ~RealDirectoryTree() override;

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "virtualfilesystem.hpp"
 
+#include "buildprocesstracker.hpp"
+
 #include "directorytree.hpp"
 #include "filesnapshots.hpp"
 #include "iocontext.hpp"
@@ -381,8 +383,9 @@ class VirtualFileSystem::Impl {
   // down exactly the parts that got started.
   Impl(const DirectoryTree& tree,
        const std::filesystem::path& mountpoint,
-       exec::static_thread_pool::scheduler scheduler)
-      : Impl(tree, mountpoint, scheduler, Unstarted{}) {
+       exec::static_thread_pool::scheduler scheduler,
+       BuildProcessTracker* denied_readers)
+      : Impl(tree, mountpoint, scheduler, denied_readers, Unstarted{}) {
     // WinFsp's DLL lives in its own install directory rather than anywhere the
     // loader searches, so the import library is delay-loaded and this is what
     // resolves it. It has to run before any other WinFsp call, and it is what
@@ -492,8 +495,10 @@ class VirtualFileSystem::Impl {
   Impl(const DirectoryTree& tree,
        const std::filesystem::path& mountpoint,
        exec::static_thread_pool::scheduler scheduler,
+       BuildProcessTracker* denied_readers,
        Unstarted)
       : m_tree(tree),
+        m_denied_readers(denied_readers),
         m_snapshots(tree),
         m_mountpoint(normalize_mountpoint(mountpoint)),
         m_root(m_mountpoint.wstring()),
@@ -800,6 +805,10 @@ class VirtualFileSystem::Impl {
       trace.open(m_reader_lanes, calling_process(caller), path);
     }
     try {
+      if (m_denied_readers && m_denied_readers->find(caller)) {
+        pending->send(STATUS_ACCESS_DENIED);
+        co_return;
+      }
       const stdexec::prop stop{stdexec::get_stop_token,
                                m_request_stop.get_token()};
       auto result = co_await stdexec::write_env(
@@ -1270,6 +1279,7 @@ class VirtualFileSystem::Impl {
   mutable TraceLanePool m_reader_lanes{"reader"};
 
   const DirectoryTree& m_tree;
+  BuildProcessTracker* m_denied_readers;
   // What every open to read reads from: the version of its file it opened,
   // which a later change to the file leaves alone.
   FileSnapshots m_snapshots;
@@ -1329,8 +1339,11 @@ class VirtualFileSystem::Impl {
 VirtualFileSystem::VirtualFileSystem(
     const DirectoryTree& tree,
     const std::filesystem::path& mountpoint,
-    exec::static_thread_pool::scheduler scheduler)
-    : m_impl(std::make_unique<Impl>(tree, mountpoint, scheduler)) {}
+    exec::static_thread_pool::scheduler scheduler,
+    BuildProcessTracker* denied_readers)
+    : m_impl(
+          std::make_unique<Impl>(tree, mountpoint, scheduler, denied_readers)) {
+}
 
 VirtualFileSystem::~VirtualFileSystem() = default;
 

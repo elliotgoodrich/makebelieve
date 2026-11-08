@@ -468,7 +468,8 @@ class TracingSession {
   // for a command run in @a working_directory - or says why it cannot:
   // tracing is required, so any missing fails the run.
   static std::expected<std::unique_ptr<TracingSession>, std::error_code>
-  prepare(const std::filesystem::path& working_directory) {
+  prepare(const std::filesystem::path& working_directory,
+          const BuildPaths& excluded) {
     if (const std::optional<std::error_code> forced =
             detail::take_forced_failure(
                 ProcessUtilTestUtil::Failure::tracing_setup)) {
@@ -510,6 +511,8 @@ class TracingSession {
     std::vector<TracingEnvironment::Variable> variables = {
         {TraceStatus::k_log_var, log_value},
         {TraceStatus::k_root_var, root},
+        {TraceStatus::k_mount_var, excluded.mount.native()},
+        {TraceStatus::k_cache_var, excluded.cache.native()},
         {TraceStatus::k_status_var, status->name()}};
     if (!test_failure.empty()) {
       variables.emplace_back(TraceStatus::k_test_failure_var, test_failure);
@@ -840,14 +843,15 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     BuildProcessTracker& tracker,
     std::filesystem::path output,
     stdexec::inplace_stop_token stop,
-    CaptureLimits limits) {
+    CaptureLimits limits,
+    BuildPaths excluded) {
   if (stop.stop_requested()) {
     co_return std::unexpected(
         std::make_error_code(std::errc::operation_canceled));
   }
 
   std::expected<std::unique_ptr<TracingSession>, std::error_code> tracing =
-      TracingSession::prepare(working_directory);
+      TracingSession::prepare(working_directory, excluded);
   if (!tracing.has_value()) {
     co_return std::unexpected(tracing.error());
   }

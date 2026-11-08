@@ -2,14 +2,15 @@
 #include "buildcache.hpp"
 #include "buildcoordinator.hpp"
 #include "builddirectorytree.hpp"
+#include "buildpaths.hpp"
 #include "buildpermits.hpp"
 #include "buildqueue.hpp"
 #include "consoleinterrupthandler.hpp"
-#include "filesystemutil.hpp"
 #include "iocontext.hpp"
 #include "osbuildprocesstracker.hpp"
 #include "realdirectorytree.hpp"
 #include "shellrunner.hpp"
+#include "tempdirectory.hpp"
 #include "tracer.hpp"
 #include "unmountchannel.hpp"
 #include "virtualfilesystem.hpp"
@@ -167,6 +168,44 @@ std::optional<MountOptions> parse_mount(std::span<char* const> args) {
   return options;
 }
 
+// The dependency mount must be reached by the actual build process, even if
+// TMPDIR is set inside the project. A mount under the Linux source passthrough
+// would be opened by its tracer instead, losing the build's identity.
+std::filesystem::path dependency_directory(
+    [[maybe_unused]] const std::filesystem::path& source) {
+  const auto temp =
+      std::filesystem::canonical(std::filesystem::temp_directory_path());
+#ifdef _WIN32
+  // Windows traces in place. The source watcher excludes the scratch
+  // directory when the user's temporary directory is inside the project.
+  auto directory = make_temp_directory(temp);
+  if (!directory) {
+    throw std::system_error(directory.error(),
+                            "creating the build dependency mount");
+  }
+  return std::move(*directory);
+#else
+  const std::array<std::filesystem::path, 4> candidates{
+      temp, "/tmp", "/var/tmp", source.parent_path()};
+  std::error_code error = std::make_error_code(std::errc::permission_denied);
+  for (const auto& candidate : candidates) {
+    std::error_code ec;
+    const auto base = std::filesystem::canonical(candidate, ec);
+    if (ec || BuildPaths::within(base, source)) {
+      continue;
+    }
+    auto directory = make_temp_directory(base);
+    if (directory) {
+      return std::move(*directory);
+    }
+    error = directory.error();
+  }
+  throw std::system_error(error,
+                          "creating a temporary directory outside the source "
+                          "for generated dependencies");
+#endif
+}
+
 // Serves the manifest's outputs as @a options asks, blocking until torn down.
 int mount(const MountOptions& options) {
   const char* const directory_arg = options.directory;
@@ -195,28 +234,43 @@ int mount(const MountOptions& options) {
   // up, below.
   UnmountChannel unmount_channel;
 
-  const std::filesystem::path source = std::filesystem::current_path();
-  const std::filesystem::path directory =
-      std::filesystem::absolute(directory_arg).lexically_normal();
-
-  // It holds the mount and the cache, whose writes must not reach the source's
-  // change notifications, nor be taken for what a build read.
-  if (!FileSystemUtil::are_disjoint(directory, source)) {
+  const std::filesystem::path source =
+      std::filesystem::canonical(std::filesystem::current_path());
+  const std::filesystem::path directory = std::filesystem::weakly_canonical(
+      std::filesystem::absolute(directory_arg));
+  if (BuildPaths::within(source, directory) &&
+      !BuildPaths::within(directory, source)) {
     std::println(stderr,
-                 "makebelieve: directory [{}] must not be, contain or be "
-                 "inside the source directory [{}], the one makebelieve was "
-                 "started in; serve from somewhere else, such as "
-                 "`makebelieve mount ../output`",
+                 "makebelieve: the build directory [{}] cannot be an ancestor "
+                 "of the source [{}]",
                  directory.string(), source.string());
     return 1;
   }
-  const std::filesystem::path mountpoint = mountpoint_for(directory);
-  const std::filesystem::path cache_directory = cache_directory_for(directory);
+
+  const BuildPaths paths{
+      .mount = std::filesystem::weakly_canonical(mountpoint_for(directory)),
+      .cache =
+          std::filesystem::weakly_canonical(cache_directory_for(directory))};
+  if (paths.contains(source) || BuildPaths::within(paths.mount, paths.cache) ||
+      BuildPaths::within(paths.cache, paths.mount)) {
+    std::println(stderr,
+                 "makebelieve: the mount and cache must be distinct "
+                 "directories and cannot contain the source");
+    return 1;
+  }
+
+  // Commands reach generated inputs through a separate mount of the same
+  // tree. Their ordinary filesystem paths to the published mount and cache
+  // are excluded, even when the build directory is outside the source.
+  const TempDirectory dependencies(dependency_directory(source));
+  const auto dependency_mount = dependencies.path() / "mount";
 
   // Outlives the build tree, which keeps its builds here.
-  BuildCache cache(cache_directory);
+  BuildCache cache(paths.cache);
 
-  const RealDirectoryTree tree(source, io);
+  BuildPaths source_exclusions = paths;
+  source_exclusions.scratch = dependencies.path();
+  const RealDirectoryTree tree(source, io, std::move(source_exclusions));
 
   // Tracks which build each process the runner launches belongs to: the
   // runner adds its commands, and the coordinator looks up who an open comes
@@ -227,8 +281,8 @@ int mount(const MountOptions& options) {
   // Runs each build through the shell. Its working directory is the source
   // root, so the inputs it traces line up with the source's own change
   // notifications.
-  const ShellRunner run(source, mountpoint, io, tracker,
-                        workers.get_scheduler());
+  const ShellRunner run(source, dependency_mount, io, tracker,
+                        workers.get_scheduler(), paths);
 
   // How many builds hold a permit at once: -j, or one per core. A build whose
   // command waits on another output gives its permit back meanwhile, so this
@@ -262,10 +316,13 @@ int mount(const MountOptions& options) {
         }
       });
 
-  const VirtualFileSystem vfs(build_tree, mountpoint, workers.get_scheduler());
+  const VirtualFileSystem dependency_vfs(build_tree, dependency_mount,
+                                         workers.get_scheduler());
+  const VirtualFileSystem vfs(build_tree, paths.mount, workers.get_scheduler(),
+                              &tracker);
 
   // Only after the mount, so the mount root exists to canonicalize.
-  unmount_channel.listen(mountpoint, io);
+  unmount_channel.listen(paths.mount, io);
 
   // Only once the mount is up, as a command may read another output through
   // it the moment its build starts.

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "virtualfilesystem.hpp"
 
+#include "buildprocesstracker.hpp"
+
 #include "directorytree.hpp"
 #include "filesnapshots.hpp"
 #include "filesystemutil.hpp"
@@ -248,6 +250,7 @@ class VirtualFileSystem::Impl {
   mutable TraceLanePool m_reader_lanes{"reader"};
 
   const DirectoryTree& m_tree;
+  BuildProcessTracker* m_denied_readers;
   // What every open reads from: the version of its file it opened, which a
   // later change to the file leaves alone.
   FileSnapshots m_snapshots;
@@ -363,8 +366,9 @@ class VirtualFileSystem::Impl {
 
   Impl(const DirectoryTree& tree,
        const std::filesystem::path& mountpoint,
-       exec::static_thread_pool::scheduler scheduler)
-      : Impl(tree, mountpoint, scheduler, Unstarted{}) {
+       exec::static_thread_pool::scheduler scheduler,
+       BuildProcessTracker* denied_readers)
+      : Impl(tree, mountpoint, scheduler, denied_readers, Unstarted{}) {
     m_args = FUSE_ARGS_INIT(0, nullptr);
     if (fuse_opt_add_arg(&m_args, "makebelieve") != 0) {
       const int error = errno != 0 ? errno : EIO;
@@ -480,11 +484,13 @@ class VirtualFileSystem::Impl {
   Impl(const DirectoryTree& tree,
        const std::filesystem::path& mountpoint,
        exec::static_thread_pool::scheduler scheduler,
+       BuildProcessTracker* denied_readers,
        Unstarted)
       // Absolute, because the notifier reopens paths beneath it for as long
       // as the mount lives, by which time the process's working directory may
       // have moved on from whatever made a relative path meaningful.
       : m_tree(tree),
+        m_denied_readers(denied_readers),
         m_snapshots(tree),
         m_mountpoint(std::filesystem::absolute(mountpoint)),
         m_scheduler(scheduler) {
@@ -815,6 +821,10 @@ class VirtualFileSystem::Impl {
       trace.open(m_reader_lanes, calling_process(caller), name);
     }
     try {
+      if (m_denied_readers && m_denied_readers->find(caller)) {
+        request->reply_error(EACCES);
+        co_return;
+      }
       const stdexec::prop stop{stdexec::get_stop_token,
                                request->stop.get_token()};
       auto opened = co_await stdexec::write_env(
@@ -1353,8 +1363,11 @@ class VirtualFileSystem::Impl {
 VirtualFileSystem::VirtualFileSystem(
     const DirectoryTree& tree,
     const std::filesystem::path& mountpoint,
-    exec::static_thread_pool::scheduler scheduler)
-    : m_impl(std::make_unique<Impl>(tree, mountpoint, scheduler)) {}
+    exec::static_thread_pool::scheduler scheduler,
+    BuildProcessTracker* denied_readers)
+    : m_impl(
+          std::make_unique<Impl>(tree, mountpoint, scheduler, denied_readers)) {
+}
 
 VirtualFileSystem::~VirtualFileSystem() = default;
 

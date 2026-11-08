@@ -213,6 +213,10 @@ class IoContext {
       std::move_only_function<void() noexcept> on_ready,
       std::move_only_function<void(std::error_code) noexcept> on_error);
 
+  /// A watcher that can no longer read changes requests the same shutdown as
+  /// a failed wait for its handle.
+  void report_watch_failure() noexcept { m_watch_failed.request_stop(); }
+
   /// A token whose stop is requested once any watch spawned by `spawn_watch`
   /// has failed, for the program to end on.
   [[nodiscard]] std::stop_token watch_failure_token() const noexcept;

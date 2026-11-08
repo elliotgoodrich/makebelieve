@@ -31,9 +31,9 @@ $ ls ../output/mount
 ```
 
 `makebelieve mount` reads the `build.makebelieve` in the current
-directory and serves the outputs at `../output/mount`. The directory it is
-given must be outside the source directory, so it can't live inside it as
-`./output`. It runs in the foreground until stopped, so run the commands below from
+directory and serves the outputs at `../output/mount`. Use `makebelieve mount .`
+to serve them at `./mount`, or `makebelieve mount out` to serve them at
+`out/mount`. It runs in the foreground until stopped, so run the commands below from
 another terminal (or background it with `&`).
 
 Nothing is built until a file is opened. Opening it runs the

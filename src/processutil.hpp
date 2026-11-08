@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include "buildpaths.hpp"
 #include "buildprocesstracker.hpp"
 
 #include <exec/task.hpp>
@@ -96,10 +97,11 @@ struct ProcessUtil {
                                 BuildProcessTracker& tracker,
                                 std::filesystem::path output,
                                 stdexec::inplace_stop_token stop,
-                                CaptureLimits limits = {}) {
+                                CaptureLimits limits = {},
+                                BuildPaths excluded = {}) {
     return stdexec::write_env(
         run_task(io, std::move(working_directory), std::move(command), tracker,
-                 std::move(output), stop, limits),
+                 std::move(output), stop, limits, std::move(excluded)),
         stdexec::prop{stdexec::get_stop_token, stdexec::never_stop_token{}});
   }
 
@@ -110,7 +112,8 @@ struct ProcessUtil {
                                      BuildProcessTracker& tracker,
                                      std::filesystem::path output,
                                      stdexec::inplace_stop_token stop,
-                                     CaptureLimits limits);
+                                     CaptureLimits limits,
+                                     BuildPaths excluded);
 };
 
 /// @class ProcessUtilTestUtil

@@ -22,8 +22,8 @@ Generated files live in the mounted output namespace and use `@/`:
 Paths without `@/` refer to the normal filesystem.
 
 A command reads another output by naming it with `@/` too. Before the
-command runs, each `@/<path>` in it becomes that output's path through the
-mount, which builds it on the way:
+command runs, each `@/<path>` expands to a path on the running instance's
+temporary dependency mount. Opening the file builds it on demand:
 
 ```mb
 @/paper.pdf = run pandoc @/paper.md -o %out
@@ -32,9 +32,10 @@ mount, which builds it on the way:
 
 Outside quotes the path runs to the next space or shell metacharacter and
 is quoted, so a mountpoint with spaces in it survives the shell; inside
-quotes (`"@/my notes.md"`) it runs to the closing quote. Every output a
-command opens through the mount - named with `@/` or not - becomes one of
-its inputs, so it is rebuilt whenever that output goes out of date.
+quotes (`"@/my notes.md"`) it runs to the closing quote. Each generated file
+read through `@/` becomes a build dependency. Build commands cannot open
+files directly under the published `mount/` or the persistent `.makebelieve/`
+cache.
 
 An output is assigned an action and what that action applies to. With
 `run` the command writes the output itself, to the path `%out` stands
@@ -238,7 +239,10 @@ makebelieve mount <directory>
 
 The outputs are served at `<directory>/mount`, and what has been built is
 kept in the hidden `<directory>/.makebelieve` (see [Resuming](#resuming)).
-`<directory>` must not overlap the source directory.
+Use `makebelieve mount .` beside the manifest to serve outputs at `./mount`,
+or `makebelieve mount out` to serve them at `out/mount`. The source watcher
+ignores the mount and cache. Other files in the build directory remain source
+files when the build directory is inside the source tree.
 
 This runs in the foreground and serves the outputs until stopped, either
 by Ctrl+C or, from another terminal, by:

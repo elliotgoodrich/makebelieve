@@ -9,6 +9,5 @@ nothing.
 
 `makebelieve mount <directory>` reads the manifest from the **current
 directory** and projects the built outputs at `<directory>/mount`, keeping
-them between runs in `<directory>/.makebelieve` (`<directory>` must not overlap the
-source). Outputs are built lazily: a file reads back as a
+them between runs in `<directory>/.makebelieve`. Outputs are built lazily: a file reads back as a
 single null byte until the first real read runs its command.
