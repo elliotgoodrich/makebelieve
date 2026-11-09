@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "buildcoordinator.hpp"
 
-#include "asyncevent.hpp"
-
 #include <stdexec/execution.hpp>
 
 #include <algorithm>
@@ -223,7 +221,69 @@ class BuildCoordinator::Impl::Wait {
   AttemptPtr requester;  // null if from no running attempt
   State state = State::blocked;
   std::error_code result;
-  AsyncEvent completed;
+
+ private:
+  template <class Receiver>
+  struct CompletedOperation {
+    using operation_state_concept = stdexec::operation_state_t;
+    Wait* wait;
+    Receiver receiver;
+    void start() & noexcept {
+      // Once registered, complete() may resume this at any moment, so it is
+      // not touched again unless the wait was already answered.
+      const bool answered = [this] {
+        const std::lock_guard lock(wait->m_signal_mutex);
+        if (!wait->m_signalled) {
+          wait->m_waiter = this;
+          wait->m_resume = [](void* ptr) noexcept {
+            auto* self = static_cast<CompletedOperation*>(ptr);
+            stdexec::set_value(std::move(self->receiver));
+          };
+        }
+        return wait->m_signalled;
+      }();
+      if (answered) {
+        stdexec::set_value(std::move(receiver));
+      }
+    }
+  };
+
+  struct Completed {
+    using sender_concept = stdexec::sender_t;
+    using completion_signatures =
+        stdexec::completion_signatures<stdexec::set_value_t()>;
+    Wait* wait;
+    template <class Receiver>
+    [[nodiscard]] CompletedOperation<Receiver> connect(
+        Receiver receiver) const {
+      return {wait, std::move(receiver)};
+    }
+  };
+
+  std::mutex m_signal_mutex;
+  bool m_signalled = false;
+  void* m_waiter = nullptr;
+  void (*m_resume)(void*) noexcept = nullptr;
+
+ public:
+  // Answers the wait for good, and resumes its coroutine if suspended. Runs on
+  // the calling thread, so the coroutine continues elsewhere (see
+  // m_completions). Repeated calls do not resume it again.
+  void complete() noexcept {
+    const auto [waiter, resume] = [this] {
+      const std::lock_guard lock(m_signal_mutex);
+      m_signalled = true;
+      return std::pair{std::exchange(m_waiter, nullptr), m_resume};
+    }();
+    if (waiter) {
+      resume(waiter);
+    }
+  }
+
+  // A sender completing with no value once complete() has been called. At
+  // most one may be waiting at a time, and this Wait must outlive it. Stop
+  // requests are not observed: cancellation answers the wait via complete().
+  Completed completed() noexcept { return Completed{this}; }
 };
 
 // Completed once an ending attempt has nothing left under way.
@@ -271,7 +331,7 @@ struct BuildCoordinator::Impl::Effects {
       drain->done(drain);
     }
     for (Wait* wait : answered) {
-      wait->completed.set();
+      wait->complete();
     }
   }
 };
@@ -646,7 +706,7 @@ exec::task<std::error_code> BuildCoordinator::Impl::wait(
   // other readers may still need that build.
   const stdexec::inplace_stop_callback<Cancel> cancel(
       stop, Cancel{.owner = this, .wait = &wait});
-  co_await stdexec::continues_on(wait.completed.wait(), m_completions);
+  co_await stdexec::continues_on(wait.completed(), m_completions);
   co_return wait.result;
 }
 
