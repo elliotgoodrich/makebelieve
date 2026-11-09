@@ -50,25 +50,10 @@ class RealDirectoryTree : public DirectoryTree {
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
       const std::filesystem::path& path) const override;
 
-  /// Returns a sender reporting file metadata for @a path, or an error.
-  /// Contents are already final; @a context does not affect this tree.
+  /// Pins the native file identity and reads on demand. Replacement by
+  /// rename preserves the old handle; in-place writes are visible through it.
   [[nodiscard]] OpenSender open(const std::filesystem::path& path,
                                 const OpenContext& context = {}) const override;
-
-  /// Returns up to @a size bytes of @a path starting at @a offset, or an
-  /// error_code on failure. A result shorter than @a size means end of file. A
-  /// @a size of 0 succeeds with an empty result without opening @a path.
-  [[nodiscard]] ReadSender read(const std::filesystem::path& path,
-                                Offset offset,
-                                std::size_t size) const override;
-
-  /// Returns the whole of @a path, read through one handle, with the size and
-  /// time that handle reports. Something outside the tree may be writing the
-  /// file meanwhile: if the handle reports a different size or time after the
-  /// read than before it, the file is read again, a few times, and then handed
-  /// out as last read.
-  [[nodiscard]] ReadWholeSender read_whole(
-      const std::filesystem::path& path) const override;
 
   /// Subscribes to changes in this object by calling @a callback and returns an
   /// RAII guard that will unsubscribe on destruction. Changes made once this

@@ -56,36 +56,6 @@ constexpr std::string_view k_manifest_name = "build.makebelieve";
 constexpr char k_null_byte = '\0';
 constexpr std::string_view k_placeholder_content(&k_null_byte, 1);
 
-// Reads the whole of @a path out of @a tree, or the error that stopped it.
-// read() promises only "up to size bytes" per call, so this loops until a
-// short read signals end of file.
-std::expected<std::string, std::error_code> read_all(
-    const DirectoryTree& tree,
-    const std::filesystem::path& path) {
-  const std::expected<EntryInfo, std::error_code> info = tree.status(path);
-  if (!info.has_value()) {
-    return std::unexpected(info.error());
-  }
-  if (!std::holds_alternative<FileInfo>(*info)) {
-    return std::unexpected(std::make_error_code(std::errc::is_a_directory));
-  }
-
-  constexpr std::size_t k_chunk = std::size_t{64} * 1024;
-  std::string content;
-  while (true) {
-    const std::expected<std::string, std::error_code> chunk =
-        DirectoryTreeUtil::read(tree, path, static_cast<Offset>(content.size()),
-                                k_chunk);
-    if (!chunk.has_value()) {
-      return std::unexpected(chunk.error());
-    }
-    content += *chunk;
-    if (chunk->size() < k_chunk) {
-      return content;
-    }
-  }
-}
-
 // Creates every missing directory on the way to @a output's parent inside
 // @a tree, so write_file()'s precondition that the parent exists holds even
 // for a nested output like `@/out/foo.o`.
@@ -250,7 +220,8 @@ void append_reason(std::string& report, const std::error_code& error) {
 std::expected<std::vector<Manifest::Rule>, std::string> read_rules(
     const DirectoryTree& source) {
   const std::expected<std::string, std::error_code> manifest =
-      read_all(source, k_manifest_name);
+      DirectoryTreeUtil::wait_read(
+          DirectoryTreeUtil::read_whole(source, k_manifest_name));
   if (!manifest.has_value()) {
     if (manifest.error() == std::errc::no_such_file_or_directory) {
       return {};
@@ -618,17 +589,6 @@ class BuildDirectoryTree::Impl {
     return m_structure.ls(path);
   }
 
-  [[nodiscard]] ReadSender read(const std::filesystem::path& path,
-                                Offset offset,
-                                std::size_t size) const {
-    return m_structure.read(path, offset, size);
-  }
-
-  [[nodiscard]] ReadWholeSender read_whole(
-      const std::filesystem::path& path) const {
-    return m_structure.read_whole(path);
-  }
-
   // What a `status` output holds: the manifest's problems, then each build
   // under way, then each output whose last build failed and is not building
   // again, each in path order.
@@ -697,9 +657,8 @@ class BuildDirectoryTree::Impl {
     co_return co_await m_coordinator->wait_as(target, requester);
   }
 
-  exec::task<std::expected<FileInfo, std::error_code>> open(
-      std::filesystem::path path,
-      OpenContext context) {
+  exec::task<std::expected<std::shared_ptr<const OpenedFile>, std::error_code>>
+  open(std::filesystem::path path, OpenContext context) {
     if (const auto stop = co_await stdexec::get_stop_token();
         stop.stop_requested()) {
       co_return std::unexpected(
@@ -708,7 +667,7 @@ class BuildDirectoryTree::Impl {
     if (const auto error = co_await build_now(path, context)) {
       co_return std::unexpected(error);
     }
-    co_return co_await DirectoryTreeUtil::open_by_status(m_structure, path);
+    co_return co_await m_structure.open(path);
   }
 
   void materialize_all() {
@@ -914,13 +873,13 @@ class BuildDirectoryTree::Impl {
         co_return std::unexpected(BuildFailure(error, {as_input(source)}));
       }
     }
-    std::expected<std::string, std::error_code> bytes =
-        read_all(m_structure, source);
-    if (!bytes.has_value()) {
+    std::expected<std::string, std::error_code> content =
+        co_await DirectoryTreeUtil::read_whole(m_structure, source);
+    if (!content.has_value()) {
       co_return std::unexpected(
-          BuildFailure(bytes.error(), {as_input(source)}));
+          BuildFailure(content.error(), {as_input(source)}));
     }
-    co_return BuildOutput{.bytes = std::move(*bytes),
+    co_return BuildOutput{.bytes = std::move(*content),
                           .inputs = {as_input(source)}};
   }
 
@@ -1464,7 +1423,9 @@ class BuildDirectoryTree::Impl {
       report = status_report_locked();
     }
     for (const std::filesystem::path& output : m_status_outputs) {
-      if (const auto current = read_all(m_structure, output);
+      if (const std::expected<std::string, std::error_code> current =
+              DirectoryTreeUtil::wait_read(
+                  DirectoryTreeUtil::read_whole(m_structure, output));
           !current.has_value() || *current != report) {
         outputs.push_back(output);
       }
@@ -2068,17 +2029,6 @@ OpenSender BuildDirectoryTree::open(const std::filesystem::path& path,
   return stdexec::write_env(
       m_impl->open(path, context),
       stdexec::prop{stdexec::get_start_scheduler, stdexec::inline_scheduler{}});
-}
-
-ReadSender BuildDirectoryTree::read(const std::filesystem::path& path,
-                                    Offset offset,
-                                    std::size_t size) const {
-  return m_impl->read(path, offset, size);
-}
-
-ReadWholeSender BuildDirectoryTree::read_whole(
-    const std::filesystem::path& path) const {
-  return m_impl->read_whole(path);
 }
 
 Subscription BuildDirectoryTree::subscribe_to_changes(

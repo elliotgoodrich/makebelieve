@@ -766,6 +766,29 @@ FileMapper::map_across(const std::filesystem::path& path,
 
 #endif
 
+// Retains the real file for stat and lets tests control the read completion.
+class TestFile : public makebelieve::OpenedFile {
+ public:
+  using Reader =
+      std::function<makebelieve::ReadSender(const makebelieve::OpenedFile&,
+                                            makebelieve::Offset,
+                                            std::size_t)>;
+  TestFile(std::shared_ptr<const makebelieve::OpenedFile> file, Reader read)
+      : m_file(std::move(file)), m_read(std::move(read)) {}
+  [[nodiscard]] std::expected<makebelieve::FileInfo, std::error_code> stat()
+      const override {
+    return m_file->stat();
+  }
+  [[nodiscard]] makebelieve::ReadSender read(makebelieve::Offset offset,
+                                             std::size_t size) const override {
+    return m_read(*m_file, offset, size);
+  }
+
+ private:
+  std::shared_ptr<const makebelieve::OpenedFile> m_file;
+  Reader m_read;
+};
+
 // Forwards to another tree but fails every read with a fixed error, to see
 // what a reader of the mount is told when the tree cannot serve a file.
 class FailingReadTree : public makebelieve::DirectoryTree {
@@ -791,22 +814,25 @@ class FailingReadTree : public makebelieve::DirectoryTree {
   [[nodiscard]] makebelieve::OpenSender open(
       const std::filesystem::path& path,
       const makebelieve::OpenContext& context) const override {
-    return m_inner.open(path, context);
-  }
-
-  [[nodiscard]] makebelieve::ReadSender read(
-      const std::filesystem::path& /*path*/,
-      makebelieve::Offset /*offset*/,
-      std::size_t /*size*/) const override {
-    return stdexec::just(
-        std::expected<std::string, std::error_code>(std::unexpected(m_error)));
-  }
-
-  [[nodiscard]] makebelieve::ReadWholeSender read_whole(
-      const std::filesystem::path& /*path*/) const override {
-    return stdexec::just(
-        std::expected<makebelieve::FileContent, std::error_code>(
-            std::unexpected(m_error)));
+    return m_inner.open(path, context) |
+           stdexec::then(
+               [error = m_error](
+                   std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                                 std::error_code> result) {
+                 return result.transform(
+                     [error](
+                         std::shared_ptr<const makebelieve::OpenedFile> file)
+                         -> std::shared_ptr<const makebelieve::OpenedFile> {
+                       return std::make_shared<TestFile>(
+                           std::move(file),
+                           [error](const makebelieve::OpenedFile&,
+                                   makebelieve::Offset, std::size_t) {
+                             return stdexec::just(
+                                 std::expected<std::string, std::error_code>(
+                                     std::unexpected(error)));
+                           });
+                     });
+               });
   }
 
   [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
@@ -849,17 +875,6 @@ class FailingStatusTree : public makebelieve::DirectoryTree {
     return m_inner.open(path, context);
   }
 
-  [[nodiscard]] makebelieve::ReadSender read(const std::filesystem::path& path,
-                                             makebelieve::Offset offset,
-                                             std::size_t size) const override {
-    return m_inner.read(path, offset, size);
-  }
-
-  [[nodiscard]] makebelieve::ReadWholeSender read_whole(
-      const std::filesystem::path& path) const override {
-    return m_inner.read_whole(path);
-  }
-
   [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
       const std::function<void(const makebelieve::DirectoryTreeDiff&)>&
           callback) const override {
@@ -897,17 +912,6 @@ class SettleOnOpenTree : public makebelieve::DirectoryTree {
     ++m_opens;
     m_inner.write_file(path, m_final);
     return m_inner.open(path, context);
-  }
-
-  [[nodiscard]] makebelieve::ReadSender read(const std::filesystem::path& path,
-                                             makebelieve::Offset offset,
-                                             std::size_t size) const override {
-    return m_inner.read(path, offset, size);
-  }
-
-  [[nodiscard]] makebelieve::ReadWholeSender read_whole(
-      const std::filesystem::path& path) const override {
-    return m_inner.read_whole(path);
   }
 
   [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
@@ -964,68 +968,50 @@ class ParkingTree : public makebelieve::DirectoryTree {
   }
 
   [[nodiscard]] exec::task<
-      std::expected<makebelieve::FileInfo, std::error_code>>
+      std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                    std::error_code>>
   open_task(std::filesystem::path path,
             makebelieve::OpenContext context) const {
     if (path.filename().string().starts_with("park")) {
-      {
-        const std::lock_guard lock(m_mutex);
-        ++m_parked;
-      }
-      m_changed.notify_all();
-      if (auto error =
-              co_await m_coordinator.wait(m_attempt, context.requester_pid)) {
+      if (const std::error_code error = co_await park(context.requester_pid)) {
         co_return std::unexpected(error);
       }
     }
-    co_return co_await m_inner.open(path, context);
+    std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                  std::error_code>
+        opened = co_await m_inner.open(path, context);
+    if (opened && path.filename().string().starts_with("readpark")) {
+      co_return std::make_shared<TestFile>(
+          *opened,
+          [this](const makebelieve::OpenedFile& file,
+                 makebelieve::Offset offset,
+                 std::size_t size) -> makebelieve::ReadSender {
+            return stdexec::write_env(
+                park_read(file, offset, size),
+                stdexec::prop{stdexec::get_start_scheduler,
+                              stdexec::inline_scheduler{}});
+          });
+    }
+    co_return opened;
   }
 
-  exec::task<std::expected<std::string, std::error_code>> read_task(
-      std::filesystem::path path,
+  exec::task<std::error_code> park(std::uint32_t requester) const {
+    {
+      const std::lock_guard lock(m_mutex);
+      ++m_parked;
+    }
+    m_changed.notify_all();
+    co_return co_await m_coordinator.wait(m_attempt, requester);
+  }
+
+  exec::task<std::expected<std::string, std::error_code>> park_read(
+      const makebelieve::OpenedFile& file,
       makebelieve::Offset offset,
       std::size_t size) const {
-    if (path.filename().string().starts_with("readpark")) {
-      {
-        const std::lock_guard lock(m_mutex);
-        ++m_parked;
-      }
-      m_changed.notify_all();
-      if (auto error = co_await m_coordinator.wait(m_attempt)) {
-        co_return std::unexpected(error);
-      }
+    if (const std::error_code error = co_await park(0)) {
+      co_return std::unexpected(error);
     }
-    co_return co_await m_inner.read(path, offset, size);
-  }
-
-  [[nodiscard]] makebelieve::ReadSender read(const std::filesystem::path& path,
-                                             makebelieve::Offset offset,
-                                             std::size_t size) const override {
-    return stdexec::write_env(read_task(path, offset, size),
-                              stdexec::prop{stdexec::get_start_scheduler,
-                                            stdexec::inline_scheduler{}});
-  }
-
-  exec::task<std::expected<makebelieve::FileContent, std::error_code>>
-  read_whole_task(std::filesystem::path path) const {
-    if (path.filename().string().starts_with("readpark")) {
-      {
-        const std::lock_guard lock(m_mutex);
-        ++m_parked;
-      }
-      m_changed.notify_all();
-      if (auto error = co_await m_coordinator.wait(m_attempt)) {
-        co_return std::unexpected(error);
-      }
-    }
-    co_return co_await m_inner.read_whole(path);
-  }
-
-  [[nodiscard]] makebelieve::ReadWholeSender read_whole(
-      const std::filesystem::path& path) const override {
-    return stdexec::write_env(read_whole_task(path),
-                              stdexec::prop{stdexec::get_start_scheduler,
-                                            stdexec::inline_scheduler{}});
+    co_return co_await file.read(offset, size);
   }
 
   [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
@@ -1083,16 +1069,13 @@ struct InlineStopSender {
 
 class InlineStopTree : public makebelieve::DirectoryTree {
   const makebelieve::DirectoryTree& m_inner;
-  bool m_read;
   bool m_stopped;
 
  public:
   mutable std::promise<void> started;
 
-  InlineStopTree(const makebelieve::DirectoryTree& inner,
-                 bool read,
-                 bool stopped)
-      : m_inner(inner), m_read(read), m_stopped(stopped) {}
+  InlineStopTree(const makebelieve::DirectoryTree& inner, bool stopped)
+      : m_inner(inner), m_stopped(stopped) {}
 
   std::expected<makebelieve::EntryInfo, std::error_code> status(
       const std::filesystem::path& path) const override {
@@ -1105,25 +1088,11 @@ class InlineStopTree : public makebelieve::DirectoryTree {
   makebelieve::OpenSender open(
       const std::filesystem::path& path,
       const makebelieve::OpenContext& context) const override {
-    if (!m_read && path == "pending") {
-      return InlineStopSender<makebelieve::FileInfo>{&started, m_stopped};
+    if (path == "pending") {
+      return InlineStopSender<std::shared_ptr<const makebelieve::OpenedFile>>{
+          &started, m_stopped};
     }
     return m_inner.open(path, context);
-  }
-  makebelieve::ReadSender read(const std::filesystem::path& path,
-                               makebelieve::Offset offset,
-                               std::size_t size) const override {
-    if (m_read && path == "pending") {
-      return InlineStopSender<std::string>{&started, m_stopped};
-    }
-    return m_inner.read(path, offset, size);
-  }
-  makebelieve::ReadWholeSender read_whole(
-      const std::filesystem::path& path) const override {
-    if (m_read && path == "pending") {
-      return InlineStopSender<makebelieve::FileContent>{&started, m_stopped};
-    }
-    return m_inner.read_whole(path);
   }
   makebelieve::Subscription subscribe_to_changes(
       const std::function<void(const makebelieve::DirectoryTreeDiff&)>&
@@ -1180,7 +1149,8 @@ class GatedOpenTree : public makebelieve::DirectoryTree {
   }
 
   [[nodiscard]] exec::task<
-      std::expected<makebelieve::FileInfo, std::error_code>>
+      std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                    std::error_code>>
   open_task(std::filesystem::path path,
             makebelieve::OpenContext context) const {
     if (path == m_gated) {
@@ -1195,17 +1165,6 @@ class GatedOpenTree : public makebelieve::DirectoryTree {
       }
     }
     co_return co_await m_inner.open(path, context);
-  }
-
-  [[nodiscard]] makebelieve::ReadSender read(const std::filesystem::path& path,
-                                             makebelieve::Offset offset,
-                                             std::size_t size) const override {
-    return m_inner.read(path, offset, size);
-  }
-
-  [[nodiscard]] makebelieve::ReadWholeSender read_whole(
-      const std::filesystem::path& path) const override {
-    return m_inner.read_whole(path);
   }
 
   [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
@@ -1520,8 +1479,8 @@ TEST_F(VirtualFileSystem, AnOpenThatWaitsDoesNotHoldUpOtherRequests) {
   const makebelieve::VirtualFileSystem vfs(gated, mountpoint(), notifier());
 
   // After the mount, so these finish before it is torn down.
-  std::future<std::optional<std::string>> slow = std::async(
-      std::launch::async, [&] { return read_file(mountpoint() / "slow.txt"); });
+  std::future<std::optional<std::string>> slow =
+      std::async(std::launch::async, read_file, mountpoint() / "slow.txt");
   if (!gated.wait_until_held()) {
     gated.release();  // or slow's destructor would hang
     FAIL() << "the open of slow.txt never reached the tree";
@@ -1557,9 +1516,8 @@ TEST_F(VirtualFileSystem, Suspends128OpensWithoutBlockingDispatchers) {
   const makebelieve::VirtualFileSystem vfs(parking, mountpoint(), notifier());
   std::vector<std::future<std::optional<std::string>>> parked;
   for (std::size_t i = 0; i < count; ++i) {
-    parked.push_back(std::async(std::launch::async, [this, i] {
-      return read_file(mountpoint() / ("park" + std::to_string(i)));
-    }));
+    parked.push_back(std::async(std::launch::async, read_file,
+                                mountpoint() / ("park" + std::to_string(i))));
   }
   const bool all_parked = parking.wait_until_parked(count);
   auto other = std::async(std::launch::async, [this] {
@@ -1588,13 +1546,13 @@ TEST_F(VirtualFileSystem, SuspendsReadsWithoutBlockingOtherFiles) {
   const makebelieve::VirtualFileSystem vfs(parking, mountpoint(), notifier());
   std::vector<std::future<std::optional<std::string>>> readers;
   for (int i = 0; i < 4; ++i) {
-    readers.push_back(std::async(std::launch::async, [this, i] {
-      return read_file(mountpoint() / ("readpark" + std::to_string(i)));
-    }));
+    readers.push_back(
+        std::async(std::launch::async, read_file,
+                   mountpoint() / ("readpark" + std::to_string(i))));
   }
   const bool suspended = parking.wait_until_parked(4);
-  auto other = std::async(std::launch::async,
-                          [this] { return read_file(mountpoint() / "free"); });
+  std::future<std::optional<std::string>> other =
+      std::async(std::launch::async, read_file, mountpoint() / "free");
   const bool progressed =
       other.wait_for(k_timeout) == std::future_status::ready;
   parking.release();
@@ -1611,8 +1569,8 @@ TEST_F(VirtualFileSystem, UnmountCancelsSuspendedOpens) {
   ParkingTree parking(tree());
   auto vfs = std::make_unique<makebelieve::VirtualFileSystem>(
       parking, mountpoint(), notifier());
-  auto reader = std::async(std::launch::async,
-                           [this] { return read_file(mountpoint() / "park"); });
+  std::future<std::optional<std::string>> reader =
+      std::async(std::launch::async, read_file, mountpoint() / "park");
   const bool parked = parking.wait_until_parked(1);
   vfs.reset();
   EXPECT_TRUE(parked);
@@ -1626,11 +1584,11 @@ TEST_F(VirtualFileSystem, UnmountCancelsSuspendedOpens) {
 TEST_F(VirtualFileSystem, InlineStopCompletionsDoNotDeadlockTheDispatcher) {
   tree().write_file("pending", "pending content");
   tree().write_file("free", "dispatcher still serves requests");
-  for (const bool reading : {false, true}) {
+  for (const bool unmounting : {false, true}) {
     for (const bool stopped : {false, true}) {
-      SCOPED_TRACE(reading ? "read" : "open");
+      SCOPED_TRACE(unmounting ? "unmount" : "interrupt");
       SCOPED_TRACE(stopped ? "set_stopped" : "set_value");
-      InlineStopTree inline_stop(tree(), reading, stopped);
+      InlineStopTree inline_stop(tree(), stopped);
       auto started = inline_stop.started.get_future();
       auto vfs = std::make_unique<makebelieve::VirtualFileSystem>(
           inline_stop, mountpoint(), notifier());
@@ -1646,19 +1604,13 @@ TEST_F(VirtualFileSystem, InlineStopCompletionsDoNotDeadlockTheDispatcher) {
         if (fd < 0) {
           error = errno;
         } else {
-          char byte;
-          if (reading && ::read(fd, &byte, 1) < 0) {
-            error = errno;
-          }
           ::close(fd);
         }
       });
       EXPECT_EQ(started.wait_for(k_timeout), std::future_status::ready);
       EXPECT_EQ(read_file(mountpoint() / "free"),
                 "dispatcher still serves requests");
-      if (reading) {
-        // Buffered reads wait in the kernel page cache and do not reliably
-        // turn a handled signal into a FUSE interrupt. Cancel via shutdown.
+      if (unmounting) {
         vfs.reset();
       } else {
         EXPECT_EQ(::pthread_kill(reader.native_handle(), SIGUSR1), 0);
@@ -1666,8 +1618,8 @@ TEST_F(VirtualFileSystem, InlineStopCompletionsDoNotDeadlockTheDispatcher) {
       // A lock regression would strand the reader or prevent shutdown.
       reader.join();
       EXPECT_EQ(::sigaction(SIGUSR1, &previous, nullptr), 0);
-      if (reading) {
-        // Unmount can abort the connection before the buffered read observes
+      if (unmounting) {
+        // Unmount can abort the connection before the pending open observes
         // the cancellation reply; either way the read must fail promptly.
         EXPECT_NE(error, 0);
       } else {
@@ -1706,8 +1658,8 @@ TEST_F(VirtualFileSystem,
     }
     opened.set_value(error);
   });
-  auto other = std::async(std::launch::async,
-                          [&] { return read_file(mountpoint() / "park"); });
+  std::future<std::optional<std::string>> other =
+      std::async(std::launch::async, read_file, mountpoint() / "park");
   const bool parked = parking.wait_until_parked(2);
   const int signalled = ::pthread_kill(interrupted.native_handle(), SIGUSR1);
   const bool completed =
@@ -1752,9 +1704,8 @@ TEST_F(VirtualFileSystem, UnmountCancelsSuspendedReads) {
   ParkingTree parked(tree());
   std::optional<makebelieve::VirtualFileSystem> vfs;
   vfs.emplace(parked, mountpoint(), notifier());
-  auto reader = std::async(std::launch::async, [&] {
-    return read_error(mountpoint() / "readpark.txt");
-  });
+  std::future<std::error_code> reader =
+      std::async(std::launch::async, read_error, mountpoint() / "readpark.txt");
   if (!parked.wait_until_parked(1)) {
     parked.release();
     FAIL() << "the read never suspended";

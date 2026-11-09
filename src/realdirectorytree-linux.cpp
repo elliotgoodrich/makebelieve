@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "realdirectorytree.hpp"
 
-#include "directorytreeutil.hpp"
 #include "iocontext.hpp"
 #include "scopeguard.hpp"
 
@@ -15,6 +14,7 @@
 #include <cstdio>
 #include <expected>
 #include <functional>
+#include <limits>
 #include <list>
 #include <map>
 #include <memory>
@@ -77,14 +77,79 @@ EntryInfo make_info(const struct stat& info) {
 
 using UniqueDir = std::unique_ptr<DIR, int (*)(DIR*)>;
 
-// How many times read_whole() reads a file that changes under it before
-// handing out what it last read.
-constexpr int k_read_whole_attempts = 8;
+// NOLINTBEGIN(bugprone-easily-swappable-parameters): keep offset and size in
+// the order used by OpenedFile::read.
+std::expected<std::string, std::error_code> read_at(int fd,
+                                                    Offset offset,
+                                                    std::size_t size) {
+  // NOLINTEND(bugprone-easily-swappable-parameters)
+  if (offset < 0) {
+    return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+  }
+  if (size == 0) {
+    return std::string{};
+  }
+  std::string contents;
+  std::optional<std::error_code> failure;
+  contents.resize_and_overwrite(size, [&](char* data,
+                                          const std::size_t capacity) noexcept {
+    std::size_t total = 0;
+    while (total < capacity) {
+      if (total > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max() -
+                                             offset)) {
+        failure = std::make_error_code(std::errc::value_too_large);
+        break;
+      }
+      const ssize_t read_bytes =
+          ::pread(fd, data + total, capacity - total,
+                  static_cast<off_t>(offset) + static_cast<off_t>(total));
+      if (read_bytes < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        failure = last_error_code();
+        break;
+      }
+      if (read_bytes == 0) {
+        break;  // End of file: a short result is how the contract spells EOF.
+      }
+      total += static_cast<std::size_t>(read_bytes);
+    }
+    return total;
+  });
 
-bool same_version(const struct stat& a, const struct stat& b) {
-  return a.st_size == b.st_size && a.st_mtim.tv_sec == b.st_mtim.tv_sec &&
-         a.st_mtim.tv_nsec == b.st_mtim.tv_nsec;
+  if (failure.has_value()) {
+    return std::unexpected(*failure);
+  }
+  return contents;
 }
+
+class NativeFile final : public OpenedFile {
+  int m_file;
+
+ public:
+  explicit NativeFile(int file) : m_file(file) {}
+  ~NativeFile() override { ::close(m_file); }
+  NativeFile(const NativeFile&) = delete;
+  NativeFile& operator=(const NativeFile&) = delete;
+
+  [[nodiscard]] std::expected<FileInfo, std::error_code> stat() const override {
+    struct stat info {};
+    if (::fstat(m_file, &info) < 0) {
+      return std::unexpected(last_error_code());
+    }
+    if (S_ISDIR(info.st_mode)) {
+      return std::unexpected(std::make_error_code(std::errc::is_a_directory));
+    }
+    return FileInfo{.size = static_cast<std::size_t>(info.st_size),
+                    .mtime = to_file_time(info.st_mtim)};
+  }
+
+  [[nodiscard]] ReadSender read(Offset offset,
+                                std::size_t size) const override {
+    return stdexec::just(m_file, offset, size) | stdexec::then(read_at);
+  }
+};
 
 }  // namespace
 
@@ -143,12 +208,9 @@ class RealDirectoryTree::Impl {
       const std::filesystem::path& path) const;
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
       const std::filesystem::path& path) const;
-  [[nodiscard]] std::expected<std::string, std::error_code> read(
-      const std::filesystem::path& path,
-      Offset offset,
-      std::size_t size) const;
-  [[nodiscard]] std::expected<FileContent, std::error_code> read_whole(
-      const std::filesystem::path& path) const;
+  [[nodiscard]] std::expected<std::shared_ptr<const OpenedFile>,
+                              std::error_code>
+  open_file(const std::filesystem::path& path) const;
   [[nodiscard]] Subscription subscribe_to_changes(
       const std::function<void(const DirectoryTreeDiff&)>& callback) const;
 
@@ -280,65 +342,6 @@ RealDirectoryTree::Impl::ls(const std::filesystem::path& path) const {
         {.name = std::filesystem::path(name), .info = make_info(info)});
   }
   return entries;
-}
-
-// offset and size are the signature DirectoryTree::read() defines, so they
-// cannot be reordered or renamed apart here.
-// NOLINTBEGIN(bugprone-easily-swappable-parameters)
-std::expected<std::string, std::error_code> RealDirectoryTree::Impl::read(
-    const std::filesystem::path& path,
-    Offset offset,
-    std::size_t size) const {
-  // NOLINTEND(bugprone-easily-swappable-parameters)
-  const std::optional<std::filesystem::path> resolved = resolve(path);
-  if (!resolved.has_value()) {
-    return std::unexpected(
-        std::make_error_code(std::errc::no_such_file_or_directory));
-  }
-  if (offset < 0) {
-    return std::unexpected(std::make_error_code(std::errc::invalid_argument));
-  }
-  if (size == 0) {
-    return std::string{};
-  }
-
-  const int fd = ::open(resolved->c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) {
-    return std::unexpected(last_error_code());
-  }
-  // pread throughout, never read/lseek, so the shared descriptor carries no
-  // position and concurrent reads of the same path do not race - the same
-  // property the Windows backend gets from a positioned OVERLAPPED.
-  const ScopeGuard closer([fd] { ::close(fd); });
-
-  std::string contents;
-  std::optional<std::error_code> failure;
-  contents.resize_and_overwrite(size, [&](char* data,
-                                          const std::size_t capacity) noexcept {
-    std::size_t total = 0;
-    while (total < capacity) {
-      const ssize_t read_bytes =
-          ::pread(fd, data + total, capacity - total,
-                  static_cast<off_t>(offset) + static_cast<off_t>(total));
-      if (read_bytes < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        failure = last_error_code();
-        break;
-      }
-      if (read_bytes == 0) {
-        break;  // End of file: a short result is how the contract spells EOF.
-      }
-      total += static_cast<std::size_t>(read_bytes);
-    }
-    return total;
-  });
-
-  if (failure.has_value()) {
-    return std::unexpected(*failure);
-  }
-  return contents;
 }
 
 Subscription RealDirectoryTree::Impl::subscribe_to_changes(
@@ -532,21 +535,8 @@ std::expected<std::vector<TreeEntry>, std::error_code> RealDirectoryTree::ls(
   return m_impl->ls(path);
 }
 
-OpenSender RealDirectoryTree::open(const std::filesystem::path& path,
-                                   const OpenContext&) const {
-  return DirectoryTreeUtil::open_by_status(*this, path);
-}
-
-ReadSender RealDirectoryTree::read(const std::filesystem::path& path,
-                                   Offset offset,
-                                   std::size_t size) const {
-  return stdexec::just() | stdexec::then([this, path, offset, size] {
-           return m_impl->read(path, offset, size);
-         });
-}
-
-std::expected<FileContent, std::error_code> RealDirectoryTree::Impl::read_whole(
-    const std::filesystem::path& path) const {
+std::expected<std::shared_ptr<const OpenedFile>, std::error_code>
+RealDirectoryTree::Impl::open_file(const std::filesystem::path& path) const {
   const std::optional<std::filesystem::path> resolved = resolve(path);
   if (!resolved.has_value()) {
     return std::unexpected(
@@ -556,60 +546,20 @@ std::expected<FileContent, std::error_code> RealDirectoryTree::Impl::read_whole(
   if (fd < 0) {
     return std::unexpected(last_error_code());
   }
-  const ScopeGuard closer([fd] { ::close(fd); });
-
-  FileContent latest;
-  for (int attempt = 0; attempt < k_read_whole_attempts; ++attempt) {
-    struct stat before {};
-    if (::fstat(fd, &before) != 0) {
-      return std::unexpected(last_error_code());
-    }
-    if (S_ISDIR(before.st_mode)) {
-      return std::unexpected(std::make_error_code(std::errc::is_a_directory));
-    }
-
-    // One byte more than the file should hold, so a read that fills the
-    // buffer is never mistaken for the end of it.
-    std::string contents(static_cast<std::size_t>(before.st_size) + 1, '\0');
-    std::size_t total = 0;
-    for (;;) {
-      if (total == contents.size()) {
-        contents.resize(contents.size() * 2);
-      }
-      const ssize_t read_bytes =
-          ::pread(fd, contents.data() + total, contents.size() - total,
-                  static_cast<off_t>(total));
-      if (read_bytes < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        return std::unexpected(last_error_code());
-      }
-      if (read_bytes == 0) {
-        break;
-      }
-      total += static_cast<std::size_t>(read_bytes);
-    }
-    contents.resize(total);
-
-    struct stat after {};
-    if (::fstat(fd, &after) != 0) {
-      return std::unexpected(last_error_code());
-    }
-    latest = {.bytes = std::make_shared<const std::string>(std::move(contents)),
-              .info = {.size = total, .mtime = to_file_time(before.st_mtim)}};
-    if (same_version(before, after) &&
-        total == static_cast<std::size_t>(before.st_size)) {
-      break;
-    }
+  ScopeGuard closer([fd] { ::close(fd); });
+  auto opened = std::make_shared<const NativeFile>(fd);
+  closer.dismiss();
+  if (const std::expected<FileInfo, std::error_code> info = opened->stat();
+      !info) {
+    return std::unexpected(info.error());
   }
-  return latest;
+  return opened;
 }
 
-ReadWholeSender RealDirectoryTree::read_whole(
-    const std::filesystem::path& path) const {
+OpenSender RealDirectoryTree::open(const std::filesystem::path& path,
+                                   const OpenContext&) const {
   return stdexec::just() |
-         stdexec::then([this, path] { return m_impl->read_whole(path); });
+         stdexec::then([this, path] { return m_impl->open_file(path); });
 }
 
 Subscription RealDirectoryTree::subscribe_to_changes(

@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -486,56 +487,121 @@ INSTANTIATE_TEST_SUITE_P(
       return std::string(info.param.label);
     });
 
-std::expected<makebelieve::FileContent, std::error_code> read_whole(
-    const makebelieve::DirectoryTree& tree,
-    const std::filesystem::path& path) {
-  auto result = stdexec::sync_wait(tree.read_whole(path));
-  return std::get<0>(std::move(result).value());
+std::string read_range(
+    const std::shared_ptr<const makebelieve::OpenedFile>& file,
+    makebelieve::Offset offset,
+    std::size_t size) {
+  const std::expected<std::string, std::error_code> result =
+      makebelieve::DirectoryTreeUtil::wait_read(file->read(offset, size));
+  EXPECT_TRUE(result.has_value());
+  return result.value_or(std::string{});
 }
 
 // A file taken whole is what status() and read() say it is.
-TEST_F(RealDirectoryTree, ReadWholeMatchesStatusAndRead) {
+TEST_F(RealDirectoryTree, OpenMatchesStatusAndRead) {
   for (const char* const path :
        {"hello.txt", "empty.txt", "binary.bin", "sub/nested.txt"}) {
     SCOPED_TRACE(path);
-    const auto whole = read_whole(tree(), path);
-    const auto status = tree().status(path);
-    const auto read =
+    const std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                        std::error_code>
+        whole = makebelieve::DirectoryTreeUtil::open(tree(), path);
+    const std::expected<makebelieve::EntryInfo, std::error_code> status =
+        tree().status(path);
+    const std::expected<std::string, std::error_code> read =
         makebelieve::DirectoryTreeUtil::read(tree(), path, 0, 1U << 20U);
     ASSERT_TRUE(whole.has_value()) << whole.error().message();
     ASSERT_TRUE(status.has_value());
     ASSERT_TRUE(read.has_value());
-    EXPECT_EQ(*whole->bytes, *read);
+    EXPECT_EQ(read_range(*whole, 0, read->size()), *read);
     const auto& file = std::get<makebelieve::FileInfo>(*status);
-    EXPECT_EQ(whole->info.size, file.size);
-    EXPECT_EQ(whole->info.mtime, file.mtime);
+    EXPECT_EQ((*whole)->stat().value().size, file.size);
+    EXPECT_EQ((*whole)->stat().value().mtime, file.mtime);
   }
 }
 
-// A file larger than any one read takes several to drain.
-TEST_F(RealDirectoryTree, ReadWholeReadsALargeFile) {
+TEST_F(RealDirectoryTree, OpenHandleObservesInPlaceWrites) {
+  const std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                      std::error_code>
+      opened = makebelieve::DirectoryTreeUtil::open(tree(), "hello.txt");
+  ASSERT_TRUE(opened.has_value());
+  ASSERT_EQ(read_range(*opened, 0, 5), "hello");
+  write_file(root() / "hello.txt", "new");
+  EXPECT_EQ(read_range(*opened, 0, 5), "new");
+  EXPECT_EQ((*opened)->stat().value().size, 3U);
+  EXPECT_TRUE(read_range(*opened, 5, 1).empty());
+  EXPECT_TRUE(read_range(*opened, 0, 0).empty());
+}
+
+TEST_F(RealDirectoryTree, OpenHandleFollowsFileAcrossRename) {
+  const std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                      std::error_code>
+      opened = makebelieve::DirectoryTreeUtil::open(tree(), "hello.txt");
+  ASSERT_TRUE(opened.has_value());
+  write_file(root() / "replacement", "new");
+  std::filesystem::rename(root() / "hello.txt", root() / "previous");
+  std::filesystem::rename(root() / "replacement", root() / "hello.txt");
+  const std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                      std::error_code>
+      fresh = makebelieve::DirectoryTreeUtil::open(tree(), "hello.txt");
+  ASSERT_TRUE(fresh.has_value());
+  EXPECT_EQ(read_range(*fresh, 0, 8), "new");
+  EXPECT_EQ(read_range(*opened, 5, 6), " world");
+  EXPECT_EQ((*opened)->stat().value().size, 11U);
+  // Editing the renamed original changes what the retained handle sees.
+  write_file(root() / "previous", "edited");
+  EXPECT_EQ(read_range(*opened, 0, 8), "edited");
+  EXPECT_EQ(read_range(*fresh, 0, 8), "new");
+}
+
+#ifndef _WIN32
+TEST_F(RealDirectoryTree, AtomicReplacementKeepsTheOpenedInode) {
+  const std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                      std::error_code>
+      original = makebelieve::DirectoryTreeUtil::open(tree(), "hello.txt");
+  ASSERT_TRUE(original.has_value());
+  write_file(root() / "next", "next version");
+  std::filesystem::rename(root() / "next", root() / "hello.txt");
+  const std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                      std::error_code>
+      current = makebelieve::DirectoryTreeUtil::open(tree(), "hello.txt");
+  ASSERT_TRUE(current.has_value());
+  EXPECT_EQ(read_range(*original, 5, 6), " world");
+  EXPECT_EQ(read_range(*current, 0, 4), "next");
+}
+#endif
+
+TEST_F(RealDirectoryTree, OpenReadsASmallRangeOfALargeFile) {
   std::string large(3U << 20U, '\0');
   for (std::size_t i = 0; i < large.size(); ++i) {
     large[i] = static_cast<char>('a' + ((i * 7 + (i >> 13)) % 26));
   }
   write_file(root() / "large.bin", large);
-  const auto whole = read_whole(tree(), "large.bin");
+  const std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                      std::error_code>
+      whole = makebelieve::DirectoryTreeUtil::open(tree(), "large.bin");
   ASSERT_TRUE(whole.has_value()) << whole.error().message();
-  EXPECT_TRUE(*whole->bytes == large);
-  EXPECT_EQ(whole->info.size, large.size());
+  // Two readers share the same native handle without sharing a file position.
+  std::future<std::string> middle =
+      std::async(std::launch::async, read_range, *whole, 2U << 20U, 17);
+  EXPECT_EQ(read_range(*whole, 9, 23), large.substr(9, 23));
+  EXPECT_EQ(middle.get(), large.substr(2U << 20U, 17));
+  EXPECT_EQ((*whole)->stat().value().size, large.size());
 }
 
-TEST_F(RealDirectoryTree, ReadWholeFailsAsReadDoes) {
-  EXPECT_EQ(read_whole(tree(), "missing.txt").error(),
+TEST_F(RealDirectoryTree, OpenFailsAsReadDoes) {
+  EXPECT_EQ(makebelieve::DirectoryTreeUtil::open(tree(), "missing.txt").error(),
             std::errc::no_such_file_or_directory);
-  EXPECT_EQ(read_whole(tree(), "missing/nested.txt").error(),
+  EXPECT_EQ(makebelieve::DirectoryTreeUtil::open(tree(), "missing/nested.txt")
+                .error(),
             std::errc::no_such_file_or_directory);
-  EXPECT_EQ(read_whole(tree(), "..").error(),
+  EXPECT_EQ(makebelieve::DirectoryTreeUtil::open(tree(), "..").error(),
             std::errc::no_such_file_or_directory);
-  // As with read(), the platforms report a directory differently.
-  const auto directory = read_whole(tree(), "sub");
+  // A directory can be listed but cannot be opened as a file.
+  const std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                      std::error_code>
+      directory = makebelieve::DirectoryTreeUtil::open(tree(), "sub");
   ASSERT_FALSE(directory.has_value());
-  EXPECT_TRUE(static_cast<bool>(directory.error()));
+  EXPECT_EQ(directory.error(), std::errc::is_a_directory);
 }
 
 // Collects the diffs a tree reports, for a test to wait on.

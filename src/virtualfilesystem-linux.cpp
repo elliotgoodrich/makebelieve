@@ -2,7 +2,7 @@
 #include "virtualfilesystem.hpp"
 
 #include "directorytree.hpp"
-#include "filesnapshots.hpp"
+#include "directorytreeutil.hpp"
 #include "filesystemutil.hpp"
 #include "iocontext.hpp"
 #include "processinfo.hpp"
@@ -248,9 +248,6 @@ class VirtualFileSystem::Impl {
   mutable TraceLanePool m_reader_lanes{"reader"};
 
   const DirectoryTree& m_tree;
-  // What every open reads from: the version of its file it opened, which a
-  // later change to the file leaves alone.
-  FileSnapshots m_snapshots;
   std::filesystem::path m_mountpoint;
 
   // Where notifier passes run.
@@ -265,7 +262,7 @@ class VirtualFileSystem::Impl {
     std::vector<std::string> names;
     // Set for a file opened to be read, and what all its reads are served
     // from.
-    std::shared_ptr<const FileSnapshot> snapshot;
+    std::shared_ptr<const OpenedFile> file;
   };
   // Unmount may discard kernel handles without sending release callbacks.
   std::mutex m_handle_mutex;
@@ -287,7 +284,7 @@ class VirtualFileSystem::Impl {
     // content.
     std::optional<FileInfo> opened;
     std::uint64_t generation = 0;
-    std::weak_ptr<const FileSnapshot> snapshot;
+    std::weak_ptr<const OpenedFile> file;
   };
   std::unordered_map<fuse_ino_t, Node> m_paths{
       {FUSE_ROOT_ID, Node{.path = {}, .lookups = 1}}};
@@ -326,6 +323,21 @@ class VirtualFileSystem::Impl {
   // once per pass, and m_everything_dirty supersedes the lot.
   std::mutex m_notify_mutex;
 
+  // Change numbers used for inode selection and notification ordering.
+  // Accessed under m_notify_mutex.
+  std::uint64_t m_clock = 0;
+  std::uint64_t m_everything_generation = 0;
+  std::unordered_map<std::filesystem::path, std::uint64_t> m_generations;
+
+  [[nodiscard]] std::uint64_t generation_locked(
+      const std::filesystem::path& path) const {
+    const auto it = m_generations.find(path);
+    return it == m_generations.end() ? m_everything_generation : it->second;
+  }
+  std::uint64_t generation_of(const std::filesystem::path& path) {
+    const std::lock_guard lock(m_notify_mutex);
+    return generation_locked(path);
+  }
   Changes m_pending;
   bool m_everything_dirty = false;
   bool m_stopping = false;
@@ -485,7 +497,6 @@ class VirtualFileSystem::Impl {
       // as the mount lives, by which time the process's working directory may
       // have moved on from whatever made a relative path meaningful.
       : m_tree(tree),
-        m_snapshots(tree),
         m_mountpoint(std::filesystem::absolute(mountpoint)),
         m_scheduler(scheduler) {
     create_mountpoint(m_mountpoint);
@@ -529,7 +540,7 @@ class VirtualFileSystem::Impl {
   // handle.
   fuse_ino_t inode(const std::filesystem::path& name,
                    const std::optional<FileInfo>& file) {
-    const std::uint64_t generation = file ? m_snapshots.generation(name) : 0;
+    const std::uint64_t generation = file ? generation_of(name) : 0;
     const std::lock_guard lock(m_inode_mutex);
     if (const auto it = m_ids.find(name); it != m_ids.end()) {
       Node& node = m_paths.at(it->second);
@@ -557,9 +568,11 @@ class VirtualFileSystem::Impl {
   // a file being built is the build that open waited for. Later ones get that
   // same version: an open the kernel makes of this inode rather than by name
   // (reopening /proc/self/fd/N, say), or a lookup that raced a change.
-  std::shared_ptr<const FileSnapshot> version_for(
+  std::shared_ptr<const OpenedFile> version_for(
       fuse_ino_t ino,
-      std::shared_ptr<const FileSnapshot> current) {
+      std::shared_ptr<const OpenedFile> current,
+      const FileInfo& info,
+      std::uint64_t generation) {
     const std::lock_guard lock(m_inode_mutex);
     const auto found = m_paths.find(ino);
     if (found == m_paths.end()) {
@@ -567,17 +580,16 @@ class VirtualFileSystem::Impl {
     }
     Node& node = found->second;
     if (!node.opened) {
-      node.opened = current->info();
-      node.generation = current->generation;
-      node.snapshot = current;
+      node.opened = info;
+      node.generation = generation;
+      node.file = current;
       return current;
     }
-    if (std::shared_ptr<const FileSnapshot> held = node.snapshot.lock()) {
+    if (std::shared_ptr<const OpenedFile> held = node.file.lock()) {
       return held;
     }
-    if (node.generation == current->generation &&
-        same(*node.opened, current->info())) {
-      node.snapshot = current;
+    if (node.generation == generation && same(*node.opened, info)) {
+      node.file = current;
       return current;
     }
     return nullptr;
@@ -622,10 +634,10 @@ class VirtualFileSystem::Impl {
     const std::lock_guard lock(m_handle_mutex);
     return *m_handles.at(handle);
   }
-  std::shared_ptr<const FileSnapshot> snapshot_of(std::uint64_t handle) {
+  std::shared_ptr<const OpenedFile> opened_file_of(std::uint64_t handle) {
     const std::lock_guard lock(m_handle_mutex);
     const auto it = m_handles.find(handle);
-    return it != m_handles.end() ? it->second->snapshot : nullptr;
+    return it != m_handles.end() ? it->second->file : nullptr;
   }
   // May run after fuse_reply_open has consumed the request. Never unwind into
   // the bridge and cause a second reply if cleanup cannot take its lock.
@@ -729,8 +741,14 @@ class VirtualFileSystem::Impl {
     struct stat value {};
     std::optional<FileInfo> fixed;
     if (handle && handle->fh) {
-      if (const auto snapshot = snapshot_of(handle->fh)) {
-        fixed = snapshot->info();
+      if (const std::shared_ptr<const OpenedFile> file =
+              opened_file_of(handle->fh)) {
+        const std::expected<FileInfo, std::error_code> info = file->stat();
+        if (!info) {
+          fuse_reply_err(req, to_errno(info.error()));
+          return;
+        }
+        fixed = *info;
       }
     }
     if (!fixed) {
@@ -817,21 +835,28 @@ class VirtualFileSystem::Impl {
     try {
       const stdexec::prop stop{stdexec::get_stop_token,
                                request->stop.get_token()};
-      auto opened = co_await stdexec::write_env(
-          m_tree.open(name, OpenContext{.requester_pid = caller,
-                                        .trace_lane = trace.lane()}),
-          stop);
+      // A change during open may follow the capture of the handle, even
+      // when both versions have identical attributes. In that case a fresh
+      // lookup must use a fresh inode. Wait for announcements through the
+      // end of open as well, including any build this open started.
+      const std::uint64_t generation = generation_of(name);
+      std::expected<std::shared_ptr<const OpenedFile>, std::error_code> opened =
+          co_await stdexec::write_env(
+              m_tree.open(name, OpenContext{.requester_pid = caller,
+                                            .trace_lane = trace.lane()}),
+              stop);
       if (!opened) {
         request->reply_error(to_errno(opened.error()));
         co_return;
       }
-      auto current = co_await stdexec::write_env(m_snapshots.take(name), stop);
-      if (!current) {
-        request->reply_error(to_errno(current.error()));
+      const std::expected<FileInfo, std::error_code> attrs = (*opened)->stat();
+      if (!attrs) {
+        request->reply_error(to_errno(attrs.error()));
         co_return;
       }
-      std::shared_ptr<const FileSnapshot> version =
-          version_for(ino, std::move(*current));
+      const std::uint64_t announce_through = generation_of(name);
+      std::shared_ptr<const OpenedFile> version =
+          version_for(ino, std::move(*opened), *attrs, generation);
       if (!version) {
         // The kernel takes this to mean its idea of the name is out of date,
         // and looks the name up again - finding the file's new inode - before
@@ -839,10 +864,9 @@ class VirtualFileSystem::Impl {
         request->reply_error(ESTALE);
         co_return;
       }
-      const std::uint64_t generation = version->generation;
       info.fh = retain(std::make_unique<FileHandle>(
-          FileHandle{.path = name, .snapshot = std::move(version)}));
-      reply_when_announced(name, generation,
+          FileHandle{.path = name, .file = std::move(version)}));
+      reply_when_announced(name, announce_through,
                            [this, request, info]() mutable noexcept {
                              if (fuse_reply_open(request->take(), &info) != 0) {
                                drop(info.fh);
@@ -879,13 +903,17 @@ class VirtualFileSystem::Impl {
     }
   }
   exec::task<void> read_file(std::shared_ptr<Request> request,
+                             std::shared_ptr<const OpenedFile> file,
                              std::filesystem::path name,
                              size_t size,
                              off_t offset) {
     try {
-      auto bytes = co_await stdexec::write_env(
-          m_tree.read(name, offset, size),
-          stdexec::prop{stdexec::get_stop_token, request->stop.get_token()});
+      std::expected<std::string, std::error_code> bytes =
+          co_await stdexec::write_env(
+              file ? file->read(offset, size)
+                   : DirectoryTreeUtil::read_range(m_tree, name, offset, size),
+              stdexec::prop{stdexec::get_stop_token,
+                            request->stop.get_token()});
       if (!bytes) {
         request->reply_error(to_errno(bytes.error()));
       } else {
@@ -904,23 +932,17 @@ class VirtualFileSystem::Impl {
             off_t offset,
             fuse_file_info* info) {
     // NOLINTEND(bugprone-easily-swappable-parameters)
-    if (info->fh) {
-      if (const auto snapshot = snapshot_of(info->fh)) {
-        const std::string& content = snapshot->content();
-        const std::size_t start =
-            std::min(content.size(), static_cast<std::size_t>(offset));
-        fuse_reply_buf(req, content.data() + start,
-                       std::min(size, content.size() - start));
-        return;
-      }
+    std::shared_ptr<const OpenedFile> file = opened_file_of(info->fh);
+    std::filesystem::path name;
+    if (!file) {
+      name = info->fh ? file_handle(info->fh).path : path(ino);
     }
-    auto name = info->fh ? file_handle(info->fh).path : path(ino);
     auto request = std::make_shared<Request>(req, m_request_stop.get_token());
     try {
       stdexec::spawn(
-          stdexec::starts_on(
-              m_file_io.get_scheduler(),
-              read_file(request, std::move(name), size, offset)) |
+          stdexec::starts_on(m_file_io.get_scheduler(),
+                             read_file(request, std::move(file),
+                                       std::move(name), size, offset)) |
               stdexec::upon_error([](const std::exception_ptr&) noexcept {}),
           m_requests.get_token());
     } catch (...) {
@@ -1079,7 +1101,14 @@ class VirtualFileSystem::Impl {
     const std::lock_guard<std::mutex> lock(m_notify_mutex);
     // Under the same lock as the queueing below, so that every generation
     // there is of a file is either announced or on its way to it.
-    m_snapshots.changed(diff);
+    if (diff.everything_dirty) {
+      m_everything_generation = ++m_clock;
+      m_generations.clear();
+    } else {
+      for (const std::filesystem::path& path : diff.entries_changed) {
+        m_generations.insert_or_assign(path, ++m_clock);
+      }
+    }
     if (m_stopping) {
       return;
     }
@@ -1194,7 +1223,7 @@ class VirtualFileSystem::Impl {
         Changes batch;
         std::optional<std::uint64_t> everything;
         if (m_everything_dirty) {
-          everything = m_snapshots.latest();
+          everything = m_clock;
           // The tree lost track of what changed, so everything we have handed
           // out could be stale. Announce the paths we know the kernel has seen
           // rather than walking the mount: an enumeration of our own
@@ -1213,7 +1242,7 @@ class VirtualFileSystem::Impl {
         // generation on before queueing it, under this lock.
         std::unordered_map<std::filesystem::path, std::uint64_t> generations;
         for (const auto& [path, kind] : batch) {
-          generations.emplace(path, m_snapshots.generation(path));
+          generations.emplace(path, generation_locked(path));
         }
 
         // Unlocked for the announcements themselves, so a change arriving

@@ -2,7 +2,7 @@
 #include "virtualfilesystem.hpp"
 
 #include "directorytree.hpp"
-#include "filesnapshots.hpp"
+#include "directorytreeutil.hpp"
 #include "iocontext.hpp"
 #include "processinfo.hpp"
 #include "tracer.hpp"
@@ -494,7 +494,6 @@ class VirtualFileSystem::Impl {
        exec::static_thread_pool::scheduler scheduler,
        Unstarted)
       : m_tree(tree),
-        m_snapshots(tree),
         m_mountpoint(normalize_mountpoint(mountpoint)),
         m_root(m_mountpoint.wstring()),
         m_scheduler(scheduler) {
@@ -545,17 +544,14 @@ class VirtualFileSystem::Impl {
 
  private:
   // What Open hands back to WinFsp and every later operation on that handle
-  // hands us - one per handle, see UmFileContextIsUserContext2. It holds the
-  // path rather than a snapshot of the entry, so a read through a long-lived
-  // handle sees the tree as it is now rather than as it was when the file was
-  // opened - which is the whole point of a build that fills the file in later.
+  // hands us - one per handle, see UmFileContextIsUserContext2.
   struct OpenFile {
     std::filesystem::path path;
 
     // Set once an open to read the file completes, and what its reads - and
     // the paging reads of a mapping or running program made through it - are
     // served from, however the file changes after.
-    std::shared_ptr<const FileSnapshot> snapshot;
+    std::shared_ptr<const OpenedFile> file;
 
     // WinFsp's directory buffer: filled on the first ReadDirectory for this
     // handle, then read back from in sorted, resumable order.
@@ -802,22 +798,23 @@ class VirtualFileSystem::Impl {
     try {
       const stdexec::prop stop{stdexec::get_stop_token,
                                m_request_stop.get_token()};
-      auto result = co_await stdexec::write_env(
-          m_tree.open(path, OpenContext{.requester_pid = caller,
-                                        .trace_lane = trace.lane()}),
-          stop);
+      std::expected<std::shared_ptr<const OpenedFile>, std::error_code> result =
+          co_await stdexec::write_env(
+              m_tree.open(path, OpenContext{.requester_pid = caller,
+                                            .trace_lane = trace.lane()}),
+              stop);
       if (!result) {
         pending->send(to_ntstatus(result.error()));
         co_return;
       }
-      auto snapshot = co_await stdexec::write_env(m_snapshots.take(path), stop);
-      if (!snapshot) {
-        pending->send(to_ntstatus(snapshot.error()));
+      const std::expected<FileInfo, std::error_code> attrs = (*result)->stat();
+      if (!attrs) {
+        pending->send(to_ntstatus(attrs.error()));
         co_return;
       }
       pending->storage.get()->Rsp.Create.Opened.FileInfo =
-          make_file_info((*snapshot)->info());
-      handle->snapshot = std::move(*snapshot);
+          make_file_info(*attrs);
+      handle->file = std::move(*result);
       pending->send(STATUS_SUCCESS);
     } catch (const std::system_error& e) {
       pending->send(to_ntstatus(e.code()));
@@ -879,23 +876,21 @@ class VirtualFileSystem::Impl {
                 PULONG bytes_transferred) {
     auto* response = FspFileSystemGetOperationContext()->Response;
     const auto* handle = static_cast<const OpenFile*>(file_context);
-    if (handle->snapshot) {
-      const std::string& content = handle->snapshot->content();
-      if (offset >= content.size()) {
-        return STATUS_END_OF_FILE;
+    if (length == 0 && handle->file) {
+      const std::expected<FileInfo, std::error_code> attrs =
+          handle->file->stat();
+      if (!attrs) {
+        return to_ntstatus(attrs.error());
       }
-      const auto count =
-          static_cast<ULONG>(std::min<UINT64>(length, content.size() - offset));
-      std::memcpy(buffer, content.data() + offset, count);
-      *bytes_transferred = count;
-      return STATUS_SUCCESS;
+      *bytes_transferred = 0;
+      return offset >= attrs->size ? STATUS_END_OF_FILE : STATUS_SUCCESS;
     }
     auto pending = std::make_shared<PendingResponse>(*this, *response);
     try {
       stdexec::spawn(
-          stdexec::starts_on(
-              m_file_io.get_scheduler(),
-              finish_read(pending, handle->path, buffer, offset, length)) |
+          stdexec::starts_on(m_file_io.get_scheduler(),
+                             finish_read(pending, handle->file, handle->path,
+                                         buffer, offset, length)) |
               stdexec::upon_error([](std::exception_ptr) noexcept {}),
           m_requests.get_token());
     } catch (...) {
@@ -903,14 +898,19 @@ class VirtualFileSystem::Impl {
     return STATUS_PENDING;
   }
   exec::task<void> finish_read(std::shared_ptr<PendingResponse> pending,
+                               std::shared_ptr<const OpenedFile> file,
                                std::filesystem::path path,
                                PVOID buffer,
                                UINT64 offset,
                                ULONG length) {
     try {
-      auto bytes = co_await stdexec::write_env(
-          m_tree.read(path, static_cast<Offset>(offset), length),
-          stdexec::prop{stdexec::get_stop_token, m_request_stop.get_token()});
+      std::expected<std::string, std::error_code> bytes =
+          co_await stdexec::write_env(
+              file ? file->read(static_cast<Offset>(offset), length)
+                   : DirectoryTreeUtil::read_range(
+                         m_tree, path, static_cast<Offset>(offset), length),
+              stdexec::prop{stdexec::get_stop_token,
+                            m_request_stop.get_token()});
       if (!bytes) {
         pending->send(to_ntstatus(bytes.error()));
         co_return;
@@ -929,13 +929,17 @@ class VirtualFileSystem::Impl {
     }
   }
 
-  // Re-queries rather than reporting what Open saw, so a file that was built
-  // while this handle was open reports its real size here. FileInfoTimeout is
-  // 0, so Windows asks every time rather than trusting a cached answer.
+  // Query the opened file so replacement of its path cannot redirect stat.
+  // FileInfoTimeout is 0, so Windows asks again for current attributes.
   NTSTATUS get_file_info(PVOID file_context, FSP_FSCTL_FILE_INFO* file_info) {
     const auto* handle = static_cast<const OpenFile*>(file_context);
-    if (handle->snapshot) {
-      *file_info = make_file_info(handle->snapshot->info());
+    if (handle->file) {
+      const std::expected<FileInfo, std::error_code> attrs =
+          handle->file->stat();
+      if (!attrs) {
+        return to_ntstatus(attrs.error());
+      }
+      *file_info = make_file_info(*attrs);
       return STATUS_SUCCESS;
     }
     const std::expected<EntryInfo, std::error_code> status =
@@ -1046,7 +1050,6 @@ class VirtualFileSystem::Impl {
   // the filesystem call into WinFsp in the middle of servicing a WinFsp
   // request. Handing it to the notifier defers it until read() has returned.
   void on_tree_changed(const DirectoryTreeDiff& diff) {
-    m_snapshots.changed(diff);
     const std::lock_guard<std::mutex> lock(m_notify_mutex);
     if (m_stopping) {
       return;
@@ -1270,9 +1273,6 @@ class VirtualFileSystem::Impl {
   mutable TraceLanePool m_reader_lanes{"reader"};
 
   const DirectoryTree& m_tree;
-  // What every open to read reads from: the version of its file it opened,
-  // which a later change to the file leaves alone.
-  FileSnapshots m_snapshots;
   const std::filesystem::path m_mountpoint;
 
   // The mount point as WinFsp wants it: its own buffer, because
