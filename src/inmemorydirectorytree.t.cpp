@@ -593,49 +593,71 @@ TEST_F(InMemoryDirectoryTree, ConcurrentReadersAndWritersStayConsistent) {
 
 }  // namespace
 
-namespace {
-
-std::expected<makebelieve::FileContent, std::error_code> read_whole(
-    const makebelieve::DirectoryTree& tree,
-    const std::filesystem::path& path) {
-  auto result = stdexec::sync_wait(tree.read_whole(path));
-  return std::get<0>(std::move(result).value());
+// An open reads the bytes and metadata published together by write_file().
+TEST_F(InMemoryDirectoryTree, OpenReturnsContentAndMetadata) {
+  const std::chrono::file_clock::time_point mtime =
+      std::chrono::file_clock::now();
+  tree().write_file("whole.txt", "whole", mtime);
+  const std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                      std::error_code>
+      first = makebelieve::DirectoryTreeUtil::open(tree(), "whole.txt");
+  ASSERT_TRUE(first.has_value()) << first.error().message();
+  EXPECT_EQ(
+      makebelieve::DirectoryTreeUtil::wait_read((*first)->read(0, 16)).value(),
+      "whole");
+  EXPECT_EQ((*first)->stat().value().size, 5U);
+  EXPECT_EQ((*first)->stat().value().mtime, mtime);
 }
 
-}  // namespace
+TEST_F(InMemoryDirectoryTree, OpensShareAFileVersionUntilItsMetadataChanges) {
+  const std::shared_ptr<const makebelieve::OpenedFile> first =
+      makebelieve::DirectoryTreeUtil::open(tree(), "hello.txt").value();
+  const std::shared_ptr<const makebelieve::OpenedFile> again =
+      makebelieve::DirectoryTreeUtil::open(tree(), "hello.txt").value();
+  EXPECT_EQ(first, again);
+  const makebelieve::FileInfo before = first->stat().value();
+  const std::chrono::file_clock::time_point updated =
+      before.mtime + std::chrono::seconds(1);
 
-// A file's content and info come as one, and are the tree's own content
-// rather than a copy of it: taking a file whole shares its buffer.
-TEST_F(InMemoryDirectoryTree, ReadWholeSharesTheFilesContent) {
-  const auto mtime = std::chrono::file_clock::now();
-  tree().write_file("whole.txt", "whole", mtime);
-  const auto first = read_whole(tree(), "whole.txt");
-  const auto second = read_whole(tree(), "whole.txt");
-  ASSERT_TRUE(first.has_value()) << first.error().message();
-  ASSERT_TRUE(second.has_value()) << second.error().message();
-  EXPECT_EQ(*first->bytes, "whole");
-  EXPECT_EQ(first->info.size, 5U);
-  EXPECT_EQ(first->info.mtime, mtime);
-  EXPECT_EQ(first->bytes, second->bytes);
+  tree().set_mtime("hello.txt", updated);
+  const std::shared_ptr<const makebelieve::OpenedFile> next =
+      makebelieve::DirectoryTreeUtil::open(tree(), "hello.txt").value();
+  EXPECT_NE(next, first);
+  EXPECT_EQ(first->stat().value().mtime, before.mtime);
+  EXPECT_EQ(next->stat().value().mtime, updated);
+  EXPECT_EQ(
+      makebelieve::DirectoryTreeUtil::wait_read(next->read(0, before.size))
+          .value(),
+      "hello world");
 }
 
 // Writing a file replaces its content rather than changing it, so content
 // already taken is left as it was.
-TEST_F(InMemoryDirectoryTree, ReadWholeContentOutlivesAWrite) {
-  const auto before = read_whole(tree(), "hello.txt");
+TEST_F(InMemoryDirectoryTree, OpenContentOutlivesAWrite) {
+  const std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                      std::error_code>
+      before = makebelieve::DirectoryTreeUtil::open(tree(), "hello.txt");
   tree().write_file("hello.txt", "goodbye");
-  const auto after = read_whole(tree(), "hello.txt");
+  const std::expected<std::shared_ptr<const makebelieve::OpenedFile>,
+                      std::error_code>
+      after = makebelieve::DirectoryTreeUtil::open(tree(), "hello.txt");
   ASSERT_TRUE(before.has_value());
   ASSERT_TRUE(after.has_value());
-  EXPECT_EQ(*before->bytes, "hello world");
-  EXPECT_EQ(*after->bytes, "goodbye");
-  EXPECT_EQ(after->info.size, 7U);
+  EXPECT_EQ(
+      makebelieve::DirectoryTreeUtil::wait_read((*before)->read(0, 16)).value(),
+      "hello world");
+  EXPECT_EQ(
+      makebelieve::DirectoryTreeUtil::wait_read((*after)->read(0, 16)).value(),
+      "goodbye");
+  EXPECT_EQ((*after)->stat().value().size, 7U);
 }
 
-TEST_F(InMemoryDirectoryTree, ReadWholeFailsAsReadDoes) {
-  EXPECT_EQ(read_whole(tree(), "missing.txt").error(),
+TEST_F(InMemoryDirectoryTree, OpenFailsAsReadDoes) {
+  EXPECT_EQ(makebelieve::DirectoryTreeUtil::open(tree(), "missing.txt").error(),
             std::errc::no_such_file_or_directory);
-  EXPECT_EQ(read_whole(tree(), "sub").error(), std::errc::is_a_directory);
-  EXPECT_EQ(read_whole(tree(), "../escape.txt").error(),
-            std::errc::no_such_file_or_directory);
+  EXPECT_EQ(makebelieve::DirectoryTreeUtil::open(tree(), "sub").error(),
+            std::errc::is_a_directory);
+  EXPECT_EQ(
+      makebelieve::DirectoryTreeUtil::open(tree(), "../escape.txt").error(),
+      std::errc::no_such_file_or_directory);
 }

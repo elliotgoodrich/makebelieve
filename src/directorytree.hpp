@@ -50,14 +50,7 @@ struct DirectoryInfo {
   std::chrono::file_clock::time_point mtime;
 };
 
-/// \class FileContent
-/// The whole of a file, and what it was when read, taken as one.
-struct FileContent {
-  /// Never changes, and shared so that a tree holding its files in memory can
-  /// hand one out without copying it.
-  std::shared_ptr<const std::string> bytes;
-  FileInfo info;
-};
+class OpenedFile;
 
 /// \class EntryInfo
 /// Describes a file or directory in a DirectoryTree.
@@ -150,13 +143,24 @@ using FileSender = exec::any_sender<exec::any_receiver<
                                    stdexec::set_stopped_t()>,
     exec::queries<stdexec::inplace_stop_token(
         stdexec::get_stop_token_t) noexcept>>>;
-/// An asynchronous open yielding the final file metadata or an error.
-using OpenSender = FileSender<FileInfo>;
+/// An asynchronous open yielding a file handle or an error.
+using OpenSender = FileSender<std::shared_ptr<const OpenedFile>>;
 /// An asynchronous read yielding file bytes or an error.
 using ReadSender = FileSender<std::string>;
 
-/// An asynchronous read of a whole file yielding its content or an error.
-using ReadWholeSender = FileSender<FileContent>;
+/// A handle to the file that was opened. If another file replaces it at the
+/// same path, stat() and read() still refer to the original file. Its contents
+/// may change while the handle is open. Keep the handle alive until each read
+/// sender has finished.
+class OpenedFile {
+ public:
+  virtual ~OpenedFile() = default;
+  [[nodiscard]] virtual std::expected<FileInfo, std::error_code> stat()
+      const = 0;
+  /// Reads up to size bytes at offset. A short read indicates EOF.
+  [[nodiscard]] virtual ReadSender read(Offset offset,
+                                        std::size_t size) const = 0;
+};
 
 /// @class DirectoryTree
 /// An abstract base class to describe an observable directory tree.
@@ -174,34 +178,14 @@ class DirectoryTree {
   [[nodiscard]] virtual std::expected<std::vector<TreeEntry>, std::error_code>
   ls(const std::filesystem::path& path) const = 0;
 
-  /// Opens the file at @a path, yielding its final metadata or an error
-  /// (`is_a_directory` for a directory). @a context identifies the requester.
-  /// Suspends while a build is needed. Cancellation
+  /// Opens @a path and retains its file identity for the life of the handle.
+  /// Returns `is_a_directory` for a directory. @a context identifies the
+  /// requester. Cancellation
   /// detaches this reader without stopping a build shared by other readers.
   /// Completion follows the @link FileSender threading contract.
   [[nodiscard]] virtual OpenSender open(
       const std::filesystem::path& path,
       const OpenContext& context = {}) const = 0;
-
-  /// Returns up to @a size bytes of @a path starting at @a offset, or an
-  /// error. A shorter result means end of file; zero size succeeds with an
-  /// empty result without opening the file. Await @link open first for final
-  /// contents. Waiting implementations suspend without occupying a dispatcher
-  /// thread. Cancellation comes from the receiver's stop token.
-  /// Completion follows the @link FileSender threading contract.
-  [[nodiscard]] virtual ReadSender read(const std::filesystem::path& path,
-                                        Offset offset,
-                                        std::size_t size) const = 0;
-
-  /// Returns the whole of the file at @a path and what it was when read, the
-  /// two taken as one: never bytes, or a size or time, from two versions of
-  /// the file. Fails as read() does, and with `is_a_directory` for a
-  /// directory. Await @link open first for final contents. Waiting
-  /// implementations suspend without occupying a dispatcher thread.
-  /// Cancellation comes from the receiver's stop token. Completion follows the
-  /// @link FileSender threading contract.
-  [[nodiscard]] virtual ReadWholeSender read_whole(
-      const std::filesystem::path& path) const = 0;
 
   /// Subscribes to changes in this object by calling @a callback and returns an
   /// RAII guard that will unsubscribe on destruction.

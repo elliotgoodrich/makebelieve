@@ -316,16 +316,10 @@ class BuildDirectoryTreeTest : public ::testing::Test {
   // Opens (which builds) then reads a whole output.
   static std::string read_output(const BuildDirectoryTree& tree,
                                  const std::filesystem::path& path) {
-    const std::expected<FileInfo, std::error_code> opened =
-        makebelieve::DirectoryTreeUtil::open(tree, path);
-    EXPECT_TRUE(opened.has_value());
-    if (!opened.has_value()) {
-      return {};
-    }
-    const auto content =
-        makebelieve::DirectoryTreeUtil::read(tree, path, 0, opened->size);
-    EXPECT_TRUE(content.has_value());
-    return content.value_or(std::string{});
+    const std::expected<std::string, std::error_code> bytes =
+        DirectoryTreeUtil::wait_read(DirectoryTreeUtil::read_whole(tree, path));
+    EXPECT_TRUE(bytes.has_value());
+    return bytes.value_or(std::string{});
   }
 };
 
@@ -375,14 +369,14 @@ TEST_F(BuildDirectoryTreeTest, OnlyOpenBuilds) {
   ASSERT_EQ(root->size(), 1U);
   EXPECT_EQ((*root)[0].name, "output.txt");
   EXPECT_EQ(output_size(tree, "output.txt"), 1U);
-  EXPECT_TRUE(makebelieve::DirectoryTreeUtil::read(tree, "output.txt", 0, 16)
-                  .has_value());
   EXPECT_EQ(runs, 0);
 
-  const std::expected<FileInfo, std::error_code> opened =
-      makebelieve::DirectoryTreeUtil::open(tree, "output.txt");
+  const std::expected<std::shared_ptr<const OpenedFile>, std::error_code>
+      opened = makebelieve::DirectoryTreeUtil::open(tree, "output.txt");
   ASSERT_TRUE(opened.has_value());
-  EXPECT_EQ(opened->size, 5U);
+  EXPECT_EQ((*opened)->stat().value().size, 5U);
+  EXPECT_EQ(DirectoryTreeUtil::wait_read((*opened)->read(0, 5)).value(),
+            "built");
   EXPECT_EQ(runs, 1);
 }
 
@@ -463,8 +457,8 @@ TEST_F(BuildDirectoryTreeTest, ACopyOfAFailingOutputFails) {
     return finished(std::unexpected(failure));
   });
 
-  const std::expected<FileInfo, std::error_code> opened =
-      makebelieve::DirectoryTreeUtil::open(tree, "copy.txt");
+  const std::expected<std::shared_ptr<const OpenedFile>, std::error_code>
+      opened = makebelieve::DirectoryTreeUtil::open(tree, "copy.txt");
   ASSERT_FALSE(opened.has_value());
   EXPECT_EQ(opened.error(), failure);
 }
@@ -477,8 +471,8 @@ TEST_F(BuildDirectoryTreeTest, OutputsCopyingEachOtherFailAsACycle) {
   int runs = 0;
   const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
 
-  const std::expected<FileInfo, std::error_code> opened =
-      makebelieve::DirectoryTreeUtil::open(tree, "a.txt");
+  const std::expected<std::shared_ptr<const OpenedFile>, std::error_code>
+      opened = makebelieve::DirectoryTreeUtil::open(tree, "a.txt");
   ASSERT_FALSE(opened.has_value());
   EXPECT_EQ(opened.error(), std::errc::resource_deadlock_would_occur);
   EXPECT_EQ(runs, 0);
@@ -611,8 +605,8 @@ TEST_F(BuildDirectoryTreeTest, RetriesAfterAFailedBuild) {
   });
 
   // The failed first build fails the open...
-  const std::expected<FileInfo, std::error_code> failed =
-      makebelieve::DirectoryTreeUtil::open(tree, "output.txt");
+  const std::expected<std::shared_ptr<const OpenedFile>, std::error_code>
+      failed = makebelieve::DirectoryTreeUtil::open(tree, "output.txt");
   ASSERT_FALSE(failed.has_value());
   EXPECT_EQ(failed.error(), std::errc::io_error);
   EXPECT_EQ(runs, 1);
@@ -657,8 +651,7 @@ TEST_F(BuildDirectoryTreeTest, RunnerCanReturnAnyFittingSender) {
   write_manifest("@/output.txt = run build %out\n");
 
   const BuildDirectoryTree tree(source, [](Command) {
-    return stdexec::just(std::string("generic")) |
-           stdexec::then([](std::string bytes) { return built(bytes); });
+    return stdexec::just(std::string("generic")) | stdexec::then(built);
   });
 
   EXPECT_EQ(read_output(tree, "output.txt"), "generic");
@@ -1119,7 +1112,7 @@ TEST_F(BuildDirectoryTreeTest, ABuildFinishingAfterItsRuleIsRemovedIsDropped) {
   const DeferredRunner builds;
   const BuildDirectoryTree tree(source, builds.runner());
 
-  std::expected<FileInfo, std::error_code> opened;
+  std::expected<std::shared_ptr<const OpenedFile>, std::error_code> opened;
   std::thread reader([&] {
     opened = makebelieve::DirectoryTreeUtil::open(tree, "output.txt");
   });
@@ -1192,26 +1185,15 @@ class FlakyTree : public DirectoryTree {
   [[nodiscard]] makebelieve::OpenSender open(
       const std::filesystem::path& path,
       const makebelieve::OpenContext& context) const override {
+    if (fail_reads) {
+      return stdexec::just(
+          std::expected<std::shared_ptr<const OpenedFile>, std::error_code>(
+              std::unexpected(
+                  std::make_error_code(std::errc::permission_denied))));
+    }
     return inner.open(path, context);
   }
 
-  [[nodiscard]] makebelieve::ReadSender read(const std::filesystem::path& path,
-                                             Offset offset,
-                                             std::size_t size) const override {
-    if (fail_reads) {
-      return stdexec::just(std::expected<std::string, std::error_code>(
-          std::unexpected(std::make_error_code(std::errc::permission_denied))));
-    }
-    return inner.read(path, offset, size);
-  }
-  [[nodiscard]] makebelieve::ReadWholeSender read_whole(
-      const std::filesystem::path& path) const override {
-    if (fail_reads) {
-      return stdexec::just(std::expected<FileContent, std::error_code>(
-          std::unexpected(std::make_error_code(std::errc::permission_denied))));
-    }
-    return inner.read_whole(path);
-  }
   [[nodiscard]] Subscription subscribe_to_changes(
       const std::function<void(const DirectoryTreeDiff&)>& callback)
       const override {

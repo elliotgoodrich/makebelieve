@@ -253,8 +253,8 @@ class FakeCommands {
       if (step.starts_with("open ")) {
         const std::string target = step.substr(5);
         activity(run, -1);
-        const std::expected<FileInfo, std::error_code> opened =
-            makebelieve::DirectoryTreeUtil::open(
+        const std::expected<std::shared_ptr<const OpenedFile>, std::error_code>
+            opened = makebelieve::DirectoryTreeUtil::open(
                 *tree, target, OpenContext{.requester_pid = run.pid});
         if (!opened.has_value() &&
             (opened.error() == std::errc::operation_canceled ||
@@ -296,6 +296,10 @@ class FakeCommands {
     }
     const ScopeGuard remove_from_tracker(
         [this, token = *added] { tracker.remove(token); });
+    {
+      const std::lock_guard lock(m_mutex);
+      ++m_runs[run.output];
+    }
     std::vector<std::thread> threads;
     for (const std::string& steps : split(script, "|")) {
       threads.emplace_back([this, &run, steps] { run_thread(run, steps); });
@@ -346,7 +350,6 @@ class FakeCommands {
     void start() & noexcept {
       {
         const std::lock_guard lock(m_run.commands->m_mutex);
-        ++m_run.commands->m_runs[m_run.output];
         m_run.commands->m_started.push_back(m_run.output);
       }
       // Its own thread, detached: it completes from there, never from within
@@ -384,6 +387,8 @@ class FakeCommands {
     };
   }
 
+  // Commands that passed process registration and started executing their
+  // script.
   int runs(const std::string& output) {
     const std::lock_guard lock(m_mutex);
     return m_runs[output];
@@ -407,7 +412,8 @@ class FakeCommands {
 };
 
 // What an open returned: ok, or the error's value.
-std::string outcome(const std::expected<FileInfo, std::error_code>& opened) {
+std::string outcome(const std::expected<std::shared_ptr<const OpenedFile>,
+                                        std::error_code>& opened) {
   return opened.has_value() ? "ok"
                             : "E" + std::to_string(opened.error().value());
 }
@@ -474,7 +480,8 @@ class Fixture {
   }
 
   // Opens @a output on no build's behalf.
-  std::expected<FileInfo, std::error_code> open(const std::string& output) {
+  std::expected<std::shared_ptr<const OpenedFile>, std::error_code> open(
+      const std::string& output) {
     return makebelieve::DirectoryTreeUtil::open(tree.value(), output,
                                                 OpenContext{});
   }
@@ -525,15 +532,22 @@ class Fixture {
     }
   };
 
-  // The bytes @a output holds now.
-  std::string content(const std::string& output) {
-    const auto info = tree.value().status(output);
-    if (!info.has_value()) {
-      return "missing";
+  void expect_inspection_starts_no_commands() {
+    const std::size_t before = commands.started().size();
+    const std::expected<std::vector<TreeEntry>, std::error_code> entries =
+        tree->ls("");
+    ASSERT_TRUE(entries.has_value());
+    ASSERT_FALSE(entries->empty());
+    for (const TreeEntry& entry : *entries) {
+      EXPECT_TRUE(tree->status(entry.name).has_value());
     }
-    return makebelieve::DirectoryTreeUtil::read(tree.value(), output, 0,
-                                                std::get<FileInfo>(*info).size)
-        .value_or("unreadable");
+    EXPECT_EQ(commands.started().size(), before);
+  }
+
+  std::string content(const std::string& output) {
+    return DirectoryTreeUtil::wait_read(
+               DirectoryTreeUtil::read_whole(*tree, output))
+        .value();
   }
 
   // Waits (bounded) until @a condition holds of the coordinator's stats.
@@ -809,11 +823,11 @@ TEST(BuildCoordinator, AnAttemptOpeningItsOwnOutputIsACycle) {
   fixture.declare("@/a = run open a\n");
   EXPECT_EQ(outcome(fixture.open("a")),
             error_of(std::errc::resource_deadlock_would_occur));
-  // Never published: still the placeholder.
-  EXPECT_EQ(fixture.content("a"), std::string(1, '\0'));
+  EXPECT_EQ(fixture.commands.runs("a"), 1);
+  fixture.expect_inspection_starts_no_commands();
 }
 
-TEST(BuildCoordinator, ATwoAttemptCycleStopsBothAndPublishesNeither) {
+TEST(BuildCoordinator, ATwoAttemptCycleStopsBoth) {
   Fixture fixture(2);
   // b ignores the failed open and never exits of its own accord.
   fixture.declare(
@@ -821,11 +835,14 @@ TEST(BuildCoordinator, ATwoAttemptCycleStopsBothAndPublishesNeither) {
       "@/b = run open a; hang\n");
   EXPECT_EQ(outcome(fixture.open("a")),
             error_of(std::errc::resource_deadlock_would_occur));
+  EXPECT_EQ(fixture.commands.runs("a"), 1);
+  EXPECT_EQ(fixture.commands.runs("b"), 1);
   EXPECT_EQ(outcome(fixture.open("b")),
             error_of(std::errc::resource_deadlock_would_occur));
-  EXPECT_EQ(fixture.content("a"), std::string(1, '\0'));
-  EXPECT_EQ(fixture.content("b"), std::string(1, '\0'));
+  EXPECT_LE(fixture.commands.runs("a"), 2);
+  EXPECT_LE(fixture.commands.runs("b"), 2);
   EXPECT_GE(fixture.commands.stopped(), 1);
+  fixture.expect_inspection_starts_no_commands();
 }
 
 TEST(BuildCoordinator, AThreeAttemptCycleStopsAllOfThem) {
@@ -836,16 +853,24 @@ TEST(BuildCoordinator, AThreeAttemptCycleStopsAllOfThem) {
       "@/c = run open a\n");
   Fixture::Opening a(fixture, "a");
   EXPECT_EQ(a.get(), error_of(std::errc::resource_deadlock_would_occur));
+  EXPECT_EQ(fixture.commands.runs("a"), 1);
+  EXPECT_EQ(fixture.commands.runs("b"), 1);
+  EXPECT_EQ(fixture.commands.runs("c"), 1);
   // The cycle's attempts all failed, and a retry of any of them is another
   // cycle, never a hang.
   for (const char* output : {"b", "c"}) {
+    const int a_runs = fixture.commands.runs("a");
+    const int b_runs = fixture.commands.runs("b");
+    const int c_runs = fixture.commands.runs("c");
     EXPECT_EQ(outcome(fixture.open(output)),
               error_of(std::errc::resource_deadlock_would_occur))
         << output;
+    // A retry can join work still finishing or run the three commands again.
+    EXPECT_LE(fixture.commands.runs("a"), a_runs + 1);
+    EXPECT_LE(fixture.commands.runs("b"), b_runs + 1);
+    EXPECT_LE(fixture.commands.runs("c"), c_runs + 1);
   }
-  for (const char* output : {"a", "b", "c"}) {
-    EXPECT_EQ(fixture.content(output), std::string(1, '\0')) << output;
-  }
+  fixture.expect_inspection_starts_no_commands();
 }
 
 TEST(BuildCoordinator, AnOpenFromNoBuildWaitsWithoutHoldingAPermit) {
@@ -874,7 +899,8 @@ TEST(BuildCoordinator, ACommandThatCannotBeAddedNeverRunsAndFails) {
   fixture.declare("@/a = run signal ran\n");
   fixture.commands.tracker.fail_next();
   EXPECT_EQ(outcome(fixture.open("a")), error_of(std::errc::no_such_process));
-  EXPECT_EQ(fixture.content("a"), std::string(1, '\0'));
+  EXPECT_EQ(fixture.commands.runs("a"), 0);
+  fixture.expect_inspection_starts_no_commands();
 }
 
 // An attempt stopped - here, found on a cycle by its own second thread - just

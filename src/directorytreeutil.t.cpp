@@ -62,6 +62,26 @@ TEST_F(DirectoryTreeUtil, MissingFromOneTreeIsNotEqual) {
   EXPECT_NE(diff.find("only_in_a.txt"), std::string::npos);
 }
 
+TEST_F(DirectoryTreeUtil, DiffSeesBytesBeyondTheSizeReportedByStatus) {
+  // Model a file that grows from one byte to two between status and read.
+  class GrowingTree : public makebelieve::InMemoryDirectoryTree {
+    std::expected<makebelieve::EntryInfo, std::error_code> status(
+        const std::filesystem::path& path) const override {
+      std::expected<makebelieve::EntryInfo, std::error_code> info =
+          InMemoryDirectoryTree::status(path);
+      if (info && path == "file") {
+        std::get<makebelieve::FileInfo>(*info).size = 1;
+      }
+      return info;
+    }
+  } growing;
+  growing.write_file("file", "ab");
+  b.write_file("file", "a");
+
+  EXPECT_EQ(makebelieve::DirectoryTreeUtil::diff(growing, b),
+            "file: content differs (2 bytes in a, 1 bytes in b)");
+}
+
 TEST_F(DirectoryTreeUtil, FileVersusDirectoryIsNotEqual) {
   a.write_file("entry", "content");
   b.make_directory("entry");

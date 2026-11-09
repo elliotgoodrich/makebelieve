@@ -3,6 +3,8 @@
 
 #include "directorytree.hpp"
 
+#include <exec/task.hpp>
+
 #include <algorithm>
 #include <cstddef>
 #include <expected>
@@ -69,12 +71,11 @@ std::string diff_at(const DirectoryTree& a,
                        kind_name(*status_a), kind_name(*status_b));
   }
 
-  if (const auto* file_a = std::get_if<FileInfo>(&*status_a)) {
-    const auto& file_b = std::get<FileInfo>(*status_b);
+  if (std::holds_alternative<FileInfo>(*status_a)) {
     const std::expected<std::string, std::error_code> content_a =
-        DirectoryTreeUtil::read(a, path, 0, file_a->size);
+        DirectoryTreeUtil::wait_read(DirectoryTreeUtil::read_whole(a, path));
     const std::expected<std::string, std::error_code> content_b =
-        DirectoryTreeUtil::read(b, path, 0, file_b.size);
+        DirectoryTreeUtil::wait_read(DirectoryTreeUtil::read_whole(b, path));
     if (!content_a.has_value() || !content_b.has_value()) {
       return std::format("{}: failed to read from {}", describe(path),
                          !content_a.has_value() ? "a" : "b");
@@ -111,30 +112,65 @@ std::string diff_at(const DirectoryTree& a,
   return {};
 }
 
-}  // namespace
-
-OpenSender DirectoryTreeUtil::open_by_status(
+exec::task<std::expected<std::string, std::error_code>> read_file_range(
     const DirectoryTree& tree,
-    const std::filesystem::path& path) {
-  return stdexec::just() |
-         stdexec::then(
-             [&tree, path]() -> std::expected<FileInfo, std::error_code> {
-               const auto info = tree.status(path);
-               if (!info) {
-                 return std::unexpected(info.error());
-               }
-               if (const auto* file = std::get_if<FileInfo>(&*info)) {
-                 return *file;
-               }
-               return std::unexpected(
-                   std::make_error_code(std::errc::is_a_directory));
-             });
+    std::filesystem::path path,
+    Offset offset,
+    std::size_t size) {
+  // Keep the path-read convention for empty requests and invalid offsets,
+  // including rejection of an escaping path before examining the range.
+  if (size == 0 || offset < 0) {
+    const std::filesystem::path normal = path.lexically_normal();
+    if (path.has_root_path() ||
+        (normal.begin() != normal.end() && *normal.begin() == "..")) {
+      co_return std::unexpected(
+          std::make_error_code(std::errc::no_such_file_or_directory));
+    }
+    if (offset < 0) {
+      co_return std::unexpected(
+          std::make_error_code(std::errc::invalid_argument));
+    }
+    co_return std::string{};
+  }
+  std::expected<std::shared_ptr<const OpenedFile>, std::error_code> opened =
+      co_await tree.open(path);
+  if (!opened) {
+    co_return std::unexpected(opened.error());
+  }
+  co_return co_await (*opened)->read(offset, size);
 }
 
-std::expected<FileInfo, std::error_code> DirectoryTreeUtil::open(
+exec::task<std::expected<std::string, std::error_code>> read_whole_file(
     const DirectoryTree& tree,
-    const std::filesystem::path& path,
-    const OpenContext& context) {
+    std::filesystem::path path,
+    OpenContext context) {
+  std::expected<std::shared_ptr<const OpenedFile>, std::error_code> opened =
+      co_await tree.open(path, context);
+  if (!opened) {
+    co_return std::unexpected(opened.error());
+  }
+  constexpr std::size_t chunk_size = std::size_t{64} * 1024;
+  std::string content;
+  for (;;) {
+    std::expected<std::string, std::error_code> chunk =
+        co_await (*opened)->read(static_cast<Offset>(content.size()),
+                                 chunk_size);
+    if (!chunk) {
+      co_return std::unexpected(chunk.error());
+    }
+    content += *chunk;
+    if (chunk->size() < chunk_size) {
+      co_return content;
+    }
+  }
+}
+
+}  // namespace
+
+std::expected<std::shared_ptr<const OpenedFile>, std::error_code>
+DirectoryTreeUtil::open(const DirectoryTree& tree,
+                        const std::filesystem::path& path,
+                        const OpenContext& context) {
   auto result = stdexec::sync_wait(stdexec::write_env(
       tree.open(path, context),
       stdexec::prop{stdexec::get_stop_token, stdexec::inplace_stop_token{}}));
@@ -149,8 +185,30 @@ std::expected<std::string, std::error_code> DirectoryTreeUtil::read(
     const std::filesystem::path& path,
     Offset offset,
     std::size_t size) {
+  return wait_read(read_range(tree, path, offset, size));
+}
+
+ReadSender DirectoryTreeUtil::read_range(const DirectoryTree& tree,
+                                         const std::filesystem::path& path,
+                                         Offset offset,
+                                         std::size_t size) {
+  return stdexec::write_env(
+      read_file_range(tree, path, offset, size),
+      stdexec::prop{stdexec::get_start_scheduler, stdexec::inline_scheduler{}});
+}
+
+ReadSender DirectoryTreeUtil::read_whole(const DirectoryTree& tree,
+                                         const std::filesystem::path& path,
+                                         const OpenContext& context) {
+  return stdexec::write_env(
+      read_whole_file(tree, path, context),
+      stdexec::prop{stdexec::get_start_scheduler, stdexec::inline_scheduler{}});
+}
+
+std::expected<std::string, std::error_code> DirectoryTreeUtil::wait_read(
+    ReadSender sender) {
   auto result = stdexec::sync_wait(stdexec::write_env(
-      tree.read(path, offset, size),
+      std::move(sender),
       stdexec::prop{stdexec::get_stop_token, stdexec::inplace_stop_token{}}));
   if (!result) {
     return std::unexpected(std::make_error_code(std::errc::operation_canceled));

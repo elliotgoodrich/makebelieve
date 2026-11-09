@@ -28,8 +28,8 @@ class BuildCoordinator;
 /// one entry per declared `@/output = <action> <argument>` rule. `open` builds
 /// an output that is unbuilt or dirty, waiting until the build its
 /// @link CommandRunner returned completes. `open` suspends instead of
-/// blocking its caller; filesystem backends use that interface. `status` and
-/// `read` never build: an unbuilt output reports size 1, otherwise the size of
+/// blocking its caller; filesystem backends use that interface. `status`
+/// never builds: an unbuilt output reports size 1, otherwise the size of
 /// its last build.
 ///
 /// Each build is one generation of its output, run through a
@@ -38,13 +38,12 @@ class BuildCoordinator;
 /// build started, and gets that build's result even if the output changes
 /// before it finishes; if it has changed, the open waits for the build after
 /// it instead. (This is deliberate, and new: an open used to wait on through
-/// build after build for as long as the output kept changing.) Content read
-/// afterwards may already be a later build's: reads are not snapshotted here,
-/// but by the filesystem serving the tree, which takes a @link FileSnapshot
-/// of each file as it is opened.
-/// Opens made by a build's own command (as the coordinator tells them apart)
-/// give its permit back while they wait, and one that would wait on a cycle of
-/// builds fails with `std::errc::resource_deadlock_would_occur`.
+/// build after build for as long as the output kept changing.) The returned
+/// handle pins the bytes and metadata obtained after that wait, even if a later
+/// build replaces the output. Opens made by a build's own command (as the
+/// coordinator tells them apart) give its permit back while they wait, and one
+/// that would wait on a cycle of builds fails with
+/// `std::errc::resource_deadlock_would_occur`.
 ///
 /// It then observes @a source for the rest of its life, recording the inputs
 /// each build reads, so a change to one of those inputs rebuilds the outputs
@@ -157,8 +156,8 @@ class BuildDirectoryTree : public DirectoryTree {
   using DirectoryTree::open;
 
   /// Builds @a path if unbuilt or dirty (or waits for a build under way) and
-  /// returns its info once up to date, or the error of the failed build it
-  /// waited on - or fails as the coordinator's `wait` does, for a request
+  /// returns its opened file once up to date, or the error of the failed build
+  /// it waited on - or fails as the coordinator's `wait` does, for a request
   /// @a context says it cannot let wait.
   [[nodiscard]] OpenSender open(const std::filesystem::path& path,
                                 const OpenContext& context = {}) const override;
@@ -195,15 +194,6 @@ class BuildDirectoryTree : public DirectoryTree {
   /// nothing is failing. Builds nothing. What a `status` output serves, for
   /// whatever wants it without reading one - tests, say.
   [[nodiscard]] std::string status_report() const;
-
-  /// Returns a sender reading up to @a size bytes at @a offset from @a path's
-  /// last published build. Does not build; await @link open first.
-  [[nodiscard]] ReadSender read(const std::filesystem::path& path,
-                                Offset offset,
-                                std::size_t size) const override;
-
-  [[nodiscard]] ReadWholeSender read_whole(
-      const std::filesystem::path& path) const override;
 
   [[nodiscard]] Subscription subscribe_to_changes(
       const std::function<void(const DirectoryTreeDiff&)>& callback)

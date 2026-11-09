@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "inmemorydirectorytree.hpp"
 
-#include "directorytreeutil.hpp"
-
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -58,18 +56,60 @@ bool is_within(const std::filesystem::path& entry,
   return result.in1 == directory.end() && result.in2 != entry.end();
 }
 
+class MemoryFile final : public OpenedFile {
+  std::shared_ptr<const std::string> m_bytes;
+  std::chrono::file_clock::time_point m_mtime;
+
+ public:
+  MemoryFile(std::shared_ptr<const std::string> bytes,
+             std::chrono::file_clock::time_point mtime)
+      : m_bytes(std::move(bytes)), m_mtime(mtime) {}
+
+  [[nodiscard]] FileInfo info() const {
+    return {.size = m_bytes->size(), .mtime = m_mtime};
+  }
+
+  [[nodiscard]] std::shared_ptr<const MemoryFile> with_mtime(
+      std::chrono::file_clock::time_point mtime) const {
+    return std::make_shared<const MemoryFile>(m_bytes, mtime);
+  }
+
+  [[nodiscard]] std::expected<FileInfo, std::error_code> stat() const override {
+    return info();
+  }
+
+  [[nodiscard]] ReadSender read(Offset offset,
+                                std::size_t size) const override {
+    return stdexec::just() |
+           stdexec::then(
+               [this, offset,
+                size]() -> std::expected<std::string, std::error_code> {
+                 if (offset < 0) {
+                   return std::unexpected(
+                       std::make_error_code(std::errc::invalid_argument));
+                 }
+                 if (static_cast<std::uint64_t>(offset) >= m_bytes->size()) {
+                   return std::string{};
+                 }
+                 return m_bytes->substr(static_cast<std::size_t>(offset), size);
+               });
+  }
+};
+
 }  // namespace
 
 class InMemoryDirectoryTree::Impl {
-  struct Node {
-    EntryInfo info;
-    // Only set when this node is a file. Replaced rather than changed when the
-    // file is written, so read_whole() can hand it out as it is.
-    std::shared_ptr<const std::string> content;
-  };
+  using Node = std::variant<DirectoryInfo, std::shared_ptr<const MemoryFile>>;
+
+  static EntryInfo entry_info(const Node& node) {
+    if (const auto* dir = std::get_if<DirectoryInfo>(&node)) {
+      return *dir;
+    }
+    return std::get<std::shared_ptr<const MemoryFile>>(node)->info();
+  }
 
   std::map<std::filesystem::path, Node> m_entries{
-      {std::filesystem::path{}, Node{.info = DirectoryInfo{}}}};
+      {std::filesystem::path{}, DirectoryInfo{}}};
 
   // Guards m_entries: shared for readers, exclusive for mutators. A mutator
   // releases it before notifying subscribers, so a callback that reads back
@@ -99,16 +139,17 @@ class InMemoryDirectoryTree::Impl {
 
       const auto it = m_entries.find(*normalized);
       assert((it == m_entries.end() ||
-              std::holds_alternative<FileInfo>(it->second.info)) &&
+              !std::holds_alternative<DirectoryInfo>(it->second)) &&
              "write_file() must not target an existing directory");
 
       diff.entries_changed = {*normalized};
       if (it == m_entries.end()) {
         diff.child_lists_changed = {normalized->parent_path()};
       }
-      m_entries[*normalized] =
-          Node{.info = FileInfo{.size = content.size(), .mtime = mtime},
-               .content = std::make_shared<const std::string>(content)};
+      m_entries.insert_or_assign(
+          *normalized,
+          std::make_shared<const MemoryFile>(
+              std::make_shared<const std::string>(content), mtime));
     }
     notify_subscribers(diff);
   }
@@ -129,7 +170,7 @@ class InMemoryDirectoryTree::Impl {
 
       diff.entries_changed = {*normalized};
       diff.child_lists_changed = {normalized->parent_path()};
-      m_entries[*normalized] = Node{.info = DirectoryInfo{.mtime = mtime}};
+      m_entries[*normalized] = DirectoryInfo{.mtime = mtime};
     }
     notify_subscribers(diff);
   }
@@ -169,7 +210,14 @@ class InMemoryDirectoryTree::Impl {
       const auto it = m_entries.find(*normalized);
       assert(it != m_entries.end() &&
              "set_mtime() must target an existing entry");
-      std::visit([mtime](auto& info) { info.mtime = mtime; }, it->second.info);
+      if (auto* dir = std::get_if<DirectoryInfo>(&it->second)) {
+        dir->mtime = mtime;
+      } else {
+        auto& file = std::get<std::shared_ptr<const MemoryFile>>(it->second);
+        if (file->info().mtime != mtime) {
+          file = file->with_mtime(mtime);
+        }
+      }
 
       diff.entries_changed = {*normalized};
     }
@@ -190,7 +238,7 @@ class InMemoryDirectoryTree::Impl {
       return std::unexpected(
           std::make_error_code(std::errc::no_such_file_or_directory));
     }
-    return it->second.info;
+    return entry_info(it->second);
   }
 
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
@@ -204,7 +252,7 @@ class InMemoryDirectoryTree::Impl {
     const std::shared_lock lock(m_mutex);
     const auto it = m_entries.find(*normalized);
     if (it == m_entries.end() ||
-        !std::holds_alternative<DirectoryInfo>(it->second.info)) {
+        !std::holds_alternative<DirectoryInfo>(it->second)) {
       return std::unexpected(
           std::make_error_code(std::errc::no_such_file_or_directory));
     }
@@ -216,53 +264,16 @@ class InMemoryDirectoryTree::Impl {
     for (const auto& [entry_path, node] : m_entries) {
       if (entry_path != *normalized &&
           entry_path.parent_path() == *normalized) {
-        entries.push_back({.name = entry_path.filename(), .info = node.info});
+        entries.push_back(
+            {.name = entry_path.filename(), .info = entry_info(node)});
       }
     }
     return entries;
   }
 
-  // offset and size are the signature DirectoryTree::read() defines, so they
-  // cannot be reordered or renamed apart here.
-  // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-  [[nodiscard]] std::expected<std::string, std::error_code> read(
-      const std::filesystem::path& path,
-      Offset offset,
-      std::size_t size) const {
-    // NOLINTEND(bugprone-easily-swappable-parameters)
-    const std::optional<std::filesystem::path> normalized = normalize(path);
-    if (!normalized.has_value()) {
-      return std::unexpected(
-          std::make_error_code(std::errc::no_such_file_or_directory));
-    }
-    if (offset < 0) {
-      return std::unexpected(std::make_error_code(std::errc::invalid_argument));
-    }
-    if (size == 0) {
-      return std::string{};
-    }
-
-    const std::shared_lock lock(m_mutex);
-    const auto it = m_entries.find(*normalized);
-    if (it == m_entries.end()) {
-      return std::unexpected(
-          std::make_error_code(std::errc::no_such_file_or_directory));
-    }
-    if (!std::holds_alternative<FileInfo>(it->second.info)) {
-      return std::unexpected(std::make_error_code(std::errc::is_a_directory));
-    }
-
-    const std::string& content = *it->second.content;
-    if (static_cast<std::size_t>(offset) >= content.size()) {
-      return std::string{};
-    }
-    return content.substr(static_cast<std::size_t>(offset), size);
-  }
-
-  // The file's content and its info come from one look at the node, under
-  // one lock, so they always match - and the content is shared, not copied.
-  [[nodiscard]] std::expected<FileContent, std::error_code> read_whole(
-      const std::filesystem::path& path) const {
+  [[nodiscard]] std::expected<std::shared_ptr<const OpenedFile>,
+                              std::error_code>
+  open_file(const std::filesystem::path& path) const {
     const std::optional<std::filesystem::path> normalized = normalize(path);
     if (!normalized.has_value()) {
       return std::unexpected(
@@ -275,11 +286,12 @@ class InMemoryDirectoryTree::Impl {
       return std::unexpected(
           std::make_error_code(std::errc::no_such_file_or_directory));
     }
-    const auto* file = std::get_if<FileInfo>(&it->second.info);
+    const auto* file =
+        std::get_if<std::shared_ptr<const MemoryFile>>(&it->second);
     if (file == nullptr) {
       return std::unexpected(std::make_error_code(std::errc::is_a_directory));
     }
-    return FileContent{.bytes = it->second.content, .info = *file};
+    return *file;
   }
 
   [[nodiscard]] Subscription subscribe_to_changes(
@@ -297,7 +309,7 @@ class InMemoryDirectoryTree::Impl {
       const std::filesystem::path& normalized) const {
     const auto it = m_entries.find(normalized.parent_path());
     return it != m_entries.end() &&
-           std::holds_alternative<DirectoryInfo>(it->second.info);
+           std::holds_alternative<DirectoryInfo>(it->second);
   }
 
   // Invokes every registered callback with @a diff, from a copy of the list
@@ -357,21 +369,8 @@ InMemoryDirectoryTree::ls(const std::filesystem::path& path) const {
 
 OpenSender InMemoryDirectoryTree::open(const std::filesystem::path& path,
                                        const OpenContext&) const {
-  return DirectoryTreeUtil::open_by_status(*this, path);
-}
-
-ReadSender InMemoryDirectoryTree::read(const std::filesystem::path& path,
-                                       Offset offset,
-                                       std::size_t size) const {
-  return stdexec::just() | stdexec::then([this, path, offset, size] {
-           return m_impl->read(path, offset, size);
-         });
-}
-
-ReadWholeSender InMemoryDirectoryTree::read_whole(
-    const std::filesystem::path& path) const {
   return stdexec::just() |
-         stdexec::then([this, path] { return m_impl->read_whole(path); });
+         stdexec::then([this, path] { return m_impl->open_file(path); });
 }
 
 Subscription InMemoryDirectoryTree::subscribe_to_changes(
