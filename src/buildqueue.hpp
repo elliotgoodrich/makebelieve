@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-#include "intrusivetask.hpp"
-
 #include <exec/finally.hpp>
 #include <stdexec/execution.hpp>
 
@@ -85,10 +83,13 @@ class BuildQueue {
   class Lease;
 
  private:
-  // One piece of work in line for a slot: what to call once it is handed one,
-  // and the ticket it waits under, if any.
+  // One piece of work in line for a slot: what to call once it is handed one
+  // (a function and the operation it acts on, so queueing never allocates),
+  // and the ticket it waits under, if any. Lives in the operation that queues
+  // it, which holds it in place while it is queued.
   struct Waiter {
-    IntrusiveTask task;
+    void* target;
+    void (*call)(void* target) noexcept;
     QueueTicket* ticket = nullptr;
     Waiter* next = nullptr;
   };
@@ -215,7 +216,7 @@ class BuildQueue {
         return;
       }
     }
-    waiter->task();
+    waiter->call(waiter->target);
   }
 
   // A sender that completes with a Slot once one is free - at once if one
@@ -384,8 +385,6 @@ class BuildQueue<Handoff>::Lease {
 template <stdexec::scheduler Handoff>
 template <class Receiver, bool Reacquire>
 class BuildQueue<Handoff>::SlotOperation {
-  friend class IntrusiveTask;
-
   struct OnStop {
     SlotOperation* self;
     void operator()() const noexcept { self->on_stop(); }
@@ -488,7 +487,12 @@ class BuildQueue<Handoff>::SlotOperation {
       : m_queue(&queue),
         m_lease(lease),
         m_receiver(std::move(receiver)),
-        m_waiting{.task = IntrusiveTask(*this), .ticket = ticket} {}
+        m_waiting{.target = this,
+                  .call =
+                      [](void* target) noexcept {
+                        static_cast<SlotOperation*>(target)->operator()();
+                      },
+                  .ticket = ticket} {}
 
   SlotOperation(const SlotOperation&) = delete;
   SlotOperation& operator=(const SlotOperation&) = delete;
