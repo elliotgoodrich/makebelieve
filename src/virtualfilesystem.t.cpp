@@ -27,6 +27,7 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -1881,6 +1882,124 @@ TEST_F(VirtualFileSystem, OpenHandleKeepsTheContentItOpened) {
   in.seekg(0);
   EXPECT_TRUE(read_rest(in) == old_content);
 }
+
+// Readers of two versions at once each get their own, whichever reads first.
+// The kernel caches a file's pages, and does so by inode rather than by
+// handle: were both versions one inode, the old reader reading on after a
+// newer open would fill that cache with the old content, which the newer
+// reader would then be served.
+TEST_F(VirtualFileSystem, AnOlderHandleReadingOnDoesNotServeANewerOpen) {
+  const std::string old_content = large_contents();
+  std::string new_content = old_content;
+  std::ranges::reverse(new_content);
+  tree().write_file("a.bin", old_content);
+  mount();
+  std::ifstream old_in(mountpoint() / "a.bin", std::ios::binary);
+  ASSERT_TRUE(old_in);
+
+  tree().write_file("a.bin", new_content, std::chrono::file_clock::now() + 1s);
+  // Opened, but nothing read yet.
+  std::ifstream new_in(mountpoint() / "a.bin", std::ios::binary);
+  ASSERT_TRUE(new_in);
+  EXPECT_TRUE(read_rest(old_in) == old_content);
+  EXPECT_TRUE(read_rest(new_in) == new_content);
+
+  // And again, each having read its whole version once already.
+  old_in.clear();
+  old_in.seekg(0);
+  new_in.clear();
+  new_in.seekg(0);
+  EXPECT_TRUE(read_rest(old_in) == old_content);
+  EXPECT_TRUE(read_rest(new_in) == new_content);
+  EXPECT_TRUE(read_file(mountpoint() / "a.bin") == new_content);
+}
+
+#ifndef _WIN32
+// The tree it is given, counting the reads that reach it through the files it
+// opens.
+class CountingTree final : public DirectoryTree {
+  const DirectoryTree& m_tree;
+  std::shared_ptr<std::atomic<int>> m_reads =
+      std::make_shared<std::atomic<int>>(0);
+
+  class File final : public OpenedFile {
+    std::shared_ptr<const OpenedFile> m_file;
+    std::shared_ptr<std::atomic<int>> m_reads;
+
+   public:
+    File(std::shared_ptr<const OpenedFile> file,
+         std::shared_ptr<std::atomic<int>> reads)
+        : m_file(std::move(file)), m_reads(std::move(reads)) {}
+
+    [[nodiscard]] std::expected<FileInfo, std::error_code> stat()
+        const override {
+      return m_file->stat();
+    }
+
+    [[nodiscard]] ReadSender read(Offset offset,
+                                  std::size_t size) const override {
+      ++*m_reads;
+      return m_file->read(offset, size);
+    }
+  };
+
+ public:
+  explicit CountingTree(const DirectoryTree& tree) : m_tree(tree) {}
+
+  [[nodiscard]] int reads() const { return m_reads->load(); }
+
+  [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
+      const std::filesystem::path& path) const override {
+    return m_tree.status(path);
+  }
+
+  [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
+      const std::filesystem::path& path) const override {
+    return m_tree.ls(path);
+  }
+
+  [[nodiscard]] OpenSender open(const std::filesystem::path& path,
+                                const OpenContext& context) const override {
+    return m_tree.open(path, context) |
+           stdexec::then([reads = m_reads](
+                             std::expected<std::shared_ptr<const OpenedFile>,
+                                           std::error_code> file)
+                             -> std::expected<std::shared_ptr<const OpenedFile>,
+                                              std::error_code> {
+             if (!file.has_value()) {
+               return file;
+             }
+             return std::make_shared<const File>(std::move(*file), reads);
+           });
+  }
+
+  [[nodiscard]] Subscription subscribe_to_changes(
+      const std::function<void(const DirectoryTreeDiff&)>& callback)
+      const override {
+    return m_tree.subscribe_to_changes(callback);
+  }
+};
+
+// Opened again unchanged, a file is read from the pages the kernel kept of it,
+// without reaching the tree. Once it changes, an open reads the new content.
+TEST_F(VirtualFileSystem, ReopeningAnUnchangedFileReadsItsCachedPages) {
+  const std::string content = large_contents();
+  tree().write_file("a.bin", content);
+  const CountingTree counting(tree());
+  const makebelieve::VirtualFileSystem vfs(counting, mountpoint(), notifier());
+  ASSERT_TRUE(read_file(mountpoint() / "a.bin") == content);
+  const int first = counting.reads();
+  EXPECT_GT(first, 0);
+
+  EXPECT_TRUE(read_file(mountpoint() / "a.bin") == content);
+  EXPECT_EQ(counting.reads(), first);
+
+  std::string changed = content;
+  std::ranges::reverse(changed);
+  tree().write_file("a.bin", changed, std::chrono::file_clock::now() + 1s);
+  EXPECT_TRUE(read_file(mountpoint() / "a.bin") == changed);
+}
+#endif
 
 // What a mapping taken while an earlier version of the file is still mapped
 // sees. On Linux, the new version. On Windows, WinFsp keeps one file node -

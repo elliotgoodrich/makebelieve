@@ -198,4 +198,5 @@ if(MAKEBELIEVE_BUILD_BENCHMARKS)
   endfunction()
 
   makebelieve_add_benchmark(iocontext)
+  makebelieve_add_benchmark(outputread)
 endif()
