@@ -866,6 +866,11 @@ class VirtualFileSystem::Impl {
       }
       info.fh = retain(std::make_unique<FileHandle>(
           FileHandle{.path = name, .file = std::move(version)}));
+      // Pages the kernel already has of this inode stay: an inode is one
+      // version of its file, fixed by the first open to read it, and a change
+      // gives the name a new inode that an open by name looks up afresh. So
+      // a file opened again unchanged is read from memory, not through us.
+      info.keep_cache = 1;
       reply_when_announced(name, announce_through,
                            [this, request, info]() mutable noexcept {
                              if (fuse_reply_open(request->take(), &info) != 0) {
