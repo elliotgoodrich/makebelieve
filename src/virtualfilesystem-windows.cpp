@@ -722,15 +722,34 @@ class VirtualFileSystem::Impl {
   // Owns the response storage after the dispatcher returns. If starting or
   // running the coroutine fails, the outstanding request still gets one reply.
   struct PendingResponse {
+    // A copy of the response the dispatcher started, which it reuses once
+    // the request is pended. Only the bytes the response uses are copied:
+    // one is made for every pended open and read.
+    class Storage {
+      // Raw room for the record, which C++ will not make an array of: it
+      // ends in a flexible array member (see RecordBuffer).
+      struct alignas(FSP_FSCTL_TRANSACT_RSP) Chunk {
+        unsigned char bytes[sizeof(FSP_FSCTL_TRANSACT_RSP)];
+      };
+      std::unique_ptr<Chunk[]> m_chunks;
+
+     public:
+      explicit Storage(const FSP_FSCTL_TRANSACT_RSP& response)
+          : m_chunks(std::make_unique_for_overwrite<Chunk[]>(
+                (response.Size + sizeof(Chunk) - 1) / sizeof(Chunk))) {
+        std::memcpy(m_chunks.get(), &response, response.Size);
+      }
+      [[nodiscard]] FSP_FSCTL_TRANSACT_RSP* get() const {
+        return reinterpret_cast<FSP_FSCTL_TRANSACT_RSP*>(m_chunks.get());
+      }
+    };
+
     Impl* owner;
-    RecordBuffer<FSP_FSCTL_TRANSACT_RSP, FSP_FSCTL_TRANSACT_RSP_BUFFER_SIZEMAX>
-        storage;
+    Storage storage;
     OpenFile* unopened = nullptr;
     bool replied = false;
     explicit PendingResponse(Impl& self, const FSP_FSCTL_TRANSACT_RSP& response)
-        : owner(&self) {
-      std::memcpy(storage.get(), &response, response.Size);
-    }
+        : owner(&self), storage(response) {}
     void send(NTSTATUS status) noexcept {
       auto* response = storage.get();
       response->IoStatus.Status = status;
