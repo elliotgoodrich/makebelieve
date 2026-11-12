@@ -124,6 +124,9 @@ It holds, each part in path order:
 
 - the problems that kept the latest edit to the manifest from being
   applied, one per line, as the mount reports them;
+- each path that more than one rule produces, with each of those rules
+  and what it matched, indented (see
+  [Directory Expansion](#directory-expansion));
 - each build under way, as `building`, or `waiting to build` while it
   waits its turn for a place to run, with its command - and
   `(its last build failed)` after one being retried;
@@ -147,8 +150,9 @@ build.makebelieve:4: expected `@/<output> = <action> <command>`
     pandoc: index.txt: withBinaryFile: does not exist (No such file or directory)
 ```
 
-A build leaves the report once it finishes, and a failure once the
-output next builds, or its rule leaves the manifest; the manifest's
+A build leaves the report once it finishes, a failure once the output
+next builds or its rule leaves the manifest, and a conflict once only one
+rule produces the path; the manifest's
 problems leave it once an edit to it is applied. While anything is
 building or waiting, the report will change again, so read it again
 later for the answer. Reading it builds nothing.
@@ -212,16 +216,38 @@ declares them:
 @/site/*.html = run pandoc @/gen/*.md -o %out
 ```
 
-Two rules may never be able to produce the same path, whatever source
-files come to exist. So a wildcard bans its suffix - whatever follows the
-`*` - from its directory: with `@/out/*.foo` declared, nothing else in
-`@/out` may end in `.foo`. The manifest is rejected when it holds, beside
-that wildcard:
+Generated and hand-written files can share a directory, and rules may
+overlap:
 
-- an output ending in the suffix - `@/out/a.foo`;
-- another wildcard whose suffix ends in it, or that it ends in -
-  `@/out/lib*.foo`, `@/out/*.x.foo` or `@/out/*o`;
-- an output inside a directory ending in it - `@/out/x.foo/y`.
+```mb
+@/pkg/*.py = copy pkg/*.py
+@/pkg/*_pb2.py = run ./gen_pb2.sh pkg/*.proto %out
+```
+
+A path that two rules actually produce, given the files that exist, is a
+conflict. It still appears, but nothing builds it and opening it fails
+with an I/O error (`EIO`, or `STATUS_IO_DEVICE_ERROR` on Windows), like a
+failed build. No rule takes precedence - not even a rule naming the path
+outright over a wildcard - and every other path is unaffected. A
+`status` output (see [Generated Files](#generated-files)) names the path,
+both rules and the files they matched:
+
+```text
+@/site/index.html is claimed by more than one rule:
+    build.makebelieve:1: @/site/*.html = run pandoc src/*.md -o %out (matching src/index.md)
+    build.makebelieve:2: @/site/index.html = run ./gen.sh
+```
+
+Conflicts come and go with the files that cause them. With the two rules
+above, `@/site/index.html` builds until `src/index.md` is created, fails
+while it exists, and builds again once it is removed. Whatever read the
+path is rebuilt when it becomes a conflict or stops being one, as it is
+for any other change. A rule that would make a file of a directory that
+another rule's output is in, such as `@/out/*.foo` matching `x.foo` beside
+`@/out/x.foo/y`, conflicts with every output in that directory.
+
+The manifest itself is still rejected when two rules name the same path
+outright, or when a rule names a path inside another rule's output.
 
 Nor may a wildcard over outputs be able to produce something its own
 pattern matches, directly or through other wildcards, since its outputs
@@ -259,6 +285,16 @@ dropped:
 ```text
 makebelieve: @/index.md failed (exit 1): run pandoc --from markdown index.txt -o %out
     pandoc: index.txt: withBinaryFile: does not exist (No such file or directory)
+```
+
+So does each path that comes to be claimed by more than one rule (see
+[Directory Expansion](#directory-expansion)), as `status` shows it, and
+again if the rules claiming it change:
+
+```text
+makebelieve: @/site/index.html is claimed by more than one rule:
+    build.makebelieve:1: @/site/*.html = run pandoc src/*.md -o %out (matching src/index.md)
+    build.makebelieve:2: @/site/index.html = run ./gen.sh
 ```
 
 From anywhere else, a `status` output holds the same report for every

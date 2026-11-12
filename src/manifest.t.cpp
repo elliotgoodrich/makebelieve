@@ -256,62 +256,57 @@ INSTANTIATE_TEST_SUITE_P(
                            "@/*.txt = status\n",
                   .expected = {},
                   .error_lines = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}},
-        // A wildcard bans what its outputs end in - whatever follows the `*` -
-        // from its directory: no other output there may end in it, whichever
-        // is declared first and whatever comes before.
+        // Rules that could produce the same path, depending on the source
+        // files there are, are accepted: only the paths they both come to
+        // produce fail, which is the build's concern, not the manifest's.
+        ParseCase{.name = "accepts_outputs_a_wildcard_could_also_produce",
+                  .input = "@/out/*.foo = copy src/*.txt\n"
+                           "@/out/a.foo = run a\n"
+                           "@/out/lib*.foo = copy src/*.txt\n"
+                           "@/out/*.x.foo = copy src/*.txt\n"
+                           "@/out/x.foo/y = run b\n",
+                  .expected =
+                      {{"out/*.foo", Action::Copy, "src/*.txt", "src/*.txt"},
+                       {"out/a.foo", Action::Run, "a"},
+                       {"out/lib*.foo", Action::Copy, "src/*.txt", "src/*.txt"},
+                       {"out/*.x.foo", Action::Copy, "src/*.txt", "src/*.txt"},
+                       {"out/x.foo/y", Action::Run, "b"}}},
+        // In either order, and a wildcard may produce a file where another
+        // output needs a directory.
         ParseCase{
-            .name = "rejects_an_output_ending_in_a_banned_suffix",
-            .input = "@/out/*.foo = copy src/*.txt\n"
-                     "@/out/a.foo = run a\n"
-                     "@/b.bar = run b\n"
-                     "@/lib*.bar = copy src/*.txt\n"
-                     "@/out/.foo = run c\n"
-                     "@/a.foo = run d\n"
-                     "@/other/a.foo = run e\n"
-                     "@/out/a.food = run f\n",
-            .expected = {{"out/*.foo", Action::Copy, "src/*.txt", "src/*.txt"},
-                         {"b.bar", Action::Run, "b"},
-                         {"a.foo", Action::Run, "d"},
-                         {"other/a.foo", Action::Run, "e"},
-                         {"out/a.food", Action::Run, "f"}},
-            .error_lines = {2, 4, 5}},
-        ParseCase{
-            .name = "rejects_a_wildcard_banning_a_declared_output",
+            .name = "accepts_a_wildcard_that_could_produce_a_declared_output",
             .input = "@/out/a.foo = run a\n"
                      "@/out/*.foo = copy src/*.txt\n"
-                     "@/out/a* = copy src/*.txt\n"
-                     "@/out/*.bar = copy src/*.txt\n",
+                     "@/gen/x.d/file = run b\n"
+                     "@/gen/*.d = copy src/*.c\n"
+                     "@/main.o/*.x = copy src/*.c\n"
+                     "@/*.o = copy src/*.c\n",
             .expected = {{"out/a.foo", Action::Run, "a"},
-                         {"out/*.bar", Action::Copy, "src/*.txt", "src/*.txt"}},
-            .error_lines = {2, 3}},
-        // Nor may a wildcard produce a file where another output needs a
-        // directory, in either order.
-        ParseCase{.name = "rejects_a_wildcard_that_could_produce_a_directory",
-                  .input = "@/gen/x.d/file = run a\n"
-                           "@/gen/*.d = copy src/*.c\n"
-                           "@/*.o = copy src/*.c\n"
-                           "@/main.o/file = run b\n"
-                           "@/main.o/*.x = copy src/*.c\n",
-                  .expected = {{"gen/x.d/file", Action::Run, "a"},
-                               {"*.o", Action::Copy, "src/*.c", "src/*.c"}},
-                  .error_lines = {2, 4, 5}},
-        // Two wildcards in one directory clash when either's suffix ends in
-        // the other's, whatever comes before their `*`s.
-        ParseCase{.name = "rejects_wildcards_sharing_a_suffix",
-                  .input = "@/*.o = copy a/*.c\n"
-                           "@/lib*.o = copy b/*.c\n"
-                           "@/a* = copy c/*.c\n"
-                           "@/*.d = copy a/*.c\n"
-                           "@/lib*.a = copy b/*.c\n"
-                           "@/sub/*.o = copy b/*.c\n"
-                           "@/*.x.o = copy d/*.c\n"
-                           "@/*d = copy d/*.c\n"
-                           "@/bin*.a = copy d/*.c\n",
-                  .expected = {{"*.o", Action::Copy, "a/*.c", "a/*.c"},
-                               {"*.d", Action::Copy, "a/*.c", "a/*.c"},
-                               {"lib*.a", Action::Copy, "b/*.c", "b/*.c"},
-                               {"sub/*.o", Action::Copy, "b/*.c", "b/*.c"}},
-                  .error_lines = {2, 3, 7, 8, 9}},
+                         {"out/*.foo", Action::Copy, "src/*.txt", "src/*.txt"},
+                         {"gen/x.d/file", Action::Run, "b"},
+                         {"gen/*.d", Action::Copy, "src/*.c", "src/*.c"},
+                         {"main.o/*.x", Action::Copy, "src/*.c", "src/*.c"},
+                         {"*.o", Action::Copy, "src/*.c", "src/*.c"}}},
+        // Even two wildcards with the same output pattern.
+        ParseCase{
+            .name = "accepts_wildcards_sharing_an_output_pattern",
+            .input = "@/src/*.js = copy src/*.js\n"
+                     "@/src/*.js = run esbuild src/*.ts --outfile=%out\n"
+                     "@/pkg/*.py = copy pkg/*.py\n"
+                     "@/pkg/*_pb2.py = run protoc pkg/*.proto\n",
+            .expected = {{"src/*.js", Action::Copy, "src/*.js", "src/*.js"},
+                         {"src/*.js", Action::Run,
+                          "esbuild src/*.ts --outfile=%out", "src/*.ts"},
+                         {"pkg/*.py", Action::Copy, "pkg/*.py", "pkg/*.py"},
+                         {"pkg/*_pb2.py", Action::Run, "protoc pkg/*.proto",
+                          "pkg/*.proto"}}},
+        // But a wildcard still cannot need a directory where a simple rule
+        // declares a file.
+        ParseCase{.name = "rejects_a_wildcard_inside_a_declared_output",
+                  .input = "@/out = run a\n"
+                           "@/out/*.o = copy src/*.c\n",
+                  .expected = {{"out", Action::Run, "a"}},
+                  .error_lines = {2}},
         // A source pattern under `@/` matches outputs instead of source
         // files, whatever declares them, and is kept without its `@/`.
         ParseCase{
@@ -352,10 +347,12 @@ INSTANTIATE_TEST_SUITE_P(
 // whatever the `*` matched put into the output and every `*` of the command.
 TEST(ManifestInstantiate, SubstitutesTheStem) {
   const makebelieve::Manifest manifest = makebelieve::Manifest::parse(
+      "# objects\n"
       "@/out/lib*.o = run cc -c src/*.cpp -MF *.d -o %out\n");
   ASSERT_EQ(manifest.rules().size(), 1U);
   const makebelieve::Manifest::Rule& rule = manifest.rules()[0];
   ASSERT_TRUE(rule.is_wildcard());
+  EXPECT_EQ(rule.line, 2U);
 
   const auto matched = makebelieve::Manifest::instantiate(rule, "main.cpp");
   ASSERT_TRUE(matched.has_value());
@@ -363,6 +360,8 @@ TEST(ManifestInstantiate, SubstitutesTheStem) {
   EXPECT_EQ(matched->action, Action::Run);
   EXPECT_EQ(matched->command, "cc -c src/main.cpp -MF main.d -o %out");
   EXPECT_FALSE(matched->is_wildcard());
+  // It keeps the line of the rule it stands for.
+  EXPECT_EQ(matched->line, 2U);
 
   // The `*` matches at least one character, and the whole name must match.
   EXPECT_FALSE(makebelieve::Manifest::instantiate(rule, ".cpp").has_value());

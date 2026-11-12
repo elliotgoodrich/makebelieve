@@ -69,6 +69,10 @@ class Manifest {
     /// declared outputs, rather than files in the manifest's directory.
     bool wildcard_over_outputs = false;
 
+    /// The 1-based line of the manifest that declared the rule, or of the
+    /// wildcard rule it was instantiated from.
+    std::size_t line = 0;
+
     [[nodiscard]] bool is_wildcard() const { return !wildcard_source.empty(); }
   };
 
@@ -92,13 +96,12 @@ class Manifest {
   /// An output with a `*` makes a `run`, `capture` or `copy` rule a wildcard
   /// rule. The `*` must be the only one and in the file name, and so must the
   /// one in its source pattern, which names source files inside the manifest's
-  /// directory or, under `@/`, other outputs. No two rules may be able to
-  /// produce the same path whatever source files come to exist, so a wildcard
-  /// bans its suffix - whatever follows its `*` - from its directory: an
-  /// output there, or a directory of one, ending in that suffix is rejected,
-  /// as is another wildcard there if either's suffix ends in the other's. Nor
-  /// may a wildcard over outputs be able to produce, directly or through other
-  /// wildcards, an output its own pattern matches.
+  /// directory or, under `@/`, other outputs. A wildcard may produce a path
+  /// that another rule declares too, depending on what source files exist;
+  /// that is not decided here but by whatever matches the wildcards, which
+  /// fails that one path. A wildcard over outputs may not be able to produce,
+  /// directly or through other wildcards, an output its own pattern matches,
+  /// or its outputs would never end.
   ///
   /// Each line that breaks these is reported in @link errors and left out of
   /// @link rules.

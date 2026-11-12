@@ -12,7 +12,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -160,7 +159,8 @@ std::optional<Manifest::Rule> Manifest::instantiate(
               .action = rule.action,
               .command = std::move(command),
               .wildcard_source = {},
-              .wildcard_over_outputs = false};
+              .wildcard_over_outputs = false,
+              .line = rule.line};
 }
 
 Manifest Manifest::parse(std::string_view text) {
@@ -171,31 +171,6 @@ Manifest Manifest::parse(std::string_view text) {
   std::map<std::filesystem::path, std::size_t> files;
   std::map<std::filesystem::path, std::size_t> directories;
 
-  // What each accepted wildcard's outputs end in - whatever follows its `*` -
-  // by the directory they are in. Nothing else there may end in it: sooner or
-  // later a source file would turn up to make the wildcard produce that name.
-  struct BannedSuffix {
-    std::string suffix;
-    std::size_t line;
-  };
-  std::unordered_map<std::filesystem::path, std::vector<BannedSuffix>>
-      banned_suffixes;
-
-  // The suffix banned in @a path's directory that its name ends in, if any.
-  const auto banned_suffix =
-      [&](const std::filesystem::path& path) -> const BannedSuffix* {
-    const auto banned = banned_suffixes.find(path.parent_path());
-    if (banned == banned_suffixes.end()) {
-      return nullptr;
-    }
-    const std::string name = path.filename().generic_string();
-    const auto it =
-        std::ranges::find_if(banned->second, [&](const BannedSuffix& other) {
-          return name.ends_with(other.suffix);
-        });
-    return it == banned->second.end() ? nullptr : &*it;
-  };
-
   // Accepted copies of outputs, checked once every output is known.
   struct CopyOfOutput {
     std::size_t rule;
@@ -204,9 +179,6 @@ Manifest Manifest::parse(std::string_view text) {
     std::filesystem::path source;
   };
   std::vector<CopyOfOutput> copies;
-
-  // The line each accepted rule was declared on.
-  std::vector<std::size_t> lines;
 
   std::size_t start = 0;
   for (std::size_t number = 1; start <= text.size(); ++number) {
@@ -374,76 +346,6 @@ Manifest Manifest::parse(std::string_view text) {
       continue;
     }
 
-    // Nor may anything end in a suffix banned where it is: not one of this
-    // output's directories...
-    const BannedSuffix* banned = nullptr;
-    for (std::filesystem::path parent = output->parent_path();
-         banned == nullptr && !parent.empty(); parent = parent.parent_path()) {
-      banned = banned_suffix(parent);
-    }
-    if (banned != nullptr) {
-      reject(
-          std::format("`{}` is inside a directory ending in `{}`, which "
-                      "only files of the wildcard on line {} may",
-                      left, banned->suffix, banned->line));
-      continue;
-    }
-
-    // ...nor the output itself. A wildcard bans its own suffix, so nothing
-    // already there may end in that either.
-    const std::filesystem::path directory = output->parent_path();
-    if (!wildcard) {
-      if (const BannedSuffix* suffix = banned_suffix(*output)) {
-        reject(
-            std::format("`{}` ends in `{}`, which only outputs of the "
-                        "wildcard on line {} may",
-                        left, suffix->suffix, suffix->line));
-        continue;
-      }
-    } else {
-      const std::string suffix =
-          NamePattern(output->filename().generic_string()).suffix;
-      const auto ends_in_it = [&](const auto& declared) {
-        return declared.first.parent_path() == directory &&
-               declared.first.filename().generic_string().ends_with(suffix);
-      };
-      if (const auto it = std::ranges::find_if(files, ends_in_it);
-          it != files.end()) {
-        reject(
-            std::format("`{}` bans outputs ending in `{}` from its "
-                        "directory, but line {} declares one",
-                        left, suffix, it->second));
-        continue;
-      }
-      if (const auto it = std::ranges::find_if(directories, ends_in_it);
-          it != directories.end()) {
-        reject(
-            std::format("`{}` bans names ending in `{}` from its "
-                        "directory, but the output on line {} is inside "
-                        "one",
-                        left, suffix, it->second));
-        continue;
-      }
-      // Each wildcard's outputs would end in the other's suffix if either
-      // suffix ends in the other.
-      std::vector<BannedSuffix>& siblings = banned_suffixes[directory];
-      if (const auto it =
-              std::ranges::find_if(siblings,
-                                   [&](const BannedSuffix& other) {
-                                     return suffix.ends_with(other.suffix) ||
-                                            other.suffix.ends_with(suffix);
-                                   });
-          it != siblings.end()) {
-        reject(std::format(
-            "`{}` and the wildcard on line {} could both "
-            "produce outputs ending in `{}`",
-            left, it->line,
-            suffix.size() > it->suffix.size() ? suffix : it->suffix));
-        continue;
-      }
-      siblings.push_back({.suffix = suffix, .line = number});
-    }
-
     if (!wildcard) {
       files.emplace(*output, number);
     }
@@ -457,12 +359,12 @@ Manifest Manifest::parse(std::string_view text) {
                         .left = std::string(left),
                         .source = std::move(*copied_output)});
     }
-    lines.push_back(number);
     manifest.m_rules.push_back({.output = *output,
                                 .action = *action,
                                 .command = std::move(command),
                                 .wildcard_source = std::move(wildcard_source),
-                                .wildcard_over_outputs = over_outputs});
+                                .wildcard_over_outputs = over_outputs,
+                                .line = number});
   }
 
   // The rules that turn out not to stand once every rule is known, by index.
@@ -507,7 +409,7 @@ Manifest Manifest::parse(std::string_view text) {
   for (std::size_t rule = 0; rule < rules.size(); ++rule) {
     if (feeds[rule][rule]) {
       manifest.m_errors.push_back(
-          {.line = lines[rule],
+          {.line = rules[rule].line,
            .message = std::format(
                "`@/{}` could produce its own sources, so its outputs would "
                "never end",
