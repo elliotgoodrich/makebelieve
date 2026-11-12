@@ -37,6 +37,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -247,20 +248,70 @@ std::expected<std::vector<Manifest::Rule>, std::string> read_rules(
                                      parsed.rules().end());
 }
 
-// Maps each output @a rules declare to its command, a wildcard rule declaring
-// one for every file in @a source its pattern matches right now.
-std::map<std::filesystem::path, Command> expand_rules(
-    const DirectoryTree& source,
-    const std::vector<Manifest::Rule>& rules) {
+// One rule's claim on a path, as a `status` output names it when more than one
+// rule claims that path.
+struct Claim {
+  // What the rule would build. Its output is the claimed path, or a directory
+  // of it - one the rule would make a file, where another rule needs a
+  // directory.
+  Command command;
+
+  // The line of the manifest declaring the rule, and the rule as it spells it.
+  std::size_t line = 0;
+  std::string rule;
+
+  // The source file - or `@/` and the output - a wildcard matched to claim
+  // the path. Empty for a simple rule.
+  std::filesystem::path matched;
+
+  [[nodiscard]] friend bool operator==(const Claim&, const Claim&) = default;
+};
+
+// What a manifest's rules declare, given the files their wildcards match.
+struct Expansion {
+  // Each path exactly one rule claims, mapped to the command that builds it.
   std::map<std::filesystem::path, Command> commands;
-  const auto declare = [&](const Manifest::Rule& rule) {
-    commands.emplace(rule.output, Command{.output = rule.output,
-                                          .action = rule.action,
-                                          .text = rule.command});
+
+  // Each path more than one rule claims, mapped to every claim on it in line
+  // order. Nothing builds it, and opening it fails.
+  std::map<std::filesystem::path, std::vector<Claim>> conflicts;
+};
+
+// @a rule as its manifest line spells it.
+std::string to_string(const Manifest::Rule& rule) {
+  std::string text(k_generated_prefix);
+  text += rule.output.generic_string();
+  text += " = ";
+  text += to_string(rule.action);
+  if (!rule.command.empty()) {
+    text += ' ';
+    text += rule.command;
+  }
+  return text;
+}
+
+// Finds every path @a rules claim, a wildcard rule claiming one for every file
+// in @a source its pattern matches right now and every output it matches.
+// Two rules may claim the same path, or one may claim a path as a file where
+// another claims something inside it: each such path is a conflict, and every
+// other path's one claim declares it.
+Expansion expand_rules(const DirectoryTree& source,
+                       const std::vector<Manifest::Rule>& rules) {
+  std::map<std::filesystem::path, std::vector<Claim>> claims;
+  const auto claim = [&](const Manifest::Rule& rule,
+                         const Manifest::Rule& simple,
+                         std::filesystem::path matched) {
+    claims[simple.output].push_back(
+        Claim{.command = Command{.output = simple.output,
+                                 .action = simple.action,
+                                 .text = simple.command},
+              .line = rule.line,
+              .rule = to_string(rule),
+              .matched = std::move(matched)});
   };
   for (const Manifest::Rule& rule : rules) {
     if (!rule.is_wildcard()) {
-      declare(rule);
+      claim(rule, rule, {});
       continue;
     }
     if (rule.wildcard_over_outputs) {
@@ -277,38 +328,78 @@ std::map<std::filesystem::path, Command> expand_rules(
       }
       if (const std::optional<Manifest::Rule> matched =
               Manifest::instantiate(rule, entry.name.generic_string())) {
-        declare(*matched);
+        claim(rule, *matched, rule.wildcard_source.parent_path() / entry.name);
       }
     }
   }
 
-  // A wildcard over outputs matches those declared so far, which may be what
-  // lets another match, so go round until nothing is added. The manifest
-  // rejects wildcards that could feed themselves, so this ends.
+  // A wildcard over outputs matches every path claimed so far, which may be
+  // what lets another match, so go round until nothing is added - matching
+  // each path once per rule. The manifest rejects wildcards that could feed
+  // themselves, so this ends.
+  std::set<std::pair<std::size_t, std::filesystem::path>> tried;
   for (bool added = true; added;) {
     added = false;
-    for (const Manifest::Rule& rule : rules) {
+    for (std::size_t index = 0; index < rules.size(); ++index) {
+      const Manifest::Rule& rule = rules[index];
       if (!rule.wildcard_over_outputs) {
         continue;
       }
-      std::vector<Manifest::Rule> matches;
-      for (const auto& [output, command] : commands) {
-        if (output.parent_path() != rule.wildcard_source.parent_path()) {
+      std::vector<std::pair<Manifest::Rule, std::filesystem::path>> matches;
+      for (const auto& [output, others] : claims) {
+        if (output.parent_path() != rule.wildcard_source.parent_path() ||
+            !tried.emplace(index, output).second) {
           continue;
         }
-        if (std::optional<Manifest::Rule> matched =
-                Manifest::instantiate(rule, output.filename().generic_string());
-            matched.has_value() && !commands.contains(matched->output)) {
-          matches.push_back(std::move(*matched));
+        if (std::optional<Manifest::Rule> matched = Manifest::instantiate(
+                rule, output.filename().generic_string())) {
+          matches.emplace_back(std::move(*matched), output);
         }
       }
-      for (const Manifest::Rule& matched : matches) {
-        declare(matched);
+      for (const auto& [matched, output] : matches) {
+        claim(rule, matched, std::filesystem::path("@") / output);
         added = true;
       }
     }
   }
-  return commands;
+
+  // A path claimed with something claimed inside it is a directory, and each
+  // claim on it, which would make it a file, conflicts with every claim
+  // inside it.
+  std::set<std::filesystem::path> directories;
+  for (const auto& [output, others] : claims) {
+    for (std::filesystem::path parent = output.parent_path(); !parent.empty();
+         parent = parent.parent_path()) {
+      if (claims.contains(parent)) {
+        directories.insert(parent);
+      }
+    }
+  }
+
+  Expansion expansion;
+  for (const auto& [output, own] : claims) {
+    if (directories.contains(output)) {
+      continue;
+    }
+    std::vector<Claim> all = own;
+    for (std::filesystem::path parent = output.parent_path(); !parent.empty();
+         parent = parent.parent_path()) {
+      if (directories.contains(parent)) {
+        const std::vector<Claim>& above = claims.at(parent);
+        all.insert(all.end(), above.begin(), above.end());
+      }
+    }
+    if (all.size() == 1) {
+      expansion.commands.emplace(output, std::move(all.front().command));
+      continue;
+    }
+    std::ranges::sort(all, [](const Claim& a, const Claim& b) {
+      return std::tie(a.line, a.matched, a.command.output) <
+             std::tie(b.line, b.matched, b.command.output);
+    });
+    expansion.conflicts.emplace(output, std::move(all));
+  }
+  return expansion;
 }
 
 }  // namespace
@@ -345,6 +436,11 @@ class BuildDirectoryTree::Impl {
   // Every declared output mapped to the command that (re)builds it, following
   // the manifest and the files its wildcards match as they change.
   std::map<std::filesystem::path, Command> m_commands;
+
+  // Every path more than one rule claims right now, as expand_rules() found
+  // it: not in m_commands, never built, shown with its placeholder, and
+  // failing whatever opens it.
+  std::map<std::filesystem::path, std::vector<Claim>> m_conflicts;
 
   // Outputs that need (re)building: every output but a `status` output, which
   // nobody builds, starts stale; a successful build clears it, an input change
@@ -604,6 +700,9 @@ class BuildDirectoryTree::Impl {
       report += m_manifest_problems;
       report += '\n';
     }
+    for (const auto& [output, claims] : m_conflicts) {
+      append_conflict(report, output, claims);
+    }
     for (const auto& [output, claimed] : m_claimed) {
       // One whose rule went, or became a report's, mid-build is no longer the
       // report's concern.
@@ -625,7 +724,7 @@ class BuildDirectoryTree::Impl {
       if (!m_in_flight.contains(output)) {
         append_failure(report, output, failure,
                        failure.failed_input.has_value() &&
-                           m_failures.contains(*failure.failed_input));
+                           is_failing(*failure.failed_input));
       }
     }
     return report;
@@ -649,6 +748,10 @@ class BuildDirectoryTree::Impl {
         record_read(*requester, output);
       }
     }
+    // Read all the same, so whatever read it rebuilds once it is resolved.
+    if (is_conflicting(output)) {
+      co_return std::make_error_code(std::errc::io_error);
+    }
     const BuildCoordinator::AttemptPtr target =
         bring_up_to_date(output, context.trace_lane);
     if (target == nullptr) {
@@ -666,6 +769,11 @@ class BuildDirectoryTree::Impl {
     }
     if (const auto error = co_await build_now(path, context)) {
       co_return std::unexpected(error);
+    }
+    // Its build may have succeeded just as the path became a conflict, which
+    // left only the placeholder in place.
+    if (is_conflicting(path.lexically_normal())) {
+      co_return std::unexpected(std::make_error_code(std::errc::io_error));
     }
     co_return co_await m_structure.open(path);
   }
@@ -865,7 +973,12 @@ class BuildDirectoryTree::Impl {
   exec::task<BuildResult> copy_output(std::filesystem::path source,
                                       BuildCoordinator::AttemptPtr self,
                                       std::optional<TraceLane> lane) {
-    // Its input even if the copy fails, so the original building retries it.
+    // Its input even if the copy fails, so the original building retries it -
+    // or, for a conflict, resolving it does.
+    if (is_conflicting(source)) {
+      co_return std::unexpected(BuildFailure(
+          std::make_error_code(std::errc::io_error), {as_input(source)}));
+    }
     if (const BuildCoordinator::AttemptPtr target =
             bring_up_to_date(source, lane)) {
       if (const std::error_code error = co_await m_coordinator->wait_as(
@@ -883,9 +996,24 @@ class BuildDirectoryTree::Impl {
                           .inputs = {as_input(source)}};
   }
 
+  // Whether @a output is a path the manifest declares, whether one rule
+  // claims it or more than one.
   [[nodiscard]] bool is_declared(const std::filesystem::path& output) {
     const std::lock_guard lock(m_mutex);
-    return m_commands.contains(output);
+    return m_commands.contains(output) || m_conflicts.contains(output);
+  }
+
+  // Whether more than one rule claims @a output.
+  [[nodiscard]] bool is_conflicting(const std::filesystem::path& output) {
+    const std::lock_guard lock(m_mutex);
+    return m_conflicts.contains(output);
+  }
+
+  // Whether opening @a output fails for now: its last build failed, or more
+  // than one rule claims it.
+  // @pre m_mutex is held.
+  [[nodiscard]] bool is_failing(const std::filesystem::path& output) const {
+    return m_failures.contains(output) || m_conflicts.contains(output);
   }
 
   // Records that the build of @a reader opened @a output, if that build is one
@@ -1132,6 +1260,8 @@ class BuildDirectoryTree::Impl {
 
     std::optional<Launch> next;
     BuildCoordinator::AttemptPtr orphaned;
+    std::error_code orphaned_error =
+        std::make_error_code(std::errc::no_such_file_or_directory);
     std::string failure_report;
     {
       const std::lock_guard lock(m_mutex);
@@ -1159,6 +1289,10 @@ class BuildDirectoryTree::Impl {
         if (attempts != m_attempts.end()) {
           orphaned = std::move(attempts->second.next);
           m_attempts.erase(attempts);
+        }
+        // Or claimed by another rule too, which opening it fails as.
+        if (m_conflicts.contains(output)) {
+          orphaned_error = std::make_error_code(std::errc::io_error);
         }
       } else {
         // Nothing but a change to its inputs or rule marks an output stale
@@ -1195,8 +1329,7 @@ class BuildDirectoryTree::Impl {
     m_coordinator->complete(
         attempt, result.has_value() ? std::error_code() : result.error().error);
     if (orphaned != nullptr) {
-      m_coordinator->complete(
-          orphaned, std::make_error_code(std::errc::no_such_file_or_directory));
+      m_coordinator->complete(orphaned, orphaned_error);
     }
 
     // After the release, as nothing waiting needs it.
@@ -1250,6 +1383,37 @@ class BuildDirectoryTree::Impl {
     append_indented(report, failure.standard_error);
   }
 
+  // Appends that @a output is claimed by more than one rule, as a report gives
+  // it: a line naming it, followed by each of @a claims, indented, as
+  // `build.makebelieve:LINE: <rule>`, then what a wildcard matched and, for a
+  // rule that would make a directory of @a output a file, which.
+  static void append_conflict(std::string& report,
+                              const std::filesystem::path& output,
+                              const std::vector<Claim>& claims) {
+    append_output(report, output);
+    report += " is claimed by more than one rule:\n";
+    for (const Claim& claim : claims) {
+      report +=
+          std::format("    {}:{}: {}", k_manifest_name, claim.line, claim.rule);
+      const bool matched = !claim.matched.empty();
+      const bool above = claim.command.output != output;
+      if (matched || above) {
+        report += " (";
+        if (matched) {
+          report += "matching ";
+          report += claim.matched.generic_string();
+        }
+        if (above) {
+          report += matched ? "; it makes " : "it makes ";
+          append_output(report, claim.command.output);
+          report += " a file";
+        }
+        report += ')';
+      }
+      report += '\n';
+    }
+  }
+
   // Records how @a output's build by @a ran went, as @a result says: a success
   // clears any failure it had, a failure replaces it - unless the rule changed
   // mid-build, when it says nothing of the rule now. Returns the failure as
@@ -1287,8 +1451,7 @@ class BuildDirectoryTree::Impl {
     for (const std::filesystem::path& input : result.error().inputs) {
       if (const std::optional<std::filesystem::path> named =
               output_named_by(input);
-          named.has_value() && *named != output &&
-          m_failures.contains(*named)) {
+          named.has_value() && *named != output && is_failing(*named)) {
         failure.failed_input = named;
         failure.copies_failed_input = named == copied;
         break;
@@ -1751,10 +1914,23 @@ class BuildDirectoryTree::Impl {
   // command changed goes stale (rebuilt eagerly if opened). Outputs whose rule
   // is unchanged keep their built content, unless they read one that was
   // added, removed or changed.
-  void apply_rules(const std::map<std::filesystem::path, Command>& commands) {
+  //
+  // A path that more than one rule claims is shown, with its placeholder, but
+  // has no command: it is removed as an output, if it was one, and added again
+  // once only one rule claims it.
+  void apply_rules(Expansion expansion) {
+    const std::map<std::filesystem::path, Command>& commands =
+        expansion.commands;
     std::vector<std::filesystem::path> removed;
     std::vector<std::filesystem::path> added;
     std::vector<std::filesystem::path> changed;
+    // Paths that more than one rule claims now, but did not before; and those
+    // that more than one did, but none does now.
+    std::vector<std::filesystem::path> now_conflicting;
+    std::vector<std::filesystem::path> unclaimed;
+    // Each conflict that is new, or claimed by different rules than before,
+    // as append_conflict() gives it, for the failure handler.
+    std::vector<std::string> conflict_reports;
     // Outputs that were not `status` outputs before, but are now.
     std::vector<std::filesystem::path> now_status;
     // What a `status` output that is new shows from the start.
@@ -1815,7 +1991,23 @@ class BuildDirectoryTree::Impl {
           update_dependents(output, {});
           m_dependencies.erase(output);
         }
+        for (const auto& [output, claims] : expansion.conflicts) {
+          const auto before = m_conflicts.find(output);
+          if (before == m_conflicts.end()) {
+            now_conflicting.push_back(output);
+          }
+          if (before == m_conflicts.end() || before->second != claims) {
+            append_conflict(conflict_reports.emplace_back(), output, claims);
+          }
+        }
+        for (const auto& [output, claims] : m_conflicts) {
+          if (!commands.contains(output) &&
+              !expansion.conflicts.contains(output)) {
+            unclaimed.push_back(output);
+          }
+        }
         m_commands = commands;
+        m_conflicts = std::move(expansion.conflicts);
         m_status_outputs.clear();
         for (const auto& [output, command] : m_commands) {
           if (command.action == Manifest::Action::Status) {
@@ -1835,8 +2027,14 @@ class BuildDirectoryTree::Impl {
 
       // Removals first, so a new output can take the place of a directory that
       // only removed outputs occupied. A `status` output holds what it shows
-      // from the start, never a placeholder.
+      // from the start, never a placeholder. A conflict keeps its place, but
+      // not what it was built as.
       for (const std::filesystem::path& output : removed) {
+        if (!m_conflicts.contains(output)) {
+          remove_with_empty_parents(m_structure, output);
+        }
+      }
+      for (const std::filesystem::path& output : unclaimed) {
         remove_with_empty_parents(m_structure, output);
       }
       for (const std::filesystem::path& output : added) {
@@ -1845,6 +2043,10 @@ class BuildDirectoryTree::Impl {
                                            ? std::string_view(report)
                                            : k_placeholder_content);
       }
+      for (const std::filesystem::path& output : now_conflicting) {
+        ensure_parent_directories(m_structure, output);
+        m_structure.write_file(output, k_placeholder_content);
+      }
       for (const std::filesystem::path& output : now_status) {
         if (!std::ranges::contains(added, output)) {
           m_structure.write_file(output, report);
@@ -1852,12 +2054,13 @@ class BuildDirectoryTree::Impl {
       }
     }
 
-    // Whatever read an output that came or went, or became a `status`
-    // output, read something else now.
+    // Whatever read an output that came or went - or became a conflict, or
+    // stopped being one - or became a `status` output, read something else
+    // now.
     {
       const std::lock_guard lock(m_mutex);
       for (const std::vector<std::filesystem::path>* outputs :
-           {&removed, &added, &now_status}) {
+           {&removed, &added, &now_status, &unclaimed}) {
         for (const std::filesystem::path& output : *outputs) {
           if (const auto readers = m_dependents.find(as_input(output));
               readers != m_dependents.end()) {
@@ -1880,6 +2083,11 @@ class BuildDirectoryTree::Impl {
     // shows differently, or not at all. Nothing is announced if nothing shows
     // differently.
     status_changed();
+    if (m_on_build_failure) {
+      for (const std::string& conflict : conflict_reports) {
+        m_on_build_failure(conflict);
+      }
+    }
 
     // Outside the layout lock, since an eager rebuild writes its result.
     invalidate(std::move(changed));

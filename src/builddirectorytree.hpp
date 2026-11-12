@@ -62,6 +62,16 @@ class BuildCoordinator;
 /// A manifest that cannot be read, or has any line @link Manifest::parse
 /// rejects, is not applied: the current rules stay in force until it is fixed.
 ///
+/// A path that more than one rule produces - given the source files and
+/// outputs their wildcards match right now - or that one rule would make a
+/// file while another makes something inside it, is a conflict: it is shown
+/// with its placeholder, nothing builds it, and opening it fails with
+/// `std::errc::io_error`, until all but one of those rules stop producing it.
+/// No rule takes precedence. Every other path is unaffected. Whatever read a
+/// path becoming a conflict, or ceasing to be one, is rebuilt as if an input
+/// had changed. Wildcards are matched afresh whenever a directory they match
+/// in changes, so a conflict comes and goes with the files that make it.
+///
 /// A `tracing` rule's output is the trace recorded to @link g_tracer (or an
 /// empty trace when there is none), served by the tree itself rather than the
 /// runner. Every open takes a fresh snapshot, and since that rewrite is caused
@@ -109,6 +119,12 @@ class BuildDirectoryTree : public DirectoryTree {
   /// a newline. Not told of a build stopped before it could finish. Called on
   /// whatever thread finished the build, before anything waiting on it is
   /// released.
+  ///
+  /// Also told of each path that comes to be claimed by more than one rule,
+  /// or by different rules than it was, as @link status_report describes it
+  /// - but not of one that stops being claimed by more than one. Called on
+  /// the source's watcher thread, or on the constructing thread for those
+  /// there are from the start.
   using BuildFailureHandler = std::function<void(const std::string& report)>;
 
   /// Builds the outputs declared in the `build.makebelieve` file of @a source,
@@ -180,6 +196,12 @@ class BuildDirectoryTree : public DirectoryTree {
   /// holds it:
   /// - why the latest change to the manifest was rejected, one
   ///   `build.makebelieve:LINE: ...` problem per line;
+  /// - each path claimed by more than one rule, as
+  ///   `@/<path> is claimed by more than one rule:` followed by one indented
+  ///   `build.makebelieve:LINE: <rule>` line per claim, in line order, ending
+  ///   in ` (matching <source>)` for a wildcard - its `@/` kept for an
+  ///   output - and saying `it makes @/<directory> a file` for a rule that
+  ///   would make one of the path's directories a file;
   /// - each build under way, as `@/<output> building: <command>`, or
   ///   `@/<output> waiting to build: <command>` while it waits its turn, with
   ///   ` (its last build failed)` after one whose last build did;

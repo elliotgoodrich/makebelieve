@@ -254,8 +254,9 @@ int mount(const MountOptions& options) {
       },
       &cache,
       [](const std::string& report) {
-        // Best-effort, as this runs wherever the build finished. One print,
-        // so builds finishing at once do not interleave.
+        // Best-effort, as this runs wherever the build finished - or, for a
+        // path more than one rule claims, on the IoContext's thread. One
+        // print, so builds finishing at once do not interleave.
         try {
           std::print(stderr, "makebelieve: {}", report);
         } catch (...) {  // NOLINT(bugprone-empty-catch)

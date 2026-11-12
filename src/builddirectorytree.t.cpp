@@ -2546,6 +2546,258 @@ TEST_F(BuildDirectoryTreeTest, AWildcardMatchesOtherOutputs) {
   EXPECT_TRUE(tree.status("copy/b.html").has_value());
 }
 
+// The error of opening @a path in @a tree, or no error if it opens.
+std::error_code open_error(const BuildDirectoryTree& tree,
+                           const std::filesystem::path& path) {
+  const std::expected<std::shared_ptr<const OpenedFile>, std::error_code>
+      opened = DirectoryTreeUtil::open(tree, path);
+  return opened.has_value() ? std::error_code() : opened.error();
+}
+
+// A path that a wildcard and a simple rule both produce fails, with no rule
+// taking precedence, for as long as the source file making the wildcard
+// produce it exists. Nothing builds it meanwhile, and every other path is
+// left alone.
+TEST_F(BuildDirectoryTreeTest, AConflictComesAndGoesWithItsSourceFile) {
+  source.make_directory("src");
+  source.write_file("src/about.md", "about");
+  write_manifest(
+      "@/site/*.html = run pandoc src/*.md -o %out\n"
+      "@/site/index.html = run ./gen.sh\n");
+
+  std::vector<std::string> commands;
+  const BuildDirectoryTree tree(source, echoing(commands));
+  EXPECT_EQ(read_output(tree, "site/index.html"), "ran ./gen.sh");
+
+  source.write_file("src/index.md", "index");
+  EXPECT_EQ(open_error(tree, "site/index.html"), std::errc::io_error);
+  // Still there, with only its placeholder.
+  EXPECT_EQ(output_size(tree, "site/index.html"), 1U);
+  EXPECT_EQ(read_output(tree, "site/about.html"),
+            "ran pandoc src/about.md -o %out");
+  EXPECT_EQ(tree.status_report(),
+            "@/site/index.html is claimed by more than one rule:\n"
+            "    build.makebelieve:1: @/site/*.html = run pandoc src/*.md -o "
+            "%out (matching src/index.md)\n"
+            "    build.makebelieve:2: @/site/index.html = run ./gen.sh\n");
+  EXPECT_EQ(commands, (std::vector<std::string>{
+                          "./gen.sh", "pandoc src/about.md -o %out"}));
+
+  source.remove("src/index.md");
+  EXPECT_EQ(tree.status_report(), "");
+  EXPECT_EQ(read_output(tree, "site/index.html"), "ran ./gen.sh");
+  EXPECT_EQ(commands.size(), 3U);
+}
+
+// Two wildcards may share an output pattern: only the names both produce
+// conflict, each naming the source file that made its wildcard produce it.
+TEST_F(BuildDirectoryTreeTest, WildcardsConflictOnlyWhereBothProduceAPath) {
+  source.make_directory("src");
+  source.write_file("src/a.js", "a");
+  source.write_file("src/b.ts", "b");
+  source.write_file("src/c.js", "c");
+  source.write_file("src/c.ts", "c");
+  write_manifest(
+      "@/src/*.js = copy src/*.js\n"
+      "@/src/*.js = run esbuild src/*.ts --outfile=%out\n");
+
+  std::vector<std::string> commands;
+  const BuildDirectoryTree tree(source, echoing(commands));
+  EXPECT_EQ(read_output(tree, "src/a.js"), "ran src/a.js");
+  EXPECT_EQ(read_output(tree, "src/b.js"),
+            "ran esbuild src/b.ts --outfile=%out");
+  EXPECT_EQ(open_error(tree, "src/c.js"), std::errc::io_error);
+  EXPECT_EQ(tree.status_report(),
+            "@/src/c.js is claimed by more than one rule:\n"
+            "    build.makebelieve:1: @/src/*.js = copy src/*.js (matching "
+            "src/c.js)\n"
+            "    build.makebelieve:2: @/src/*.js = run esbuild src/*.ts "
+            "--outfile=%out (matching src/c.ts)\n");
+  EXPECT_EQ(commands.size(), 2U);
+}
+
+// A wildcard over outputs can produce a path another rule does too. A copy of
+// it fails as a copy of any failing output does.
+TEST_F(BuildDirectoryTreeTest, AWildcardOverOutputsCanConflict) {
+  source.make_directory("src");
+  source.write_file("src/a.txt", "a");
+  source.write_file("src/index.txt", "index");
+  write_manifest(
+      "@/gen/*.md = capture render src/*.txt\n"
+      "@/site/*.html = run pandoc @/gen/*.md -o %out\n"
+      "@/site/index.html = run ./index.sh\n"
+      "@/copy.html = copy @/site/index.html\n");
+
+  std::vector<std::string> commands;
+  const BuildDirectoryTree tree(source, echoing(commands));
+  EXPECT_EQ(read_output(tree, "site/a.html"), "ran pandoc @/gen/a.md -o %out");
+  EXPECT_EQ(open_error(tree, "site/index.html"), std::errc::io_error);
+  EXPECT_EQ(open_error(tree, "copy.html"), std::errc::io_error);
+  EXPECT_EQ(tree.status_report(),
+            "@/site/index.html is claimed by more than one rule:\n"
+            "    build.makebelieve:2: @/site/*.html = run pandoc @/gen/*.md -o "
+            "%out (matching @/gen/index.md)\n"
+            "    build.makebelieve:3: @/site/index.html = run ./index.sh\n"
+            "@/copy.html failed because @/site/index.html failed\n");
+
+  // Resolved, the copy is retried along with it.
+  source.remove("src/index.txt");
+  EXPECT_EQ(read_output(tree, "copy.html"), "ran ./index.sh");
+  EXPECT_EQ(tree.status_report(), "");
+}
+
+// A rule that would make a file of a directory another rule's output is in
+// conflicts with that output, which fails while the directory stays one.
+TEST_F(BuildDirectoryTreeTest, AFileWhereADirectoryIsNeededConflicts) {
+  source.make_directory("src");
+  source.write_file("src/a.foo", "a");
+  write_manifest(
+      "@/out/*.foo = copy src/*.foo\n"
+      "@/out/x.foo/y = run b\n");
+
+  std::vector<std::string> commands;
+  const BuildDirectoryTree tree(source, echoing(commands));
+  EXPECT_EQ(read_output(tree, "out/x.foo/y"), "ran b");
+
+  source.write_file("src/x.foo", "x");
+  EXPECT_EQ(open_error(tree, "out/x.foo/y"), std::errc::io_error);
+  const auto directory = tree.status("out/x.foo");
+  ASSERT_TRUE(directory.has_value());
+  EXPECT_TRUE(std::holds_alternative<DirectoryInfo>(*directory));
+  EXPECT_EQ(read_output(tree, "out/a.foo"), "ran src/a.foo");
+  EXPECT_EQ(tree.status_report(),
+            "@/out/x.foo/y is claimed by more than one rule:\n"
+            "    build.makebelieve:1: @/out/*.foo = copy src/*.foo (matching "
+            "src/x.foo; it makes @/out/x.foo a file)\n"
+            "    build.makebelieve:2: @/out/x.foo/y = run b\n");
+
+  source.remove("src/x.foo");
+  EXPECT_EQ(read_output(tree, "out/x.foo/y"), "ran b");
+  EXPECT_EQ(tree.status_report(), "");
+}
+
+// Whatever read a path that becomes a conflict, or stops being one, is
+// rebuilt as it would be for any other change.
+TEST_F(BuildDirectoryTreeTest, AConflictRebuildsWhatReadThePath) {
+  source.make_directory("src");
+  write_manifest(
+      "@/gen/*.h = copy src/*.h\n"
+      "@/gen/config.h = run configure %out\n"
+      "@/app = run cc %out\n");
+
+  int app_runs = 0;
+  const BuildDirectoryTree tree(source, [&app_runs](Command command) {
+    if (command.text != "cc %out") {
+      return finished(built(command.text));
+    }
+    ++app_runs;
+    return finished(BuildOutput{
+        .bytes = "app",
+        .inputs = {std::filesystem::path("@") / "gen" / "config.h"}});
+  });
+  EXPECT_EQ(read_output(tree, "app"), "app");
+  EXPECT_EQ(app_runs, 1);
+
+  source.write_file("src/config.h", "config");
+  EXPECT_EQ(app_runs, 2);
+
+  source.remove("src/config.h");
+  EXPECT_EQ(app_runs, 3);
+}
+
+// The failure handler hears of a conflict once as it starts - from the start,
+// even - and again only if the rules claiming the path change.
+TEST_F(BuildDirectoryTreeTest, TellsTheBuildFailureHandlerOfEachConflict) {
+  source.make_directory("src");
+  source.write_file("src/a.md", "a");
+  write_manifest(
+      "@/site/*.html = run pandoc src/*.md -o %out\n"
+      "@/site/a.html = run ./gen.sh\n"
+      "@/site/b.html = copy src/b.html\n"
+      "@/site/c.html = copy src/c.html\n");
+
+  std::vector<std::string> reports;
+  const BuildDirectoryTree tree(
+      source, returning("built"), {}, nullptr,
+      [&reports](const std::string& report) { reports.push_back(report); });
+  EXPECT_EQ(reports, (std::vector<std::string>{
+                         "@/site/a.html is claimed by more than one rule:\n"
+                         "    build.makebelieve:1: @/site/*.html = run pandoc "
+                         "src/*.md -o %out (matching src/a.md)\n"
+                         "    build.makebelieve:2: @/site/a.html = run "
+                         "./gen.sh\n"}));
+
+  // Matched again, but nothing about it changed.
+  source.write_file("src/b.md", "b");
+  ASSERT_EQ(reports.size(), 2U);
+  EXPECT_EQ(reports[1],
+            "@/site/b.html is claimed by more than one rule:\n"
+            "    build.makebelieve:1: @/site/*.html = run pandoc src/*.md -o "
+            "%out (matching src/b.md)\n"
+            "    build.makebelieve:3: @/site/b.html = copy src/b.html\n");
+
+  // A third rule claiming it changes what it is claimed by.
+  write_manifest(
+      "@/site/*.html = run pandoc src/*.md -o %out\n"
+      "@/site/*.html = copy src/*.md\n"
+      "@/site/a.html = run ./gen.sh\n"
+      "@/site/b.html = copy src/b.html\n"
+      "@/site/c.html = copy src/c.html\n");
+  EXPECT_EQ(reports.size(), 4U);
+
+  // Resolving them says nothing.
+  source.remove("src/a.md");
+  source.remove("src/b.md");
+  EXPECT_EQ(reports.size(), 4U);
+  EXPECT_EQ(tree.status_report(), "");
+}
+
+// Subscribers hear of a path as it becomes a conflict and as it stops being
+// one, as either changes what opening it gives.
+TEST_F(BuildDirectoryTreeTest, AConflictStartingAndEndingIsAnnounced) {
+  source.make_directory("src");
+  write_manifest(
+      "@/site/*.html = run pandoc src/*.md -o %out\n"
+      "@/site/index.html = run ./gen.sh\n");
+
+  const BuildDirectoryTree tree(source, returning("built"));
+  EXPECT_EQ(read_output(tree, "site/index.html"), "built");
+
+  std::vector<std::filesystem::path> changed;
+  const Subscription subscription =
+      tree.subscribe_to_changes([&changed](const DirectoryTreeDiff& diff) {
+        changed.insert(changed.end(), diff.entries_changed.begin(),
+                       diff.entries_changed.end());
+      });
+  const std::filesystem::path index =
+      std::filesystem::path("site") / "index.html";
+
+  source.write_file("src/index.md", "index");
+  EXPECT_EQ(changed, (std::vector<std::filesystem::path>{index}));
+
+  changed.clear();
+  source.remove("src/index.md");
+  EXPECT_EQ(changed, (std::vector<std::filesystem::path>{index}));
+}
+
+// Building everything leaves a conflict alone, and builds it once resolved.
+TEST_F(BuildDirectoryTreeTest, MaterializingAllLeavesAConflictUnbuilt) {
+  source.make_directory("src");
+  source.write_file("src/index.md", "index");
+  write_manifest(
+      "@/site/*.html = run pandoc src/*.md -o %out\n"
+      "@/site/index.html = run ./gen.sh\n"
+      "@/other.txt = run other\n");
+
+  std::vector<std::string> commands;
+  const BuildDirectoryTree tree(source, echoing(commands));
+  tree.materialize_all();
+  EXPECT_EQ(commands, (std::vector<std::string>{"other"}));
+
+  source.remove("src/index.md");
+  EXPECT_EQ(commands, (std::vector<std::string>{"other", "./gen.sh"}));
+}
+
 // As `BuildDirectoryTreeTest`, keeping builds in a cache that each test can
 // close and reopen, as a restart would.
 class BuildDirectoryTreeCacheTest : public BuildDirectoryTreeTest {
@@ -2824,6 +3076,31 @@ TEST_F(BuildDirectoryTreeCacheTest, OnlyBuildsThatCanBeCheckedAreKept) {
       {}, &*cache);
   EXPECT_FALSE(DirectoryTreeUtil::open(tree, "failed.txt").has_value());
   read_output(tree, "missing.txt");
+  EXPECT_TRUE(recorded().empty());
+}
+
+// A path that became a conflict while nothing watched is not served from what
+// was built before, and its record goes; nor is one that becomes a conflict
+// while served kept.
+TEST_F(BuildDirectoryTreeCacheTest, AConflictIsNeverServedFromTheCache) {
+  source.make_directory("src");
+  write_manifest(
+      "@/site/*.html = run pandoc src/*.md -o %out\n"
+      "@/site/index.html = run ./gen.sh\n");
+  {
+    const BuildDirectoryTree tree(source, returning("built"), {}, &*cache);
+    EXPECT_EQ(read_output(tree, "site/index.html"), "built");
+    EXPECT_EQ(recorded(), (std::vector<std::filesystem::path>{
+                              std::filesystem::path("site") / "index.html"}));
+    source.write_file("src/index.md", "index");
+    EXPECT_TRUE(recorded().empty());
+    source.remove("src/index.md");
+    EXPECT_EQ(read_output(tree, "site/index.html"), "built");
+  }
+
+  source.write_file("src/index.md", "index");
+  const BuildDirectoryTree tree(source, returning("built"), {}, &reopen());
+  EXPECT_EQ(open_error(tree, "site/index.html"), std::errc::io_error);
   EXPECT_TRUE(recorded().empty());
 }
 
