@@ -17,8 +17,10 @@
 namespace makebelieve {
 
 /// @class InMemoryDirectoryTree
-/// A `DirectoryTree` backed entirely by memory, with manipulators to build
-/// and mutate its contents directly.
+/// A `DirectoryTree` held in memory, with manipulators to build and mutate
+/// its contents directly. Each file holds bytes of its own, or reads through
+/// another opened file it was given - a built output's file on disk, kept
+/// open, say.
 ///
 /// Thread-safe: readers (`status`/`ls`/`read`) run concurrently; mutators
 /// serialise against them and each other. Change notifications are delivered
@@ -50,6 +52,17 @@ class InMemoryDirectoryTree : public DirectoryTree {
                   std::string_view content,
                   std::chrono::file_clock::time_point mtime =
                       std::chrono::file_clock::now());
+
+  /// Creates or overwrites the file at @a path with what @a content reads,
+  /// reported as @a info: its status, and the stat of an open of it, give
+  /// @a info without asking @a content. Every open of this version shares
+  /// @a content, which stays readable until the last of them has gone.
+  /// @pre The parent directory of @a path exists.
+  /// @pre @a path does not already name a directory.
+  /// @pre @a content reads @a info's size of bytes, the same every time.
+  void write_file(const std::filesystem::path& path,
+                  std::shared_ptr<const OpenedFile> content,
+                  FileInfo info);
 
   /// Creates an empty directory at @a path.
   /// @pre The parent directory of @a path exists.

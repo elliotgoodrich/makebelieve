@@ -21,11 +21,19 @@
 
 namespace makebelieve {
 
-/// What running a command produced: the bytes of the output it built, and the
-/// input files it read (its dependencies), relative to the source tree's
-/// root.
+/// What running a command produced: the output it built, and the input files
+/// it read (its dependencies), relative to the source tree's root.
 struct BuildOutput {
+  /// The bytes of the output it built - unless it left them in `file`.
   std::string bytes;
+
+  /// A file holding the output it built, if it left one rather than giving
+  /// `bytes`, which the tree takes over: once it has opened it, it moves it
+  /// into its cache or deletes it. So nothing else may write to, move or
+  /// delete it, and it is best placed in the cache's scratch directory, from
+  /// where moving it in is a rename.
+  std::filesystem::path file;
+
   std::vector<std::filesystem::path> inputs;
 };
 

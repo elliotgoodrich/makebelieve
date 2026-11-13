@@ -19,12 +19,17 @@ namespace makebelieve {
 
 class IoContext;
 
-/// At most how much of each of its output streams a run of a command keeps:
-/// the rest is counted, but not kept, so a command that writes without end
-/// cannot use up memory.
-struct CaptureLimits {
+/// Where a run of a command sends its output streams.
+struct CaptureOptions {
+  /// At most how much of each stream the run keeps: the rest is counted, but
+  /// not kept, so a command that writes without end cannot use up memory.
   std::size_t standard_output = std::numeric_limits<std::size_t>::max();
   std::size_t standard_error = std::numeric_limits<std::size_t>::max();
+
+  /// If not empty, the file the command's standard output goes to instead,
+  /// created or truncated: none of it passes through this process, so
+  /// `standard_output` does not apply and Output::standard_output is empty.
+  std::filesystem::path standard_output_file;
 };
 
 /// @class ProcessUtil
@@ -50,7 +55,7 @@ struct ProcessUtil {
     int exit_status = 0;
 
     /// How many bytes it wrote to standard output and to standard error beyond
-    /// what @link CaptureLimits let the run keep.
+    /// what @link CaptureOptions let the run keep.
     std::size_t standard_output_omitted = 0;
     std::size_t standard_error_omitted = 0;
   };
@@ -63,13 +68,15 @@ struct ProcessUtil {
   /// working directory set to @a working_directory, and completes with its
   /// standard output and standard error, the files it read (see
   /// Output::inputs) and its exit status once it has run to completion,
-  /// whatever that status - keeping no more of each stream than @a limits
-  /// allows. It completes with `std::errc::operation_canceled`
-  /// if @a stop was requested, in which case the command is terminated first,
-  /// or with the platform error if the command could not be started or waited
-  /// on - or could not be traced, whether because tracing could not be set up
-  /// or because it failed while the command ran. A command that cannot be
-  /// traced never runs, or is terminated.
+  /// whatever that status - as @a options says: keeping no more of each
+  /// stream than it allows, or sending standard output to a file, one that
+  /// cannot be created failing the run before the command starts. It
+  /// completes with
+  /// `std::errc::operation_canceled` if @a stop was requested, in which case
+  /// the command is terminated first, or with the platform error if the command
+  /// could not be started or waited on - or could not be traced, whether
+  /// because tracing could not be set up or because it failed while the command
+  /// ran. A command that cannot be traced never runs, or is terminated.
   ///
   /// Once the command has exited, whatever it started and left running is
   /// killed, and the sender completes only once all of it has exited too -
@@ -96,10 +103,10 @@ struct ProcessUtil {
                                 BuildProcessTracker& tracker,
                                 std::filesystem::path output,
                                 stdexec::inplace_stop_token stop,
-                                CaptureLimits limits = {}) {
+                                CaptureOptions options = {}) {
     return stdexec::write_env(
         run_task(io, std::move(working_directory), std::move(command), tracker,
-                 std::move(output), stop, limits),
+                 std::move(output), stop, std::move(options)),
         stdexec::prop{stdexec::get_stop_token, stdexec::never_stop_token{}});
   }
 
@@ -110,7 +117,7 @@ struct ProcessUtil {
                                      BuildProcessTracker& tracker,
                                      std::filesystem::path output,
                                      stdexec::inplace_stop_token stop,
-                                     CaptureLimits limits);
+                                     CaptureOptions options);
 };
 
 /// @class ProcessUtilTestUtil

@@ -2,6 +2,7 @@
 #include "processutil.hpp"
 
 #include "buildprocesstracker.hpp"
+#include "filesystemutil.hpp"
 #include "iocontext.hpp"
 
 #include <gtest/gtest.h>
@@ -523,6 +524,44 @@ TEST_F(ProcessUtil, ReportsTheStatusACommandExitedWith) {
   EXPECT_EQ(result->exit_status, 3);
   EXPECT_EQ(result->standard_output, "hello world");
   EXPECT_FALSE(result->inputs.empty());
+}
+
+// Given a file for its standard output, a command writes it there - replacing
+// what the file held - rather than back to us, and its standard error, inputs
+// and status are reported as ever.
+TEST_F(ProcessUtil, WritesStandardOutputToTheFileGiven) {
+  write_input("input.txt", "hello world");
+  const std::filesystem::path file = work / "stdout.txt";
+  write_input("stdout.txt", "what the file held before, which is longer");
+
+  const makebelieve::ProcessUtil::Result result = std::get<0>(
+      stdexec::sync_wait(makebelieve::ProcessUtil::run(
+                             io, work,
+                             print_file_command("input.txt") + " && " +
+                                 print_file_command("missing.txt"),
+                             none, {}, {}, {.standard_output_file = file}))
+          .value());
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_NE(result->exit_status, 0);
+  EXPECT_EQ(result->standard_output, "");
+  EXPECT_NE(result->standard_error, "");
+  EXPECT_FALSE(result->inputs.empty());
+  EXPECT_EQ(makebelieve::FileSystemUtil::read_file(file), "hello world");
+}
+
+// A file for its standard output that cannot be created fails the run before
+// the command starts.
+TEST_F(ProcessUtil, AStandardOutputFileThatCannotBeCreatedNeverRunsTheCommand) {
+  const makebelieve::ProcessUtil::Result result = std::get<0>(
+      stdexec::sync_wait(
+          makebelieve::ProcessUtil::run(
+              io, work, "cmake -E touch ran.txt", none, {}, {},
+              {.standard_output_file = work / "missing" / "stdout.txt"}))
+          .value());
+
+  EXPECT_FALSE(result.has_value());
+  EXPECT_FALSE(std::filesystem::exists(work / "ran.txt"));
 }
 
 // Makes our stdin, while it lives, a pipe that never has anything to read nor

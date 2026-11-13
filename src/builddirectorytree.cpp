@@ -7,6 +7,7 @@
 #include "directorytreeutil.hpp"
 #include "inmemorydirectorytree.hpp"
 #include "manifest.hpp"
+#include "nativefile.hpp"
 #include "processinfo.hpp"
 #include "scopeguard.hpp"
 #include "shellrunner.hpp"
@@ -90,6 +91,36 @@ void remove_with_empty_parents(InMemoryDirectoryTree& tree,
 }
 
 constexpr std::string_view k_generated_prefix = "@/";
+
+// A file a runner left, which the tree has taken over: deleted when this goes,
+// unless something - the cache - takes it first.
+class ScratchFile {
+  std::filesystem::path m_path;
+
+ public:
+  ScratchFile() = default;
+  explicit ScratchFile(std::filesystem::path path) : m_path(std::move(path)) {}
+  ~ScratchFile() {
+    if (!m_path.empty()) {
+      std::error_code ignored;
+      std::filesystem::remove(m_path, ignored);
+    }
+  }
+  ScratchFile(ScratchFile&& other) noexcept
+      : m_path(std::exchange(other.m_path, {})) {}
+  ScratchFile& operator=(ScratchFile other) noexcept {
+    std::swap(m_path, other.m_path);
+    return *this;
+  }
+  ScratchFile(const ScratchFile&) = delete;
+
+  [[nodiscard]] bool empty() const { return m_path.empty(); }
+
+  // Hands the file over, so it is no longer deleted here.
+  [[nodiscard]] std::filesystem::path release() {
+    return std::exchange(m_path, {});
+  }
+};
 
 // What BuildDirectoryTreeTestUtil::before_next_status_write() was last given,
 // and not yet taken.
@@ -408,7 +439,9 @@ class BuildDirectoryTree::Impl {
   // The directory structure and file contents we present. Each declared output
   // starts as a placeholder, replaced by real content once its command
   // succeeds - but for a `status` output, which holds its report from the
-  // start.
+  // start. Only placeholders and reports, and what a runner gave as bytes,
+  // are held in memory: everything else is served from the file it was built
+  // into, or restored from, kept open.
   InMemoryDirectoryTree m_structure;
 
   // The manifest's home, observed for input and manifest changes.
@@ -878,8 +911,69 @@ class BuildDirectoryTree::Impl {
     }
   }
 
- public:
  private:
+  // A successful build as it is served.
+  struct Built {
+    // What serves its content: the file its runner left, opened; the output
+    // a copy of it copied, as that was then; or bytes it gave, in memory.
+    std::shared_ptr<const OpenedFile> file;
+
+    std::size_t size = 0;
+
+    // The hash of its content, worked out only while there is a cache.
+    std::string hash;
+
+    // The file its runner left, still to be moved into the cache or deleted.
+    ScratchFile scratch;
+
+    std::vector<std::filesystem::path> inputs;
+  };
+  using Outcome = std::expected<Built, BuildFailure>;
+
+  // @a result as it is served, from an opened file: the one its runner left,
+  // which reads on whatever becomes of it; @a copied, for a copy of an
+  // output; or else its bytes, held in memory. Fails as the build does if that
+  // file cannot be opened, or hashed for the cache.
+  [[nodiscard]] Outcome ingest(BuildResult result,
+                               std::shared_ptr<const OpenedFile> copied) const {
+    if (!result.has_value()) {
+      return std::unexpected(std::move(result.error()));
+    }
+    Built built{.inputs = std::move(result->inputs)};
+    const auto fail = [&built](std::error_code error) {
+      return std::unexpected(BuildFailure(error, std::move(built.inputs)));
+    };
+    if (!result->file.empty()) {
+      built.scratch = ScratchFile(result->file);
+      std::expected<std::shared_ptr<const NativeFile>, std::error_code> opened =
+          NativeFile::open(result->file);
+      if (!opened.has_value()) {
+        return fail(opened.error());
+      }
+      copied = std::move(*opened);
+    }
+    if (copied == nullptr) {
+      copied = DirectoryTreeUtil::memory_file(
+          std::make_shared<const std::string>(std::move(result->bytes)),
+          std::chrono::file_clock::time_point());
+    }
+    const std::expected<FileInfo, std::error_code> info = copied->stat();
+    if (!info.has_value()) {
+      return fail(info.error());
+    }
+    built.size = info->size;
+    if (m_cache != nullptr) {
+      std::expected<std::string, std::error_code> hash =
+          BuildCache::hash(*copied);
+      if (!hash.has_value()) {
+        return fail(hash.error());
+      }
+      built.hash = std::move(*hash);
+    }
+    built.file = std::move(copied);
+    return built;
+  }
+
   // A successful build to keep in the cache, as finish_build found it.
   struct Keep {
     Command command;
@@ -968,11 +1062,14 @@ class BuildDirectoryTree::Impl {
     return target;
   }
 
-  // The build, as @a self, of a copy of the output @a source.
+  // The build, as @a self, of a copy of the output @a source, which on success
+  // sets @a copied to the version of @a source it copied - shared, not read.
   // NOLINTNEXTLINE(misc-no-recursion): see launch_build.
-  exec::task<BuildResult> copy_output(std::filesystem::path source,
-                                      BuildCoordinator::AttemptPtr self,
-                                      std::optional<TraceLane> lane) {
+  exec::task<BuildResult> copy_output(
+      std::filesystem::path source,
+      BuildCoordinator::AttemptPtr self,
+      std::optional<TraceLane> lane,
+      std::shared_ptr<std::shared_ptr<const OpenedFile>> copied) {
     // Its input even if the copy fails, so the original building retries it -
     // or, for a conflict, resolving it does.
     if (is_conflicting(source)) {
@@ -986,14 +1083,14 @@ class BuildDirectoryTree::Impl {
         co_return std::unexpected(BuildFailure(error, {as_input(source)}));
       }
     }
-    std::expected<std::string, std::error_code> content =
-        co_await DirectoryTreeUtil::read_whole(m_structure, source);
-    if (!content.has_value()) {
+    std::expected<std::shared_ptr<const OpenedFile>, std::error_code> opened =
+        co_await m_structure.open(source);
+    if (!opened.has_value()) {
       co_return std::unexpected(
-          BuildFailure(content.error(), {as_input(source)}));
+          BuildFailure(opened.error(), {as_input(source)}));
     }
-    co_return BuildOutput{.bytes = std::move(*content),
-                          .inputs = {as_input(source)}};
+    *copied = std::move(*opened);
+    co_return BuildOutput{.inputs = {as_input(source)}};
   }
 
   // Whether @a output is a path the manifest declares, whether one rule
@@ -1088,11 +1185,12 @@ class BuildDirectoryTree::Impl {
     // write_status, so it cannot overwrite a newer one.
     if (Manifest::is_report(launch.command.action)) {
       finish_build(output, launch.command, launch.attempt, build_id,
-                   BuildOutput{.bytes = launch.command.action ==
-                                                Manifest::Action::Tracing
-                                            ? trace_snapshot()
-                                            : std::string(),
-                               .inputs = {}});
+                   ingest(BuildOutput{.bytes = launch.command.action ==
+                                                       Manifest::Action::Tracing
+                                                   ? trace_snapshot()
+                                                   : std::string(),
+                                      .inputs = {}},
+                          nullptr));
       return;
     }
 
@@ -1117,6 +1215,8 @@ class BuildDirectoryTree::Impl {
       }
     }
 
+    // What a copy of an output copied, once it has.
+    auto copied = std::make_shared<std::shared_ptr<const OpenedFile>>();
     std::optional<AttemptSender> build;
     try {
       // A copy of another output is served by the tree too.
@@ -1128,7 +1228,7 @@ class BuildDirectoryTree::Impl {
               ? BuildSender(stdexec::write_env(
                     copy_output(
                         launch.command.text.substr(k_generated_prefix.size()),
-                        launch.attempt, lane),
+                        launch.attempt, lane, copied),
                     stdexec::prop{stdexec::get_start_scheduler,
                                   stdexec::inline_scheduler{}}))
               : m_runner(std::move(launch.command));
@@ -1167,12 +1267,14 @@ class BuildDirectoryTree::Impl {
             }) |
             // Recording a result allocates; with nowhere left to report that
             // to, a failure there ends the process, as it would on any thread.
+            // Taking in what it built reaches the disk, so happens here,
+            // where the build completed, rather than under a lock.
             stdexec::then(
                 // NOLINTNEXTLINE(bugprone-exception-escape)
                 [this, output, command, attempt = std::move(launch.attempt),
-                 build_id](BuildResult result) noexcept {
+                 build_id, copied](BuildResult result) noexcept {
                   finish_build(output, command, attempt, build_id,
-                               std::move(result));
+                               ingest(std::move(result), *copied));
                 }),
         m_builds.get_token());
   }
@@ -1219,7 +1321,7 @@ class BuildDirectoryTree::Impl {
                     const Command& ran,
                     const BuildCoordinator::AttemptPtr& attempt,
                     std::uint64_t build_id,
-                    BuildResult result) {
+                    Outcome result) {
     // What to keep in the cache once waiters are released, if anything.
     std::optional<Keep> keep;
     if (result.has_value()) {
@@ -1233,13 +1335,20 @@ class BuildDirectoryTree::Impl {
         declared = command != m_commands.end();
         if (declared) {
           if (command->second.action == Manifest::Action::Status) {
-            result->bytes = status_report_locked();
+            auto report =
+                std::make_shared<const std::string>(status_report_locked());
+            result->size = report->size();
+            if (m_cache != nullptr) {
+              result->hash = BuildCache::hash(*report);
+            }
+            result->file = DirectoryTreeUtil::memory_file(
+                std::move(report), std::chrono::file_clock::time_point());
           }
           add_reads(output, result->inputs);
           if (m_cache != nullptr) {
             // Before any waiter is released, so a build reading this output
             // finds the hash of what it read.
-            m_hashes.insert_or_assign(output, BuildCache::hash(result->bytes));
+            m_hashes.insert_or_assign(output, result->hash);
             if (!Manifest::is_report(command->second.action)) {
               keep = Keep{.command = command->second,
                           .inputs = result->inputs,
@@ -1254,7 +1363,14 @@ class BuildDirectoryTree::Impl {
       // Outside m_mutex: write_file notifies subscribers, who may read back
       // through us.
       if (declared) {
-        m_structure.write_file(output, result->bytes, built_at);
+        m_structure.write_file(
+            output, result->file,
+            FileInfo{.size = result->size, .mtime = built_at});
+      }
+      // A file the runner left that the cache will not take goes now, the
+      // open file serving it reading on, before anything waiting is released.
+      if (!keep.has_value()) {
+        result->scratch = ScratchFile();
       }
     }
 
@@ -1332,9 +1448,10 @@ class BuildDirectoryTree::Impl {
       m_coordinator->complete(orphaned, orphaned_error);
     }
 
-    // After the release, as nothing waiting needs it.
+    // After the release, as nothing waiting needs it. A file the runner left
+    // that the cache does not take goes with `result`.
     if (keep.has_value()) {
-      keep_in_cache(output, result->bytes, *keep);
+      keep_in_cache(output, *result, *keep);
     }
 
     const std::optional<TraceLane> lane =
@@ -1424,7 +1541,7 @@ class BuildDirectoryTree::Impl {
   // @pre m_mutex is held, and the inputs of a failure hold what it read.
   std::string record_outcome(const std::filesystem::path& output,
                              const Command& ran,
-                             const BuildResult& result) {
+                             const Outcome& result) {
     const auto command = m_commands.find(output);
     const bool current = command != m_commands.end() && command->second == ran;
     if (Manifest::is_report(ran.action) || result.has_value()) {
@@ -1650,11 +1767,12 @@ class BuildDirectoryTree::Impl {
     return std::filesystem::path(text.substr(k_generated_prefix.size()));
   }
 
-  // Keeps @a output's build, @a bytes, in the cache - unless something
-  // invalidated it since it started, or an input it read cannot be stamped,
-  // in which case the output is left with no record.
+  // Keeps @a output's build, @a built, in the cache - handing it the file the
+  // runner left, if there is one - unless something invalidated it since it
+  // started, or an input it read cannot be stamped, in which case the output
+  // is left with no record.
   void keep_in_cache(const std::filesystem::path& output,
-                     const std::string& bytes,
+                     Built& built,
                      const Keep& keep) {
     const std::lock_guard cache_lock(m_cache_mutex);
     std::vector<BuildCache::Input> stamps;
@@ -1697,8 +1815,14 @@ class BuildDirectoryTree::Impl {
     }
     // Best-effort: a build the cache cannot keep is just built again next run.
     try {
-      if (keepable) {
-        m_cache->store(keep.command, bytes, keep.mtime, stamps);
+      if (keepable && !built.scratch.empty()) {
+        m_cache->store_file(keep.command, built.scratch.release(), built.hash,
+                            keep.mtime, stamps);
+      } else if (keepable) {
+        // A copy of an output, whose content is in the cache already unless
+        // that output was not kept, or is not yet - or bytes a runner gave.
+        m_cache->store_content(keep.command, *built.file, built.hash,
+                               keep.mtime, stamps);
       } else {
         m_cache->forget(std::span(&output, 1));
       }
@@ -1729,8 +1853,10 @@ class BuildDirectoryTree::Impl {
     // Whether each output's record holds, worked out once each.
     enum class Check : std::uint8_t { checking, holds, stale };
     std::map<std::filesystem::path, Check> checked;
-    // The content of every output whose record holds.
-    std::map<std::filesystem::path, std::string> contents;
+    // The content of every output whose record holds, opened, and its size.
+    std::map<std::filesystem::path,
+             std::pair<std::shared_ptr<const NativeFile>, std::size_t>>
+        contents;
   };
 
   // Whether @a output's record in @a restoring holds: its rule is unchanged,
@@ -1776,12 +1902,16 @@ class BuildDirectoryTree::Impl {
         return false;
       }
     }
-    std::expected<std::string, std::error_code> bytes =
-        m_cache->read(record->second->hash);
-    if (!bytes.has_value()) {
+    std::expected<std::shared_ptr<const NativeFile>, std::error_code> file =
+        m_cache->open(record->second->hash);
+    if (!file.has_value()) {
       return false;
     }
-    restoring.contents.emplace(output, std::move(*bytes));
+    const std::expected<FileInfo, std::error_code> info = (*file)->stat();
+    if (!info.has_value()) {
+      return false;
+    }
+    restoring.contents.emplace(output, std::pair(std::move(*file), info->size));
     return true;
   }
 
@@ -1814,8 +1944,10 @@ class BuildDirectoryTree::Impl {
           continue;
         }
         // Its placeholder is already in place, so its directories are too.
-        m_structure.write_file(output, restoring.contents.at(output),
-                               record.mtime);
+        // Served from the cache's own file, which is never rewritten.
+        const auto& [file, size] = restoring.contents.at(output);
+        m_structure.write_file(output, file,
+                               FileInfo{.size = size, .mtime = record.mtime});
         const std::lock_guard lock(m_mutex);
         m_stale.erase(output);
         m_hashes.insert_or_assign(output, record.hash);

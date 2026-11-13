@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT
 #include "shellrunner.hpp"
 
+#include "directorytreeutil.hpp"
 #include "filesystemutil.hpp"
 #include "iocontext.hpp"
 #include "manifest.hpp"
+#include "nativefile.hpp"
 #include "processutil.hpp"
+#include "scopeguard.hpp"
 #include "tracer.hpp"
 
 #include <exec/task.hpp>
@@ -13,7 +16,7 @@
 #include <cstddef>
 #include <expected>
 #include <filesystem>
-#include <optional>
+#include <memory>
 #include <random>
 #include <string>
 #include <string_view>
@@ -87,14 +90,11 @@ class TempDirectory {
   [[nodiscard]] const std::filesystem::path& path() const { return m_path; }
 };
 
-// Creates a fresh directory under the system's temporary one, or says why it
-// could not. Only a name that is taken already is retried.
-std::expected<std::filesystem::path, std::error_code> make_temp_directory() {
+// Creates a fresh directory in @a base, or says why it could not. Only a name
+// that is taken already is retried.
+std::expected<std::filesystem::path, std::error_code> make_temp_directory(
+    const std::filesystem::path& base) {
   std::error_code ec;
-  const std::filesystem::path base = std::filesystem::temp_directory_path(ec);
-  if (ec) {
-    return std::unexpected(ec);
-  }
   std::random_device device;
   std::uniform_int_distribution<unsigned> digit(0, 0xffffffU);
   constexpr int k_attempts = 100;
@@ -182,28 +182,68 @@ std::string expand_generated(std::string_view command,
   return result;
 }
 
-// Reads the whole of @a path, or the error that stopped it - put as the same
-// error on every platform for the two a missing source gives.
-std::expected<std::string, std::error_code> read_file(
-    const std::filesystem::path& path) {
-  std::expected<std::string, std::error_code> contents =
-      FileSystemUtil::read_file(path);
-  if (contents.has_value()) {
-    return contents;
-  }
+// @a error, met reading the file @a path, put as the same error on every
+// platform for the two a missing file gives: that it does not exist, or is a
+// directory.
+std::error_code explain(std::error_code error,
+                        const std::filesystem::path& path) {
   std::error_code ec;
   const std::filesystem::file_status status = std::filesystem::status(path, ec);
   if (ec) {
-    return std::unexpected(ec);
+    return ec;
   }
   if (!std::filesystem::exists(status)) {
-    return std::unexpected(
-        std::make_error_code(std::errc::no_such_file_or_directory));
+    return std::make_error_code(std::errc::no_such_file_or_directory);
   }
   if (std::filesystem::is_directory(status)) {
-    return std::unexpected(std::make_error_code(std::errc::is_a_directory));
+    return std::make_error_code(std::errc::is_a_directory);
   }
-  return contents;
+  return error;
+}
+
+// Why a file of type @a type cannot be taken for a build's output.
+std::error_code not_a_file(std::filesystem::file_type type) {
+  switch (type) {
+    case std::filesystem::file_type::not_found:
+      return std::make_error_code(std::errc::no_such_file_or_directory);
+    case std::filesystem::file_type::directory:
+      return std::make_error_code(std::errc::is_a_directory);
+    default:
+      return std::make_error_code(std::errc::invalid_argument);
+  }
+}
+
+// Creates @a to holding the bytes of the file @a from, or says why it could
+// not. Neither is inherited by a command launched meanwhile.
+std::error_code copy_into(const std::filesystem::path& from,
+                          const std::filesystem::path& to) {
+  const std::expected<std::shared_ptr<const NativeFile>, std::error_code>
+      source = NativeFile::open(from);
+  return source.has_value() ? DirectoryTreeUtil::write_file(to, **source)
+                            : source.error();
+}
+
+// Moves the file @a written, which a `run` command left at %out, to @a kept,
+// or says why it could not - that there is no file there, say. A symlink
+// left there is taken for the file it names, whose bytes are copied, as a
+// reader would take it: what it names may go with the build's directory.
+std::error_code take(const std::filesystem::path& written,
+                     const std::filesystem::path& kept) {
+  std::error_code ec;
+  const std::filesystem::file_type type =
+      std::filesystem::symlink_status(written, ec).type();
+  if (type == std::filesystem::file_type::regular) {
+    std::filesystem::rename(written, kept, ec);
+    return ec;
+  }
+  if (type != std::filesystem::file_type::symlink) {
+    return not_a_file(type);
+  }
+  const std::filesystem::file_type target =
+      std::filesystem::status(written, ec).type();
+  return target == std::filesystem::file_type::regular
+             ? copy_into(written, kept)
+             : not_a_file(target);
 }
 
 // Recasts absolute traced input paths into paths relative to @a root, dropping
@@ -268,10 +308,32 @@ exec::task<BuildResult> detail::run_shell_command(
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): named by the header
     std::filesystem::path working_directory,
     std::filesystem::path mountpoint,
+    std::filesystem::path scratch_directory,
     Command command,
     BuildProcessTracker& tracker,
     stdexec::inplace_stop_token stop) {
   MB_TRACE_THREAD_NAME("build worker");
+
+  // Every build gets a private directory in the scratch directory, which goes
+  // with whatever the build leaves in it, and what it builds ends up in a
+  // file beside that directory - so with a name that cannot collide - for the
+  // tree to take over. A `run` command builds into a file inside the
+  // directory with the output's own file name, since plenty of tools (pandoc
+  // and friends) pick their format from the extension, which is then moved
+  // out; the other actions write that file directly.
+  std::expected<std::filesystem::path, std::error_code> directory =
+      make_temp_directory(scratch_directory);
+  if (!directory.has_value()) {
+    co_return std::unexpected(directory.error());
+  }
+  const TempDirectory scratch(std::move(*directory));
+  std::filesystem::path kept = scratch.path();
+  kept += ".out";
+  // Unless it is handed over, as the build fails.
+  ScopeGuard discard_kept([&kept] {
+    std::error_code ignored;
+    std::filesystem::remove(kept, ignored);
+  });
 
   // A `copy` rule names a file rather than a command: nothing is run, the
   // output is that file's bytes, and the file itself is the build's one input -
@@ -280,53 +342,39 @@ exec::task<BuildResult> detail::run_shell_command(
   // working directory.
   if (command.action == Manifest::Action::Copy) {
     const std::filesystem::path source = command.text;
-    std::expected<std::string, std::error_code> bytes =
-        read_file(working_directory / source);
     // The reader sees the output, so the source's own error - that it does
     // not exist, say - would read as being about the output. The source is
     // still its input, so creating or fixing it retries the copy: a tracer
     // records only the files that opened, so nothing else would.
-    if (!bytes.has_value()) {
+    if (const std::error_code error =
+            copy_into(working_directory / source, kept)) {
       co_return std::unexpected(BuildFailure(
           make_error_code(BuildError::copy_source_unreadable), {source},
-          with_reason({}, "cannot copy [" + source.generic_string() +
-                              "]: " + bytes.error().message())));
+          with_reason(
+              {}, "cannot copy [" + source.generic_string() + "]: " +
+                      explain(error, working_directory / source).message())));
     }
-    co_return BuildOutput{.bytes = std::move(*bytes), .inputs = {source}};
+    discard_kept.dismiss();
+    co_return BuildOutput{.file = std::move(kept), .inputs = {source}};
   }
 
+  // A `run` command has its file's path substituted in for %out, and its
+  // build output is whatever it left there - not its standard output, which
+  // a `> %out` rule leaves empty. A `capture` command's standard output is
+  // its output, so goes straight to the file handed over.
   const bool capture = command.action == Manifest::Action::Capture;
-
-  // A `run` command gets a private file to write its output to - with the
-  // output's own file name, since plenty of tools (pandoc and friends) pick
-  // their format from the extension - with that path substituted in for %out.
-  // The directory is fresh per build, so the name cannot collide. Its build
-  // output is whatever it left in that file - not ProcessUtil's captured
-  // stdout, which a `> %out` rule leaves empty. A `capture` command has no
-  // output file: its stdout is the output.
-  std::optional<TempDirectory> scratch;
-  std::filesystem::path out_path;
-  if (!capture) {
-    std::expected<std::filesystem::path, std::error_code> directory =
-        make_temp_directory();
-    if (!directory.has_value()) {
-      co_return std::unexpected(directory.error());
-    }
-    scratch.emplace(std::move(*directory));
-    out_path = scratch->path() / command.output.filename();
-  }
-
+  const std::filesystem::path out_path =
+      scratch.path() / command.output.filename();
   std::string text = expand_generated(command.text, mountpoint);
   if (!capture) {
     text = substitute_out(text, out_path);
   }
-  // A `capture` command's standard output is its output, so all of it is
-  // kept; the rest only explains a failure.
   ProcessUtil::Result result = co_await ProcessUtil::run(
       io, working_directory, text, tracker, command.output, stop,
-      CaptureLimits{.standard_output = capture ? CaptureLimits{}.standard_output
-                                               : k_kept_diagnostics,
-                    .standard_error = k_kept_diagnostics});
+      CaptureOptions{
+          .standard_output = k_kept_diagnostics,
+          .standard_error = k_kept_diagnostics,
+          .standard_output_file = capture ? kept : std::filesystem::path()});
   if (!result.has_value()) {
     co_return std::unexpected(result.error());
   }
@@ -365,30 +413,25 @@ exec::task<BuildResult> detail::run_shell_command(
     co_return fail(exit_status_error(result->exit_status),
                    std::move(diagnostics));
   }
-  std::string bytes;
-  if (capture) {
-    bytes = std::move(result->standard_output);
-  } else {
-    // A command that left nothing at %out has not built its output. Reading
-    // the scratch file's own error back - that it does not exist, say - would
-    // read as being about the output.
-    std::expected<std::string, std::error_code> written = read_file(out_path);
-    if (!written.has_value()) {
-      co_return fail(
-          make_error_code(BuildError::out_not_written),
-          with_reason(
-              std::move(diagnostics),
-              written.error() == std::errc::no_such_file_or_directory
-                  ? std::string(
-                        "command exited successfully but wrote nothing to %out")
-                  : "command exited successfully but its %out could not be "
-                    "read: " +
-                        written.error().message()));
-    }
-    bytes = std::move(*written);
+  // A command that left nothing at %out has not built its output. Reading
+  // the scratch file's own error back - that it does not exist, say - would
+  // read as being about the output.
+  if (const std::error_code error =
+          capture ? std::error_code() : take(out_path, kept)) {
+    co_return fail(
+        make_error_code(BuildError::out_not_written),
+        with_reason(
+            std::move(diagnostics),
+            error == std::errc::no_such_file_or_directory
+                ? std::string(
+                      "command exited successfully but wrote nothing to %out")
+                : "command exited successfully but its %out could not be "
+                  "read: " +
+                      error.message()));
   }
+  discard_kept.dismiss();
   // What it printed is dropped: it built, so there is nothing to explain.
-  co_return BuildOutput{.bytes = std::move(bytes), .inputs = std::move(inputs)};
+  co_return BuildOutput{.file = std::move(kept), .inputs = std::move(inputs)};
 }
 
 }  // namespace makebelieve

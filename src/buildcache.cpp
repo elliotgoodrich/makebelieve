@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 #include "buildcache.hpp"
 
+#include "directorytreeutil.hpp"
 #include "filesystemutil.hpp"
+#include "nativefile.hpp"
 #include "scopeguard.hpp"
 
 #include <sqlite3.h>
@@ -16,6 +18,8 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -231,6 +235,14 @@ std::optional<Manifest::Action> action_from_text(std::string_view text) {
   return std::nullopt;
 }
 
+// How much of a file BuildCache::hash reads at a time.
+constexpr std::size_t k_hash_piece_bytes = std::size_t{1} << 20;
+
+// Formats @a hash as BuildCache names content by it.
+std::string to_text(const XXH128_hash_t& hash) {
+  return std::format("{:016x}{:016x}", hash.high64, hash.low64);
+}
+
 // Whether @a hash could have come from BuildCache::hash, so it is safe to
 // name a file by.
 bool is_hash(std::string_view hash) {
@@ -264,7 +276,9 @@ void mark_as_cache(const std::filesystem::path& directory) {
 }  // namespace
 
 BuildCache::BuildCache(std::filesystem::path directory)
-    : m_directory(std::move(directory)), m_objects(m_directory / "objects") {
+    : m_directory(std::move(directory)),
+      m_objects(m_directory / "objects"),
+      m_scratch(m_directory / "scratch") {
   std::filesystem::create_directories(m_objects);
   mark_as_cache(m_directory);
 
@@ -320,6 +334,14 @@ BuildCache::BuildCache(std::filesystem::path directory)
     }
     transaction.commit();
   }
+
+  // Only now the cache is ours: whatever is in scratch was left by a run that
+  // has gone, never by one still writing there.
+  {
+    std::error_code ignored;
+    std::filesystem::remove_all(m_scratch, ignored);
+  }
+  std::filesystem::create_directories(m_scratch);
   close_on_failure.dismiss();
 }
 
@@ -329,6 +351,10 @@ BuildCache::~BuildCache() {
 
 const std::filesystem::path& BuildCache::directory() const {
   return m_directory;
+}
+
+const std::filesystem::path& BuildCache::scratch_directory() const {
+  return m_scratch;
 }
 
 std::vector<BuildCache::Record> BuildCache::records() const {
@@ -373,23 +399,28 @@ std::vector<BuildCache::Record> BuildCache::records() const {
   return records;
 }
 
-std::expected<std::string, std::error_code> BuildCache::read(
-    std::string_view hash) const {
+std::expected<std::shared_ptr<const NativeFile>, std::error_code>
+BuildCache::open(std::string_view hash) const {
   const auto missing =
       std::make_error_code(std::errc::no_such_file_or_directory);
   if (!is_hash(hash)) {
     return std::unexpected(missing);
   }
-  std::expected<std::string, std::error_code> bytes =
-      FileSystemUtil::read_file(m_objects / std::string(hash));
-  if (!bytes.has_value()) {
-    return std::unexpected(bytes.error());
+  std::expected<std::shared_ptr<const NativeFile>, std::error_code> file =
+      NativeFile::open(m_objects / std::string(hash));
+  if (!file.has_value()) {
+    return std::unexpected(file.error());
   }
-  // A content file a crash cut short, or that anything else has touched.
-  if (BuildCache::hash(*bytes) != hash) {
+  const std::expected<std::string, std::error_code> found =
+      BuildCache::hash(**file);
+  if (!found.has_value()) {
+    return std::unexpected(found.error());
+  }
+  // A content file that anything else has touched.
+  if (*found != hash) {
     return std::unexpected(missing);
   }
-  return bytes;
+  return file;
 }
 
 std::string BuildCache::store(const Command& command,
@@ -397,28 +428,73 @@ std::string BuildCache::store(const Command& command,
                               std::chrono::file_clock::time_point mtime,
                               std::span<const Input> inputs) {
   std::string hash = BuildCache::hash(bytes);
-  const std::lock_guard lock(m_mutex);
+  store_content(command,
+                *DirectoryTreeUtil::memory_file(
+                    std::make_shared<const std::string>(bytes), {}),
+                hash, mtime, inputs);
+  return hash;
+}
 
-  // Written in full under another name, then renamed into place, so the file
-  // under the hash's name never holds anything else.
-  const std::filesystem::path object = m_objects / hash;
-  const std::filesystem::path scratch =
-      m_objects / std::format("{}.{}.tmp", hash, ++m_next_scratch);
-  if (const std::error_code error =
-          FileSystemUtil::write_file(scratch, bytes)) {
+void BuildCache::store_file(const Command& command,
+                            const std::filesystem::path& file,
+                            std::string_view hash,
+                            std::chrono::file_clock::time_point mtime,
+                            std::span<const Input> inputs) {
+  // Whatever becomes of it, the file is the cache's to get rid of.
+  const ScopeGuard remove_file([&file] {
     std::error_code ignored;
-    std::filesystem::remove(scratch, ignored);
-    throw std::system_error(error, "build cache: writing an output");
-  }
-  {
+    std::filesystem::remove(file, ignored);
+  });
+  const std::lock_guard lock(m_mutex);
+  place(std::string(hash), [&file](const std::filesystem::path& scratch) {
     std::error_code error;
-    std::filesystem::rename(scratch, object, error);
-    if (error) {
-      std::filesystem::remove(scratch, error);
-      throw std::system_error(error, "build cache: writing an output");
-    }
-  }
+    std::filesystem::rename(file, scratch, error);
+    return error;
+  });
+  record(command, std::string(hash), mtime, inputs);
+}
 
+void BuildCache::store_content(const Command& command,
+                               const OpenedFile& content,
+                               std::string_view hash,
+                               std::chrono::file_clock::time_point mtime,
+                               std::span<const Input> inputs) {
+  const std::lock_guard lock(m_mutex);
+  place(std::string(hash), [&content](const std::filesystem::path& scratch) {
+    return DirectoryTreeUtil::write_file(scratch, content);
+  });
+  record(command, std::string(hash), mtime, inputs);
+}
+
+void BuildCache::place(
+    const std::string& hash,
+    const std::function<std::error_code(const std::filesystem::path&)>& write) {
+  if (!is_hash(hash)) {
+    throw std::system_error(std::make_error_code(std::errc::invalid_argument),
+                            "build cache: storing an output");
+  }
+  // Content already there is left as it is, as something may be reading it.
+  const std::filesystem::path object = m_objects / hash;
+  std::error_code ignored;
+  if (std::filesystem::exists(object, ignored)) {
+    return;
+  }
+  const std::filesystem::path scratch =
+      m_scratch / std::format("cache-{}.tmp", ++m_next_scratch);
+  std::error_code error = write(scratch);
+  if (!error) {
+    std::filesystem::rename(scratch, object, error);
+  }
+  if (error) {
+    std::filesystem::remove(scratch, ignored);
+    throw std::system_error(error, "build cache: storing an output");
+  }
+}
+
+void BuildCache::record(const Command& command,
+                        const std::string& hash,
+                        std::chrono::file_clock::time_point mtime,
+                        std::span<const Input> inputs) {
   const std::string output = to_text(command.output);
   std::optional<std::string> previous;
   try {
@@ -454,7 +530,6 @@ std::string BuildCache::store(const Command& command,
   if (previous.has_value() && *previous != hash) {
     drop_if_unreferenced(*previous);
   }
-  return hash;
 }
 
 void BuildCache::forget(std::span<const std::filesystem::path> outputs) {
@@ -514,8 +589,25 @@ void BuildCache::drop_if_unreferenced(const std::string& hash) {
 }
 
 std::string BuildCache::hash(std::string_view bytes) {
-  const XXH128_hash_t hash = XXH3_128bits(bytes.data(), bytes.size());
-  return std::format("{:016x}{:016x}", hash.high64, hash.low64);
+  return to_text(XXH3_128bits(bytes.data(), bytes.size()));
+}
+
+std::expected<std::string, std::error_code> BuildCache::hash(
+    const OpenedFile& file) {
+  XXH3_state_t state;
+  XXH3_128bits_reset(&state);
+  for (Offset offset = 0;;) {
+    const std::expected<std::string, std::error_code> piece =
+        DirectoryTreeUtil::wait_read(file.read(offset, k_hash_piece_bytes));
+    if (!piece.has_value()) {
+      return std::unexpected(piece.error());
+    }
+    if (piece->empty()) {
+      return to_text(XXH3_128bits_digest(&state));
+    }
+    XXH3_128bits_update(&state, piece->data(), piece->size());
+    offset += static_cast<Offset>(piece->size());
+  }
 }
 
 std::int64_t BuildCache::raw_mtime(std::chrono::file_clock::time_point time) {

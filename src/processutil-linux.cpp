@@ -835,8 +835,9 @@ struct KillOn {
   stdexec::inplace_stop_token abort;  // something found it cannot succeed
 };
 
-// Collects @a child's stdout from @a read_fd, and its stderr from @a error_fd,
-// keeping no more of each than @a limits allows, until it exits, then reaps it,
+// Collects @a child's stdout from @a read_fd - unless it has none, its stdout
+// going to a file - and its stderr from @a error_fd, keeping no more of each
+// than @a options allows, until it exits, then reaps it,
 // killing it if either of @a kill_on is requested. Waits on both through
 // @a io. This is the child's one owner while it runs: nothing else signals or
 // reaps it. Knows nothing of tracing.
@@ -845,12 +846,14 @@ exec::task<Supervision> supervise(IoContext& io,
                                   UniqueFd read_fd,
                                   UniqueFd error_fd,
                                   KillOn kill_on,
-                                  CaptureLimits limits) {
+                                  CaptureOptions options) {
   Supervision result;
 
   // Non-blocking, so draining stops at what is there now.
   for (const int fd : {read_fd.get(), error_fd.get()}) {
-    ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK);
+    if (fd >= 0) {
+      ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK);
+    }
   }
   std::array<char, 4096> buffer{};
   // Reads what the pipe @a fd holds now into @a into, as far as @a limit
@@ -879,7 +882,7 @@ exec::task<Supervision> supervise(IoContext& io,
   // is then killed - and reading as it arrives keeps a full pipe from
   // blocking the command.
   std::error_code wait_error;
-  bool open = true;
+  bool open = read_fd.get() >= 0;
   bool error_open = true;
   {
     // Gone before the child is reaped - their destruction waiting out one
@@ -919,12 +922,12 @@ exec::task<Supervision> supervise(IoContext& io,
         break;
       }
       if (open) {
-        open = drain(read_fd, result.output, limits.standard_output,
+        open = drain(read_fd, result.output, options.standard_output,
                      result.output_omitted);
       }
       if (error_open) {
-        error_open = drain(error_fd, result.error_output, limits.standard_error,
-                           result.error_omitted);
+        error_open = drain(error_fd, result.error_output,
+                           options.standard_error, result.error_omitted);
       }
     }
     if (wait_error) {
@@ -936,11 +939,11 @@ exec::task<Supervision> supervise(IoContext& io,
   result.exit_status = child.exit_status();
   // Whatever the child wrote just before it exited.
   if (open) {
-    drain(read_fd, result.output, limits.standard_output,
+    drain(read_fd, result.output, options.standard_output,
           result.output_omitted);
   }
   if (error_open) {
-    drain(error_fd, result.error_output, limits.standard_error,
+    drain(error_fd, result.error_output, options.standard_error,
           result.error_omitted);
   }
 
@@ -1138,13 +1141,13 @@ exec::task<Supervision> supervise_then_end(
     UniqueFd read_fd,
     UniqueFd error_fd,
     KillOn kill_on,
-    CaptureLimits limits,
+    CaptureOptions options,
     TracingSession& session,
     stdexec::inplace_stop_source& stop_serving) {
   Supervision supervision;
   try {
     supervision = co_await supervise(io, child, std::move(read_fd),
-                                     std::move(error_fd), kill_on, limits);
+                                     std::move(error_fd), kill_on, options);
   } catch (...) {
     supervision.error = std::make_error_code(std::errc::not_enough_memory);
   }
@@ -1249,25 +1252,38 @@ class TracingSetup {
 };
 
 // Runs @a command under a FUSE passthrough on @a root, reporting the absolute
-// paths it read under @a root. Tracing is required: if it cannot be set up -
-// no unprivileged user namespaces, say - or fails while the command runs, the
-// run fails with the reason rather than reporting no inputs.
+// paths it read under @a root - its standard output going to
+// the file @a options names, if it names one, rather than back to us. Tracing
+// is required: if it cannot be set up - no unprivileged user namespaces, say -
+// or fails while the command runs, the run fails with the reason rather than
+// reporting no inputs.
 exec::task<ProcessUtil::Result> run_traced(IoContext& io,
                                            std::filesystem::path root,
                                            std::string command,
                                            BuildProcessTracker& tracker,
                                            std::filesystem::path output,
                                            stdexec::inplace_stop_token stop,
-                                           CaptureLimits limits) {
+                                           CaptureOptions options) {
   // Close-on-exec, so that only this command gets the write ends - as its
   // stdout and stderr, which dup2() leaves inheritable - and no other launched
-  // meanwhile gets any end.
-  std::array<int, 2> out_pipe{-1, -1};
-  if (::pipe2(out_pipe.data(), O_CLOEXEC) != 0) {
-    co_return std::unexpected(last_error_code());
+  // meanwhile gets any end. A file its stdout goes to has no end of ours.
+  UniqueFd out_read(-1);
+  UniqueFd out_write(-1);
+  if (!options.standard_output_file.empty()) {
+    out_write =
+        UniqueFd(::open(options.standard_output_file.c_str(),
+                        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666));
+    if (out_write.get() < 0) {
+      co_return std::unexpected(last_error_code());
+    }
+  } else {
+    std::array<int, 2> out_pipe{-1, -1};
+    if (::pipe2(out_pipe.data(), O_CLOEXEC) != 0) {
+      co_return std::unexpected(last_error_code());
+    }
+    out_read = UniqueFd(out_pipe[0]);
+    out_write = UniqueFd(out_pipe[1]);
   }
-  UniqueFd out_read(out_pipe[0]);
-  UniqueFd out_write(out_pipe[1]);
   std::array<int, 2> err_pipe{-1, -1};
   if (::pipe2(err_pipe.data(), O_CLOEXEC) != 0) {
     co_return std::unexpected(last_error_code());
@@ -1345,7 +1361,7 @@ exec::task<ProcessUtil::Result> run_traced(IoContext& io,
   std::error_code tracing_failure;
   Supervision supervision = co_await stdexec::when_all(
       supervise_then_end(io, child, std::move(out_read), std::move(err_read),
-                         {.stop = stop, .abort = abort.get_token()}, limits,
+                         {.stop = stop, .abort = abort.get_token()}, options,
                          **session, stop_serving),
       serve_or_abort(io, **session, stop_serving.get_token(), abort,
                      tracing_failure));
@@ -1373,7 +1389,7 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     BuildProcessTracker& tracker,
     std::filesystem::path output,
     stdexec::inplace_stop_token stop,
-    CaptureLimits limits) {
+    CaptureOptions options) {
   if (stop.stop_requested()) {
     co_return std::unexpected(
         std::make_error_code(std::errc::operation_canceled));
@@ -1389,7 +1405,8 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     root = working_directory;
   }
   co_return co_await run_traced(io, std::move(root), std::move(command),
-                                tracker, std::move(output), stop, limits);
+                                tracker, std::move(output), stop,
+                                std::move(options));
 }
 
 }  // namespace makebelieve

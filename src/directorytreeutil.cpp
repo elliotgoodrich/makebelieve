@@ -2,23 +2,62 @@
 #include "directorytreeutil.hpp"
 
 #include "directorytree.hpp"
+#include "filesystemutil.hpp"
 
 #include <exec/task.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <memory>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <variant>
 #include <vector>
 
 namespace makebelieve {
 
 namespace {
+
+// An opened file over bytes of its own, as DirectoryTreeUtil::memory_file
+// describes.
+class MemoryFile final : public OpenedFile {
+  std::shared_ptr<const std::string> m_bytes;
+  std::chrono::file_clock::time_point m_mtime;
+
+ public:
+  MemoryFile(std::shared_ptr<const std::string> bytes,
+             std::chrono::file_clock::time_point mtime)
+      : m_bytes(std::move(bytes)), m_mtime(mtime) {}
+
+  [[nodiscard]] std::expected<FileInfo, std::error_code> stat() const override {
+    return FileInfo{.size = m_bytes->size(), .mtime = m_mtime};
+  }
+
+  [[nodiscard]] ReadSender read(Offset offset,
+                                std::size_t size) const override {
+    return stdexec::just() |
+           stdexec::then(
+               [this, offset,
+                size]() -> std::expected<std::string, std::error_code> {
+                 if (offset < 0) {
+                   return std::unexpected(
+                       std::make_error_code(std::errc::invalid_argument));
+                 }
+                 if (static_cast<std::uint64_t>(offset) >= m_bytes->size()) {
+                   return std::string{};
+                 }
+                 return m_bytes->substr(static_cast<std::size_t>(offset), size);
+               });
+  }
+};
 
 std::string describe(const std::filesystem::path& path) {
   return path.empty() ? std::string("<root>") : path.generic_string();
@@ -223,6 +262,55 @@ std::string DirectoryTreeUtil::diff(const DirectoryTree& a,
 
 bool DirectoryTreeUtil::equal(const DirectoryTree& a, const DirectoryTree& b) {
   return diff(a, b).empty();
+}
+
+std::error_code DirectoryTreeUtil::write_file(const std::filesystem::path& path,
+                                              const OpenedFile& file) {
+  // Big enough that a large file takes few reads, small enough that a piece
+  // never holds much of one in memory.
+  constexpr std::size_t k_piece_bytes = std::size_t{1} << 20;
+  Offset offset = 0;
+  return FileSystemUtil::write_file(
+      path, [&]() -> std::expected<std::string, std::error_code> {
+        std::expected<std::string, std::error_code> piece =
+            wait_read(file.read(offset, k_piece_bytes));
+        if (piece.has_value()) {
+          offset += static_cast<Offset>(piece->size());
+        }
+        return piece;
+      });
+}
+
+std::optional<std::filesystem::path> DirectoryTreeUtil::normalize(
+    const std::filesystem::path& path) {
+  if (path.empty()) {
+    return std::filesystem::path{};
+  }
+  if (path.is_absolute() || path.has_root_name() || path.has_root_directory()) {
+    return std::nullopt;
+  }
+
+  const std::filesystem::path normal = path.lexically_normal();
+  const auto first = normal.begin();
+  if (first != normal.end() && *first == "..") {
+    return std::nullopt;
+  }
+
+  // lexically_normal() leaves a path that collapsed to nothing as ".",
+  // rather than empty; fold that back onto the root's own sentinel.
+  return normal == "." ? std::filesystem::path{} : normal;
+}
+
+bool DirectoryTreeUtil::is_within(const std::filesystem::path& entry,
+                                  const std::filesystem::path& directory) {
+  const auto result = std::ranges::mismatch(directory, entry);
+  return result.in1 == directory.end() && result.in2 != entry.end();
+}
+
+std::shared_ptr<const OpenedFile> DirectoryTreeUtil::memory_file(
+    std::shared_ptr<const std::string> bytes,
+    std::chrono::file_clock::time_point mtime) {
+  return std::make_shared<const MemoryFile>(std::move(bytes), mtime);
 }
 
 }  // namespace makebelieve

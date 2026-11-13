@@ -42,6 +42,7 @@ add_library(makebelieve_core STATIC
   iocontext.cpp
   nativehandlepoller-${MAKEBELIEVE_PLATFORM}.cpp
   manifest.cpp
+  nativefile-${MAKEBELIEVE_PLATFORM}.cpp
   osbuildprocesstracker-${MAKEBELIEVE_PLATFORM}.cpp
   processinfo-${MAKEBELIEVE_PLATFORM}.cpp
   processutil-${MAKEBELIEVE_PLATFORM}.cpp

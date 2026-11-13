@@ -334,14 +334,15 @@ std::error_code make_output_pipe(ScopedHandle& read, ScopedHandle& write) {
 // Collects a command's output from our end of its pipe, keeping one
 // overlapped read outstanding at a time and signalling event() whenever it
 // completes - and never again once the pipe has closed, so it may go on being
-// waited on alongside a pipe that is still open.
+// waited on alongside a pipe that is still open. Given no pipe, it has nothing
+// to read, so is closed from the start.
 class OutputReader {
   HANDLE m_pipe;
   ScopedHandle m_event;
   OVERLAPPED m_overlapped{};
   std::vector<char> m_buffer = std::vector<char>(k_pipe_bytes);
   bool m_pending = false;
-  bool m_open = true;
+  bool m_open;
   std::string m_output;
   std::size_t m_limit;
   std::size_t m_omitted = 0;
@@ -379,6 +380,7 @@ class OutputReader {
   OutputReader(HANDLE pipe, std::size_t limit)
       : m_pipe(pipe),
         m_event(CreateEventW(nullptr, TRUE, FALSE, nullptr)),
+        m_open(pipe != nullptr),
         m_limit(limit) {}
 
   // The kernel may yet write into m_buffer, so no read may outlive it.
@@ -840,7 +842,7 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
     BuildProcessTracker& tracker,
     std::filesystem::path output,
     stdexec::inplace_stop_token stop,
-    CaptureLimits limits) {
+    CaptureOptions options) {
   if (stop.stop_requested()) {
     co_return std::unexpected(
         std::make_error_code(std::errc::operation_canceled));
@@ -856,15 +858,31 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
   ScopedHandle write_end(nullptr);
   ScopedHandle error_read_end(nullptr);
   ScopedHandle error_write_end(nullptr);
-  if (const std::error_code error = make_output_pipe(read_end, write_end)) {
+  if (!options.standard_output_file.empty()) {
+    // The command's alone, as its pipe's end would be. Others may read it,
+    // or move it away, while it writes.
+    SECURITY_ATTRIBUTES inheritable = {
+        .nLength = sizeof(inheritable),
+        .bInheritHandle = TRUE,
+    };
+    const HANDLE file =
+        CreateFileW(options.standard_output_file.c_str(), GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_DELETE, &inheritable,
+                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+      co_return std::unexpected(last_error_code());
+    }
+    write_end.reset(file);
+  } else if (const std::error_code error =
+                 make_output_pipe(read_end, write_end)) {
     co_return std::unexpected(error);
   }
   if (const std::error_code error =
           make_output_pipe(error_read_end, error_write_end)) {
     co_return std::unexpected(error);
   }
-  OutputReader reader(read_end.get(), limits.standard_output);
-  OutputReader error_reader(error_read_end.get(), limits.standard_error);
+  OutputReader reader(read_end.get(), options.standard_output);
+  OutputReader error_reader(error_read_end.get(), options.standard_error);
   if (!reader.valid() || !error_reader.valid()) {
     co_return std::unexpected(last_error_code());
   }

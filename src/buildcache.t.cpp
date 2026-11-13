@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 #include "buildcache.hpp"
 
+#include "directorytreeutil.hpp"
 #include "filesystemutil.hpp"
+#include "nativefile.hpp"
 
 #include <gtest/gtest.h>
 
@@ -11,12 +13,29 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
 namespace {
 
 using namespace makebelieve;
+
+// All of what @a file reads, at once.
+std::string read_all(const OpenedFile& file) {
+  return DirectoryTreeUtil::wait_read(file.read(0, std::size_t{1} << 20))
+      .value();
+}
+
+// The content @a cache holds under @a hash, as `open` finds it.
+std::expected<std::string, std::error_code> read(const BuildCache& cache,
+                                                 std::string_view hash) {
+  const auto opened = cache.open(hash);
+  if (!opened.has_value()) {
+    return std::unexpected(opened.error());
+  }
+  return read_all(**opened);
+}
 
 class BuildCacheTest : public ::testing::Test {
  protected:
@@ -115,7 +134,7 @@ TEST_F(BuildCacheTest, StoredRecordsOutliveTheCache) {
                                 .mtime = k_built,
                                 .inputs = inputs}));
   EXPECT_EQ(hash, BuildCache::hash("built"));
-  EXPECT_EQ(cache.read(hash), "built");
+  EXPECT_EQ(read(cache, hash), "built");
 }
 
 TEST_F(BuildCacheTest, KeepsEveryAction) {
@@ -158,7 +177,7 @@ TEST_F(BuildCacheTest, StoringAgainReplacesTheRecordAndDropsOldContent) {
   ASSERT_EQ(records[0].inputs.size(), 1U);
   EXPECT_EQ(records[0].inputs[0].path, "b");
   EXPECT_EQ(object_count(), 1U);
-  EXPECT_FALSE(cache.read(BuildCache::hash("first")).has_value());
+  EXPECT_FALSE(read(cache, BuildCache::hash("first")).has_value());
 }
 
 TEST_F(BuildCacheTest, OutputsWithTheSameContentShareIt) {
@@ -169,9 +188,9 @@ TEST_F(BuildCacheTest, OutputsWithTheSameContentShareIt) {
 
   // Content stays for as long as any record names it.
   cache.forget(std::vector<std::filesystem::path>{"x"});
-  EXPECT_EQ(cache.read(hash), "same");
+  EXPECT_EQ(read(cache, hash), "same");
   cache.forget(std::vector<std::filesystem::path>{"y"});
-  EXPECT_FALSE(cache.read(hash).has_value());
+  EXPECT_FALSE(read(cache, hash).has_value());
   EXPECT_EQ(object_count(), 0U);
 }
 
@@ -196,15 +215,15 @@ TEST_F(BuildCacheTest, ContentThatNoLongerMatchesItsHashReadsAsMissing) {
   ASSERT_FALSE(
       FileSystemUtil::write_file(directory / "objects" / hash, "conten"));
 
-  const std::expected<std::string, std::error_code> read = cache.read(hash);
-  ASSERT_FALSE(read.has_value());
-  EXPECT_EQ(read.error(), std::errc::no_such_file_or_directory);
+  const std::expected<std::string, std::error_code> content = read(cache, hash);
+  ASSERT_FALSE(content.has_value());
+  EXPECT_EQ(content.error(), std::errc::no_such_file_or_directory);
 }
 
 TEST_F(BuildCacheTest, ReadingAnythingButAHashFails) {
   const BuildCache cache(directory);
-  EXPECT_FALSE(cache.read("../cache.sqlite").has_value());
-  EXPECT_FALSE(cache.read("").has_value());
+  EXPECT_FALSE(read(cache, "../cache.sqlite").has_value());
+  EXPECT_FALSE(read(cache, "").has_value());
 }
 
 TEST_F(BuildCacheTest, GarbageCollectionKeepsOnlyRecordedContent) {
@@ -218,7 +237,7 @@ TEST_F(BuildCacheTest, GarbageCollectionKeepsOnlyRecordedContent) {
   cache.collect_garbage();
 
   EXPECT_EQ(object_count(), 1U);
-  EXPECT_EQ(cache.read(hash), "kept");
+  EXPECT_EQ(read(cache, hash), "kept");
 }
 
 TEST_F(BuildCacheTest, ASecondCacheOnTheSameDirectoryFails) {
@@ -241,6 +260,85 @@ TEST_F(BuildCacheTest, HashesAreThirtyTwoHexDigits) {
   EXPECT_EQ(hash.size(), 32U);
   EXPECT_EQ(hash.find_first_not_of("0123456789abcdef"), std::string::npos);
   EXPECT_NE(hash, BuildCache::hash("anything else"));
+}
+
+// Hashing through an opened file names content as hashing its bytes does.
+TEST_F(BuildCacheTest, HashesAnOpenedFileAsItsBytes) {
+  BuildCache cache(directory);
+  const std::string hash = cache.store(run("x", "c"), "anything", k_built, {});
+  const auto opened = cache.open(hash);
+  ASSERT_TRUE(opened.has_value()) << opened.error().message();
+  EXPECT_EQ(BuildCache::hash(**opened), hash);
+}
+
+// Whatever a run left in scratch is gone by the next.
+TEST_F(BuildCacheTest, OpeningEmptiesTheScratchDirectory) {
+  {
+    const BuildCache cache(directory);
+    EXPECT_TRUE(std::filesystem::is_directory(cache.scratch_directory()));
+    ASSERT_FALSE(FileSystemUtil::write_file(
+        cache.scratch_directory() / "left.out", "left"));
+  }
+  const BuildCache cache(directory);
+  EXPECT_TRUE(std::filesystem::is_empty(cache.scratch_directory()));
+}
+
+// A file stored is moved in as the content - or deleted, if that content is
+// there already - and gone from where it was either way.
+TEST_F(BuildCacheTest, StoringAFileTakesItOver) {
+  BuildCache cache(directory);
+  const std::filesystem::path first = cache.scratch_directory() / "1.out";
+  const std::filesystem::path second = cache.scratch_directory() / "2.out";
+  ASSERT_FALSE(FileSystemUtil::write_file(first, "same"));
+  ASSERT_FALSE(FileSystemUtil::write_file(second, "same"));
+  const std::string hash = BuildCache::hash("same");
+
+  cache.store_file(run("x", "c"), first, hash, k_built, {});
+  cache.store_file(run("y", "c"), second, hash, k_built, {});
+
+  EXPECT_FALSE(std::filesystem::exists(first));
+  EXPECT_FALSE(std::filesystem::exists(second));
+  EXPECT_EQ(object_count(), 1U);
+  EXPECT_EQ(read(cache, hash), "same");
+  EXPECT_EQ(cache.records().size(), 2U);
+}
+
+// Content that something has open is never rewritten, and that open reads on
+// once the content is dropped - and the same content can be stored again.
+TEST_F(BuildCacheTest, OpenContentReadsOnOnceItIsDropped) {
+  BuildCache cache(directory);
+  const std::string hash = cache.store(run("x", "c"), "kept", k_built, {});
+  const auto opened = cache.open(hash);
+  ASSERT_TRUE(opened.has_value()) << opened.error().message();
+
+  cache.store(run("y", "c"), "kept", k_built, {});
+  cache.forget(std::vector<std::filesystem::path>{"x", "y"});
+  EXPECT_EQ(object_count(), 0U);
+  EXPECT_EQ(read_all(**opened), "kept");
+
+  const std::filesystem::path again = cache.scratch_directory() / "again.out";
+  ASSERT_FALSE(FileSystemUtil::write_file(again, "kept"));
+  cache.store_file(run("x", "c"), again, hash, k_built, {});
+  EXPECT_EQ(read(cache, hash), "kept");
+  EXPECT_EQ(read_all(**opened), "kept");
+}
+
+// Content read from an opened file is written in only if it is not there.
+TEST_F(BuildCacheTest, StoresWhatAnOpenedFileReads) {
+  BuildCache cache(directory);
+  const std::filesystem::path source = directory / "source.txt";
+  ASSERT_FALSE(FileSystemUtil::write_file(source, "copied"));
+  const auto opened = NativeFile::open(source);
+  ASSERT_TRUE(opened.has_value());
+
+  cache.store_content(run("x", "c"), **opened, BuildCache::hash("copied"),
+                      k_built, {});
+  cache.store_content(run("y", "c"), **opened, BuildCache::hash("copied"),
+                      k_built, {});
+
+  EXPECT_EQ(object_count(), 1U);
+  EXPECT_EQ(read(cache, BuildCache::hash("copied")), "copied");
+  EXPECT_EQ(cache.records().size(), 2U);
 }
 
 }  // namespace

@@ -3,6 +3,7 @@
 
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -30,6 +31,12 @@ struct FileSystemUtil {
   [[nodiscard]] static std::error_code write_file(
       const std::filesystem::path& path,
       std::string_view contents);
+
+  /// As above, but writing what @a next gives, a piece at a time, until it
+  /// gives an empty piece - or an error, which is returned.
+  [[nodiscard]] static std::error_code write_file(
+      const std::filesystem::path& path,
+      const std::function<std::expected<std::string, std::error_code>()>& next);
 
   /// Attempts to hide the existing file or directory @a path from listings
   /// that skip hidden entries, returning the error that stopped it, if any.

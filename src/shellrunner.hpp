@@ -58,6 +58,7 @@ exec::task<BuildResult> run_shell_command(
     IoContext& io,
     std::filesystem::path working_directory,
     std::filesystem::path mountpoint,
+    std::filesystem::path scratch_directory,
     Command command,
     BuildProcessTracker& tracker,
     stdexec::inplace_stop_token stop);
@@ -68,23 +69,26 @@ exec::task<BuildResult> run_shell_command(
 /// A `CommandRunner` that carries out each rule it is
 /// given, with no limit of its own on how many run at once. Its
 /// brief synchronous steps - preparing and removing a scratch directory,
-/// starting a command, reading back what it wrote - run on @a Scheduler, and
-/// it waits on a command through an `IoContext`, holding no thread while it
+/// starting a command, moving what it wrote out of it - run on @a Scheduler,
+/// and it waits on a command through an `IoContext`, holding no thread while it
 /// runs.
 ///
 /// Each rule runs through the system shell with the working directory set to
-/// the one given at construction, so relative inputs resolve against it. A
-/// `Run` command has `%out` substituted with a scratch file - with the same
-/// file name as the output it builds, so a tool that chooses its format from
-/// the extension needs no extra flag - and produces the bytes it wrote there,
-/// failing with `BuildError::out_not_written` if it left no file there. A
-/// `Capture` command produces the bytes it wrote to standard output. A command
-/// that exits with a nonzero status fails. Each `@/<path>` in either becomes
-/// that output's path under the mountpoint. A
-/// `Copy` rule runs no command at all: it produces the bytes of the file it
-/// names, read from under the working directory, and reports that file as its
-/// one input, failing with `BuildError::copy_source_unreadable` if that file
-/// cannot be read. (`BuildDirectoryTree` serves a copy of an output itself.)
+/// the one given at construction, so relative inputs resolve against it. Every
+/// rule builds into a file of its own, in a directory of its own in the
+/// scratch directory given at construction, with the same file name as the
+/// output it builds. A `Run` command has `%out` substituted with that file - so
+/// a tool that chooses its format from the extension needs no extra flag - and
+/// produces what it wrote there, failing with `BuildError::out_not_written` if
+/// it left no file there. A `Capture` command has its standard output written
+/// to that file. A command that exits with a nonzero status fails. Each
+/// `@/<path>` in either becomes that output's path under the mountpoint. A
+/// `Copy` rule runs no command at all: it copies the file it names, from under
+/// the working directory, and reports that file as its one input, failing with
+/// `BuildError::copy_source_unreadable` if that file cannot be read.
+/// (`BuildDirectoryTree` serves a copy of an output itself.) Once built, the
+/// file is moved out beside its directory - which goes, with anything else the
+/// build left in it - and handed over as `BuildOutput::file`.
 ///
 /// Whatever a command writes to standard error - and a `Run` command's
 /// standard output, which is not its output but may say why it failed - is
@@ -102,7 +106,7 @@ exec::task<BuildResult> run_shell_command(
 /// @tparam Scheduler Where each build's synchronous steps run, and where it
 /// resumes, and completes, after waiting on its command. Satisfying
 /// `stdexec::scheduler` is not enough: those steps block - on the filesystem,
-/// on starting a process, on reading back an output that may be large - so
+/// on starting a process, on copying a file that may be large - so
 /// @a Scheduler must run work on threads meant for that, such as a worker
 /// pool's. An inline scheduler, or any whose work runs on the thread that
 /// started it, would leave them on the caller's thread, which may be the
@@ -111,25 +115,32 @@ template <stdexec::scheduler Scheduler>
 class ShellRunner {
   std::filesystem::path m_working_directory;
   std::filesystem::path m_mountpoint;
+  std::filesystem::path m_scratch_directory;
   IoContext* m_io;
   BuildProcessTracker* m_tracker;
   Scheduler m_scheduler;
 
  public:
   /// Creates a runner working in @a working_directory, with outputs mounted
-  /// at the absolute path @a mountpoint, running its synchronous steps on
+  /// at the absolute path @a mountpoint, building into files in
+  /// @a scratch_directory - a build cache's, which what it builds can then be
+  /// moved into with a rename - running its synchronous steps on
   /// @a scheduler, waiting through @a io, and adding the commands it runs to
   /// @a tracker - `BuildProcessTracker::none()` if nothing needs to tell them
   /// apart.
   /// @pre @a io, @a tracker, and whatever runs @a scheduler's work, outlive
   /// every build it starts.
+  /// @pre @a scratch_directory exists, outside @a working_directory, so no
+  /// command reads what is built there as an input.
   ShellRunner(std::filesystem::path working_directory,
               std::filesystem::path mountpoint,
+              std::filesystem::path scratch_directory,
               IoContext& io,
               BuildProcessTracker& tracker,
               Scheduler scheduler)
       : m_working_directory(std::move(working_directory)),
         m_mountpoint(std::move(mountpoint)),
+        m_scratch_directory(std::move(scratch_directory)),
         m_io(&io),
         m_tracker(&tracker),
         m_scheduler(std::move(scheduler)) {}
@@ -143,11 +154,12 @@ class ShellRunner {
            stdexec::let_value([io = m_io, tracker = m_tracker,
                                working_directory = m_working_directory,
                                mountpoint = m_mountpoint,
+                               scratch_directory = m_scratch_directory,
                                command = std::move(command)]() mutable {
              return stdexec::read_env(stdexec::get_stop_token) |
                     stdexec::let_value([&](stdexec::inplace_stop_token stop) {
                       return detail::run_shell_command(
-                          *io, working_directory, mountpoint,
+                          *io, working_directory, mountpoint, scratch_directory,
                           std::move(command), *tracker, stop);
                     });
            });

@@ -652,6 +652,66 @@ TEST_F(InMemoryDirectoryTree, OpenContentOutlivesAWrite) {
   EXPECT_EQ((*after)->stat().value().size, 7U);
 }
 
+// An opened file standing for a built output's file on disk.
+static std::shared_ptr<const makebelieve::OpenedFile> opened_content(
+    std::string bytes) {
+  return makebelieve::DirectoryTreeUtil::memory_file(
+      std::make_shared<const std::string>(std::move(bytes)),
+      std::chrono::file_clock::time_point());
+}
+
+static std::string read_all(const makebelieve::OpenedFile& file) {
+  return makebelieve::DirectoryTreeUtil::wait_read(file.read(0, 1024)).value();
+}
+
+// A file given another opened file reads through it, but reports the size and
+// mtime it was given without asking that file.
+TEST_F(InMemoryDirectoryTree, AFileGivenContentReadsThroughItAsReported) {
+  makebelieve::InMemoryDirectoryTree tree;
+  const std::chrono::file_clock::time_point built =
+      std::chrono::file_clock::time_point(std::chrono::hours(2));
+  tree.write_file("out.txt", opened_content("shared bytes"),
+                  makebelieve::FileInfo{.size = 12, .mtime = built});
+
+  const std::shared_ptr<const makebelieve::OpenedFile> opened =
+      makebelieve::DirectoryTreeUtil::open(tree, "out.txt").value();
+  EXPECT_EQ(read_all(*opened), "shared bytes");
+  EXPECT_EQ(
+      makebelieve::DirectoryTreeUtil::wait_read(opened->read(7, 16)).value(),
+      "bytes");
+  EXPECT_EQ(opened->stat().value().size, 12U);
+  EXPECT_EQ(opened->stat().value().mtime, built);
+  const makebelieve::FileInfo info =
+      std::get<makebelieve::FileInfo>(*tree.status("out.txt"));
+  EXPECT_EQ(info.size, 12U);
+  EXPECT_EQ(info.mtime, built);
+}
+
+// Every open of one version shares it, and keeps its content however the
+// file is replaced or removed.
+TEST_F(InMemoryDirectoryTree, AnOpenPinsItsVersion) {
+  makebelieve::InMemoryDirectoryTree tree;
+  std::shared_ptr<const makebelieve::OpenedFile> source =
+      opened_content("first");
+  const std::weak_ptr<const makebelieve::OpenedFile> watch = source;
+  tree.write_file(
+      "out.txt", std::move(source),
+      makebelieve::FileInfo{.size = 5,
+                            .mtime = std::chrono::file_clock::time_point()});
+  const std::shared_ptr<const makebelieve::OpenedFile> first =
+      makebelieve::DirectoryTreeUtil::open(tree, "out.txt").value();
+  EXPECT_EQ(makebelieve::DirectoryTreeUtil::open(tree, "out.txt").value(),
+            first);
+
+  tree.write_file("out.txt", "second");
+  EXPECT_EQ(
+      read_all(*makebelieve::DirectoryTreeUtil::open(tree, "out.txt").value()),
+      "second");
+  tree.remove("out.txt");
+  EXPECT_FALSE(watch.expired());
+  EXPECT_EQ(read_all(*first), "first");
+}
+
 TEST_F(InMemoryDirectoryTree, OpenFailsAsReadDoes) {
   EXPECT_EQ(makebelieve::DirectoryTreeUtil::open(tree(), "missing.txt").error(),
             std::errc::no_such_file_or_directory);

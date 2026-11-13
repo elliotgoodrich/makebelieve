@@ -3,6 +3,7 @@
 
 #include "buildprocesstracker.hpp"
 #include "commandrunner.hpp"
+#include "filesystemutil.hpp"
 #include "iocontext.hpp"
 #include "manifest.hpp"
 
@@ -47,7 +48,19 @@ std::filesystem::path trimmed_path(std::string_view echoed) {
 struct Built {
   BuildResult result;
   std::thread::id completed_on;
+
+  // What the file it built holds, read back - and the file deleted, as the
+  // tree would once it took it over.
+  std::string bytes;
 };
+
+// Reads the file @a path, then deletes it.
+std::string take_file(const std::filesystem::path& path) {
+  std::string bytes = FileSystemUtil::read_file(path).value_or("");
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  return bytes;
+}
 
 template <class Scheduler>
 std::thread::id thread_of(Scheduler scheduler) {
@@ -74,18 +87,24 @@ class ShellRunnerTest : public ::testing::Test {
   // With a space in it, so a path through it has to be quoted to survive.
   std::filesystem::path mountpoint = work.string() + " mnt";
 
+  // Where the runner builds, as a cache's scratch directory would be.
+  std::filesystem::path scratch = work.string() + " scratch";
+
   void SetUp() override {
     std::error_code ec;
     std::filesystem::remove_all(work, ec);
     std::filesystem::remove_all(mountpoint, ec);
+    std::filesystem::remove_all(scratch, ec);
     std::filesystem::create_directories(work);
     std::filesystem::create_directories(mountpoint / "sub");
+    std::filesystem::create_directories(scratch);
   }
 
   void TearDown() override {
     std::error_code ec;
     std::filesystem::remove_all(work, ec);
     std::filesystem::remove_all(mountpoint, ec);
+    std::filesystem::remove_all(scratch, ec);
   }
 
   void write_generated(const std::filesystem::path& name,
@@ -106,9 +125,13 @@ class ShellRunnerTest : public ::testing::Test {
         ex::sync_wait(ex::write_env(run(std::move(command)),
                                     ex::prop{ex::get_stop_token, stop}) |
                       ex::then([](BuildResult result) {
-                        return Built{
-                            .result = std::move(result),
-                            .completed_on = std::this_thread::get_id()};
+                        Built built{.result = std::move(result),
+                                    .completed_on = std::this_thread::get_id(),
+                                    .bytes = {}};
+                        if (built.result.has_value()) {
+                          built.bytes = take_file(built.result->file);
+                        }
+                        return built;
                       }))
             .value());
   }
@@ -118,7 +141,7 @@ class ShellRunnerTest : public ::testing::Test {
       Command command,
       ex::inplace_stop_token stop = {},
       BuildProcessTracker& tracker = BuildProcessTracker::none()) {
-    const ShellRunner run(work, mountpoint, io, tracker,
+    const ShellRunner run(work, mountpoint, scratch, io, tracker,
                           context.get_scheduler());
     return build(run, std::move(command), stop);
   }
@@ -222,9 +245,40 @@ TEST_F(ShellRunnerTest, CopiesTheFileACopyRuleNamesAndReportsItAsTheInput) {
                              .action = Manifest::Action::Copy,
                              .text = "input.txt"});
   ASSERT_TRUE(built.result.has_value());
-  EXPECT_EQ(built.result->bytes, "copied");
+  EXPECT_EQ(built.bytes, "copied");
   EXPECT_EQ(built.result->inputs,
             std::vector<std::filesystem::path>{"input.txt"});
+}
+
+// Every action builds into a file it leaves in the scratch directory, for the
+// tree to take over, and leaves nothing else there - whatever else the
+// command wrote beside %out included.
+TEST_F(ShellRunnerTest, LeavesWhatItBuiltInTheScratchDirectoryAndNothingElse) {
+  write_input("input.txt", "kept");
+  for (const Command& command : {
+           Command{.output = "sub/output.txt",
+                   .action = Manifest::Action::Run,
+                   .text = "cmake -E copy input.txt %out && cmake -E touch "
+                           "%out.stray"},
+           Command{.output = "output.txt",
+                   .action = Manifest::Action::Capture,
+                   .text = "cmake -E cat input.txt"},
+           Command{.output = "output.txt",
+                   .action = Manifest::Action::Copy,
+                   .text = "input.txt"},
+       }) {
+    const ShellRunner run(work, mountpoint, scratch, io,
+                          BuildProcessTracker::none(), context.get_scheduler());
+    BuildResult result = std::get<0>(ex::sync_wait(run(command)).value());
+    ASSERT_TRUE(result.has_value()) << command.text;
+    EXPECT_EQ(result->file.parent_path(), scratch) << command.text;
+    std::vector<std::filesystem::path> left;
+    for (const auto& entry : std::filesystem::directory_iterator(scratch)) {
+      left.push_back(entry.path());
+    }
+    EXPECT_EQ(left, std::vector{result->file}) << command.text;
+    EXPECT_EQ(take_file(result->file), "kept") << command.text;
+  }
 }
 
 TEST_F(ShellRunnerTest, ProducesWhatARunCommandWroteToOut) {
@@ -233,7 +287,7 @@ TEST_F(ShellRunnerTest, ProducesWhatARunCommandWroteToOut) {
                              .action = Manifest::Action::Run,
                              .text = "cmake -E copy input.txt %out"});
   ASSERT_TRUE(built.result.has_value());
-  EXPECT_EQ(built.result->bytes, "written");
+  EXPECT_EQ(built.bytes, "written");
 }
 
 // A run command that leaves nothing at %out has not built its output, so it
@@ -350,7 +404,7 @@ TEST_F(ShellRunnerTest, KeepsWhatASucceedingCommandWarnedOutOfItsOutput) {
        .action = Manifest::Action::Capture,
        .text = "cmake -E echo warned 1>&2 && cmake -E echo_append built"});
   ASSERT_TRUE(built.result.has_value()) << built.result.error().error.message();
-  EXPECT_EQ(built.result->bytes, "built");
+  EXPECT_EQ(built.bytes, "built");
 }
 
 TEST_F(ShellRunnerTest, ProducesWhatACaptureCommandWroteToStandardOutput) {
@@ -359,7 +413,7 @@ TEST_F(ShellRunnerTest, ProducesWhatACaptureCommandWroteToStandardOutput) {
                              .action = Manifest::Action::Capture,
                              .text = "cmake -E cat input.txt"});
   ASSERT_TRUE(built.result.has_value());
-  EXPECT_EQ(built.result->bytes, "captured");
+  EXPECT_EQ(built.bytes, "captured");
 }
 
 // The scratch file `%out` names has the file name of the output being built,
@@ -372,7 +426,7 @@ TEST_F(ShellRunnerTest, NamesTheScratchFileAfterTheOutput) {
              .action = Manifest::Action::Run,
              .text = "cmake -E echo %out > %out"});
   ASSERT_TRUE(built.result.has_value());
-  EXPECT_EQ(trimmed_path(built.result->bytes).filename(), "report.pdf");
+  EXPECT_EQ(trimmed_path(built.bytes).filename(), "report.pdf");
 }
 
 // An output with no extension leaves the scratch file without one either,
@@ -382,7 +436,7 @@ TEST_F(ShellRunnerTest, AddsNoExtensionToABareOutput) {
                              .action = Manifest::Action::Run,
                              .text = "cmake -E echo %out > %out"});
   ASSERT_TRUE(built.result.has_value());
-  EXPECT_EQ(trimmed_path(built.result->bytes).filename(), "report");
+  EXPECT_EQ(trimmed_path(built.bytes).filename(), "report");
 }
 
 // `@/` in a command names another output, reached through the mountpoint -
@@ -393,7 +447,7 @@ TEST_F(ShellRunnerTest, ExpandsAnOutputInACaptureCommandToItsPathInTheMount) {
                              .action = Manifest::Action::Capture,
                              .text = "cmake -E cat @/sub/generated.txt"});
   ASSERT_TRUE(built.result.has_value()) << built.result.error().error.message();
-  EXPECT_EQ(built.result->bytes, "generated");
+  EXPECT_EQ(built.bytes, "generated");
 }
 
 TEST_F(ShellRunnerTest, ExpandsAnOutputInARunCommandAlongsideOut) {
@@ -404,7 +458,7 @@ TEST_F(ShellRunnerTest, ExpandsAnOutputInARunCommandAlongsideOut) {
              .action = Manifest::Action::Run,
              .text = "cmake -E cat input.txt @/generated.txt > %out"});
   ASSERT_TRUE(built.result.has_value()) << built.result.error().error.message();
-  EXPECT_EQ(built.result->bytes, "inputgenerated");
+  EXPECT_EQ(built.bytes, "inputgenerated");
 }
 
 // A `@/` path already inside quotes runs to the closing quote - spaces and
@@ -415,7 +469,7 @@ TEST_F(ShellRunnerTest, ExpandsAnOutputAlreadyInsideQuotes) {
                              .action = Manifest::Action::Capture,
                              .text = "cmake -E cat \"@/my file.txt\""});
   ASSERT_TRUE(built.result.has_value()) << built.result.error().error.message();
-  EXPECT_EQ(built.result->bytes, "spaced");
+  EXPECT_EQ(built.bytes, "spaced");
 }
 
 // Writes, in @a directory, a program that copies the file its first argument
@@ -448,7 +502,7 @@ TEST_F(ShellRunnerTest, RunsAProgramNamedByAQuotedPath) {
                .text = "\"" + program.string() + "\" @/generated.txt %out"});
     ASSERT_TRUE(built.result.has_value())
         << directory << ": " << built.result.error().error.message();
-    EXPECT_EQ(built.result->bytes, "generated") << directory;
+    EXPECT_EQ(built.bytes, "generated") << directory;
   }
 }
 
@@ -463,7 +517,7 @@ TEST_F(ShellRunnerTest, RunsAProgramWithQuotedArguments) {
              .action = Manifest::Action::Run,
              .text = relative.string() + " \"@/my file.txt\" %out"});
   ASSERT_TRUE(built.result.has_value()) << built.result.error().error.message();
-  EXPECT_EQ(built.result->bytes, "spaced");
+  EXPECT_EQ(built.bytes, "spaced");
 }
 
 // A command reading an output through the mount builds on whatever it finds
@@ -483,7 +537,7 @@ TEST_F(ShellRunnerTest, CopiesBytesVerbatim) {
                              .action = Manifest::Action::Copy,
                              .text = "input.bin"});
   ASSERT_TRUE(built.result.has_value());
-  EXPECT_EQ(built.result->bytes, binary);
+  EXPECT_EQ(built.bytes, binary);
 }
 
 // A copy whose source is not there fails rather than quietly producing
@@ -535,13 +589,13 @@ TEST_F(ShellRunnerTest, RunsAndCompletesEachBuildOnItsScheduler) {
 TEST_F(ShellRunnerTest, RunsOnAThreadPool) {
   write_input("input.txt", "pooled");
   exec::static_thread_pool pool(1);
-  const ShellRunner run(work, mountpoint, io, BuildProcessTracker::none(),
-                        pool.get_scheduler());
+  const ShellRunner run(work, mountpoint, scratch, io,
+                        BuildProcessTracker::none(), pool.get_scheduler());
   const Built built = build(run, {.output = "output.txt",
                                   .action = Manifest::Action::Capture,
                                   .text = "cmake -E cat input.txt"});
   ASSERT_TRUE(built.result.has_value());
-  EXPECT_EQ(built.result->bytes, "pooled");
+  EXPECT_EQ(built.bytes, "pooled");
   EXPECT_EQ(built.completed_on, thread_of(pool.get_scheduler()));
 }
 

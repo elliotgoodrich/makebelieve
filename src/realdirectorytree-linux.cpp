@@ -2,7 +2,7 @@
 #include "realdirectorytree.hpp"
 
 #include "iocontext.hpp"
-#include "scopeguard.hpp"
+#include "nativefile.hpp"
 
 #include <stdexec/execution.hpp>
 
@@ -14,7 +14,6 @@
 #include <cstdio>
 #include <expected>
 #include <functional>
-#include <limits>
 #include <list>
 #include <map>
 #include <memory>
@@ -76,80 +75,6 @@ EntryInfo make_info(const struct stat& info) {
 }
 
 using UniqueDir = std::unique_ptr<DIR, int (*)(DIR*)>;
-
-// NOLINTBEGIN(bugprone-easily-swappable-parameters): keep offset and size in
-// the order used by OpenedFile::read.
-std::expected<std::string, std::error_code> read_at(int fd,
-                                                    Offset offset,
-                                                    std::size_t size) {
-  // NOLINTEND(bugprone-easily-swappable-parameters)
-  if (offset < 0) {
-    return std::unexpected(std::make_error_code(std::errc::invalid_argument));
-  }
-  if (size == 0) {
-    return std::string{};
-  }
-  std::string contents;
-  std::optional<std::error_code> failure;
-  contents.resize_and_overwrite(size, [&](char* data,
-                                          const std::size_t capacity) noexcept {
-    std::size_t total = 0;
-    while (total < capacity) {
-      if (total > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max() -
-                                             offset)) {
-        failure = std::make_error_code(std::errc::value_too_large);
-        break;
-      }
-      const ssize_t read_bytes =
-          ::pread(fd, data + total, capacity - total,
-                  static_cast<off_t>(offset) + static_cast<off_t>(total));
-      if (read_bytes < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        failure = last_error_code();
-        break;
-      }
-      if (read_bytes == 0) {
-        break;  // End of file: a short result is how the contract spells EOF.
-      }
-      total += static_cast<std::size_t>(read_bytes);
-    }
-    return total;
-  });
-
-  if (failure.has_value()) {
-    return std::unexpected(*failure);
-  }
-  return contents;
-}
-
-class NativeFile final : public OpenedFile {
-  int m_file;
-
- public:
-  explicit NativeFile(int file) : m_file(file) {}
-  ~NativeFile() override { ::close(m_file); }
-  NativeFile(const NativeFile&) = delete;
-  NativeFile& operator=(const NativeFile&) = delete;
-
-  [[nodiscard]] std::expected<FileInfo, std::error_code> stat() const override {
-    struct stat info {};
-    if (::fstat(m_file, &info) < 0) {
-      return std::unexpected(last_error_code());
-    }
-    if (S_ISDIR(info.st_mode)) {
-      return std::unexpected(std::make_error_code(std::errc::is_a_directory));
-    }
-    return FileInfo{.size = static_cast<std::size_t>(info.st_size),
-                    .mtime = to_file_time(info.st_mtim)};
-  }
-
-  [[nodiscard]] ReadSender read(Offset offset,
-                                std::size_t size) const override {
-    return stdexec::just(m_file, offset, size) | stdexec::then(read_at);
-  }
-};
 
 }  // namespace
 
@@ -542,18 +467,16 @@ RealDirectoryTree::Impl::open_file(const std::filesystem::path& path) const {
     return std::unexpected(
         std::make_error_code(std::errc::no_such_file_or_directory));
   }
-  const int fd = ::open(resolved->c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) {
-    return std::unexpected(last_error_code());
+  std::expected<std::shared_ptr<const NativeFile>, std::error_code> opened =
+      NativeFile::open(*resolved);
+  if (!opened.has_value()) {
+    return std::unexpected(opened.error());
   }
-  ScopeGuard closer([fd] { ::close(fd); });
-  auto opened = std::make_shared<const NativeFile>(fd);
-  closer.dismiss();
-  if (const std::expected<FileInfo, std::error_code> info = opened->stat();
+  if (const std::expected<FileInfo, std::error_code> info = (*opened)->stat();
       !info) {
     return std::unexpected(info.error());
   }
-  return opened;
+  return std::move(*opened);
 }
 
 OpenSender RealDirectoryTree::open(const std::filesystem::path& path,
