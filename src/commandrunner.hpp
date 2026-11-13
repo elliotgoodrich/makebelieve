@@ -14,6 +14,7 @@
 #include <string>
 #include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 
 // What a `BuildDirectoryTree` hands a runner and what the runner hands back:
@@ -21,11 +22,16 @@
 
 namespace makebelieve {
 
-/// What running a command produced: the bytes of the output it built, and the
-/// input files it read (its dependencies), relative to the source tree's
-/// root.
+/// What running a command produced: the output it built, and the input files
+/// it read (its dependencies), relative to the source tree's root.
 struct BuildOutput {
-  std::string bytes;
+  /// The output it built: its bytes, or a file holding them, which the tree
+  /// takes over - once it has opened it, it moves it into its cache or
+  /// deletes it. So nothing else may write to, move or delete that file, and
+  /// it is best placed in the cache's scratch directory, from where moving it
+  /// in is a rename.
+  std::variant<std::string, std::filesystem::path> content;
+
   std::vector<std::filesystem::path> inputs;
 };
 

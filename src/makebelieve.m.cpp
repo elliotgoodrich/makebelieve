@@ -226,9 +226,10 @@ int mount(const MountOptions& options) {
 
   // Runs each build through the shell. Its working directory is the source
   // root, so the inputs it traces line up with the source's own change
-  // notifications.
-  const ShellRunner run(source, mountpoint, io, tracker,
-                        workers.get_scheduler());
+  // notifications. It builds into the cache's scratch directory, from where
+  // what it built is moved into the cache and served.
+  const ShellRunner run(source, mountpoint, cache.scratch_directory(), io,
+                        tracker, workers.get_scheduler());
 
   // How many builds hold a permit at once: -j, or one per core. A build whose
   // command waits on another output gives its permit back meanwhile, so this

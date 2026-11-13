@@ -51,7 +51,7 @@ using namespace makebelieve;
 // The tests here care about an output's bytes, not its traced inputs, so wrap a
 // plain string as a successful BuildResult carrying no inputs.
 BuildResult built(std::string bytes) {
-  return BuildOutput{.bytes = std::move(bytes), .inputs = {}};
+  return BuildOutput{.content = std::move(bytes), .inputs = {}};
 }
 
 // A build that has already finished with @a result, completing as soon as it
@@ -75,9 +75,35 @@ CommandRunner counting_with_inputs(int& runs,
                                    std::vector<std::filesystem::path> inputs) {
   return [&runs, inputs = std::move(inputs)](Command /*command*/) {
     ++runs;
-    return finished(BuildOutput{.bytes = "build " + std::to_string(runs),
+    return finished(BuildOutput{.content = "build " + std::to_string(runs),
                                 .inputs = inputs});
   };
+}
+
+// As counting_with_inputs, but leaving what it builds ("build N") in a file
+// of its own in @a directory, as a real runner does, rather than giving bytes.
+CommandRunner counting_into_files(int& runs,
+                                  std::filesystem::path directory,
+                                  std::vector<std::filesystem::path> inputs) {
+  return [&runs, directory = std::move(directory),
+          inputs = std::move(inputs)](Command /*command*/) {
+    ++runs;
+    const std::filesystem::path file =
+        directory / ("build-" + std::to_string(runs) + ".out");
+    std::ofstream(file, std::ios::binary) << "build " << runs;
+    return finished(BuildOutput{.content = file, .inputs = inputs});
+  };
+}
+
+// The entries in @a directory.
+std::vector<std::filesystem::path> entries_of(
+    const std::filesystem::path& directory) {
+  std::vector<std::filesystem::path> entries;
+  for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+    entries.push_back(entry.path().filename());
+  }
+  std::ranges::sort(entries);
+  return entries;
 }
 
 // A thread-safe runner that holds each build in flight until the test
@@ -280,21 +306,27 @@ class BuildDirectoryTreeTest : public ::testing::Test {
        std::string(
            ::testing::UnitTest::GetInstance()->current_test_info()->name()));
 
+  // Where the tests driving real commands build into, beside `work`.
+  std::filesystem::path scratch = work.string() + "-scratch";
+
   // Runs real commands in `work`, as if the outputs were mounted beside it.
   [[nodiscard]] auto shell() {
-    return ShellRunner(work, work.string() + "-mnt", io,
+    return ShellRunner(work, work.string() + "-mnt", scratch, io,
                        BuildProcessTracker::none(), pool.get_scheduler());
   }
 
   void SetUp() override {
     std::error_code ec;
     std::filesystem::remove_all(work, ec);
+    std::filesystem::remove_all(scratch, ec);
     std::filesystem::create_directories(work);
+    std::filesystem::create_directories(scratch);
   }
 
   void TearDown() override {
     std::error_code ec;
     std::filesystem::remove_all(work, ec);
+    std::filesystem::remove_all(scratch, ec);
   }
 
   void write_manifest(std::string_view text) {
@@ -518,7 +550,7 @@ TEST_F(BuildDirectoryTreeTest,
       inputs = {std::filesystem::path("@") / "first.txt"};
     }
     return finished(
-        BuildOutput{.bytes = command.text + " " + std::to_string(run),
+        BuildOutput{.content = command.text + " " + std::to_string(run),
                     .inputs = std::move(inputs)});
   });
 
@@ -548,7 +580,7 @@ TEST_F(BuildDirectoryTreeTest, RemovingAnOutputRebuildsWhatReadIt) {
     }
     ++second_runs;
     return finished(
-        BuildOutput{.bytes = "second",
+        BuildOutput{.content = std::string("second"),
                     .inputs = {std::filesystem::path("@") / "first.txt"}});
   });
 
@@ -739,7 +771,8 @@ TEST_F(BuildDirectoryTreeTest, DestructionStopsBuildsUnderWay) {
     std::thread first(
         [&] { EXPECT_EQ(read_output(tree, "output.txt"), "v1"); });
     ASSERT_TRUE(builds.wait_for_runs(1));
-    builds.complete(BuildOutput{.bytes = "v1", .inputs = {"input.txt"}});
+    builds.complete(
+        BuildOutput{.content = std::string("v1"), .inputs = {"input.txt"}});
     first.join();
 
     // An eager rebuild, left in flight.
@@ -850,7 +883,7 @@ TEST_F(BuildDirectoryTreeTest, ARebuildRefreshesTheTrackedInputs) {
     std::vector<std::filesystem::path> inputs =
         runs == 1 ? std::vector<std::filesystem::path>{"a.txt"}
                   : std::vector<std::filesystem::path>{"b.txt"};
-    return finished(BuildOutput{.bytes = "build " + std::to_string(runs),
+    return finished(BuildOutput{.content = "build " + std::to_string(runs),
                                 .inputs = std::move(inputs)});
   });
 
@@ -877,18 +910,19 @@ TEST_F(BuildDirectoryTreeTest, CoalescesInputChangesDuringAnInFlightRebuild) {
   // Build #1 completes at once; later ones are held in flight.
   const DeferredRunner deferred;
   int runs = 0;
-  const BuildDirectoryTree tree(source, [&, held = deferred.runner()](
-                                            Command command) {
-    ++runs;
-    if (runs == 1) {
-      return finished(BuildOutput{.bytes = "build 1", .inputs = {"input.txt"}});
-    }
-    return held(std::move(command));
-  });
+  const BuildDirectoryTree tree(
+      source, [&, held = deferred.runner()](Command command) {
+        ++runs;
+        if (runs == 1) {
+          return finished(BuildOutput{.content = std::string("build 1"),
+                                      .inputs = {"input.txt"}});
+        }
+        return held(std::move(command));
+      });
 
   const auto complete = [&deferred](std::string bytes) {
     deferred.complete(
-        BuildOutput{.bytes = std::move(bytes), .inputs = {"input.txt"}});
+        BuildOutput{.content = std::move(bytes), .inputs = {"input.txt"}});
   };
 
   EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
@@ -925,7 +959,7 @@ TEST_F(BuildDirectoryTreeTest, OpeningADirtyOutputWaitsForItsRebuild) {
   const DeferredRunner builds;
   const BuildDirectoryTree tree(source, builds.runner());
   const auto result = [](std::string bytes) {
-    return BuildOutput{.bytes = std::move(bytes), .inputs = {"input.txt"}};
+    return BuildOutput{.content = std::move(bytes), .inputs = {"input.txt"}};
   };
 
   std::thread first([&] { EXPECT_EQ(read_output(tree, "output.txt"), "v1"); });
@@ -1395,11 +1429,12 @@ TEST_F(BuildDirectoryTreeTest, ChangingAnInputOfAFailedBuildRetriesIt) {
     std::vector<std::filesystem::path> inputs = {
         compiles ? std::filesystem::path("source.txt")
                  : std::filesystem::path("@") / "compiled.txt"};
-    return finished(broken ? BuildResult(std::unexpected(BuildFailure(
-                                 exit_status_error(1), std::move(inputs))))
-                           : BuildResult(BuildOutput{
-                                 .bytes = compiles ? "compiled" : "read",
-                                 .inputs = std::move(inputs)}));
+    return finished(
+        broken ? BuildResult(std::unexpected(
+                     BuildFailure(exit_status_error(1), std::move(inputs))))
+               : BuildResult(BuildOutput{
+                     .content = std::string(compiles ? "compiled" : "read"),
+                     .inputs = std::move(inputs)}));
   });
   tree.materialize_all();
   // Each is still the placeholder of an unbuilt output.
@@ -1455,11 +1490,11 @@ TEST_F(BuildDirectoryTreeTest, AFailureThatReadNothingKeepsItsInputs) {
   int runs = 0;
   const BuildDirectoryTree tree(source, [&runs](const Command& /*command*/) {
     ++runs;
-    return finished(
-        runs == 2
-            ? BuildResult(std::unexpected(exit_status_error(1)))
-            : BuildResult(BuildOutput{.bytes = "build " + std::to_string(runs),
-                                      .inputs = {"input.txt"}}));
+    return finished(runs == 2
+                        ? BuildResult(std::unexpected(exit_status_error(1)))
+                        : BuildResult(BuildOutput{
+                              .content = "build " + std::to_string(runs),
+                              .inputs = {"input.txt"}}));
   });
   EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
 
@@ -1648,7 +1683,7 @@ TEST_F(BuildDirectoryTreeTest, TellsTheBuildFailureHandlerOfEachFailure) {
   std::map<std::filesystem::path, BuildResult> failures = {
       {"bad.txt",
        std::unexpected(BuildFailure(exit_status_error(2), {}, "no\n"))},
-      {"warned.txt", BuildOutput{.bytes = "ok", .inputs = {}}}};
+      {"warned.txt", BuildOutput{.content = std::string("ok"), .inputs = {}}}};
   std::vector<std::string> reports;
   const BuildDirectoryTree tree(
       source, failing(runs, failures), {}, nullptr,
@@ -2692,7 +2727,7 @@ TEST_F(BuildDirectoryTreeTest, AConflictRebuildsWhatReadThePath) {
     }
     ++app_runs;
     return finished(BuildOutput{
-        .bytes = "app",
+        .content = std::string("app"),
         .inputs = {std::filesystem::path("@") / "gen" / "config.h"}});
   });
   EXPECT_EQ(read_output(tree, "app"), "app");
@@ -2796,6 +2831,67 @@ TEST_F(BuildDirectoryTreeTest, MaterializingAllLeavesAConflictUnbuilt) {
 
   source.remove("src/index.md");
   EXPECT_EQ(commands, (std::vector<std::string>{"other", "./gen.sh"}));
+}
+
+// A file a runner leaves is served from that file, opened, and - with no cache
+// to keep it in - deleted at once. An open of it reads on after a rebuild
+// replaces it, and is told the size and mtime the tree gave it.
+TEST_F(BuildDirectoryTreeTest, ServesTheFileARunnerLeftAndDeletesIt) {
+  source.write_file("input.txt", "v1");
+  write_manifest("@/output.txt = run build %out\n");
+  int runs = 0;
+  const BuildDirectoryTree tree(
+      source, counting_into_files(runs, scratch, {"input.txt"}));
+
+  const std::shared_ptr<const OpenedFile> first =
+      DirectoryTreeUtil::open(tree, "output.txt").value();
+  EXPECT_TRUE(entries_of(scratch).empty());
+  const FileInfo info = first->stat().value();
+  EXPECT_EQ(info.size, 7U);
+  EXPECT_EQ(info.mtime, std::get<FileInfo>(*tree.status("output.txt")).mtime);
+
+  source.write_file("input.txt", "v2");
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 2");
+  EXPECT_TRUE(entries_of(scratch).empty());
+  EXPECT_EQ(DirectoryTreeUtil::wait_read(first->read(0, 16)).value(),
+            "build 1");
+  EXPECT_EQ(first->stat().value().size, info.size);
+  EXPECT_EQ(first->stat().value().mtime, info.mtime);
+}
+
+// A copy of an output shares what that output was when it copied it, reading
+// nothing itself, but is stamped with when it was built.
+TEST_F(BuildDirectoryTreeTest, ACopyOfAnOutputSharesItsFile) {
+  source.write_file("input.txt", "v1");
+  write_manifest("@/a.txt = run build %out\n@/b.txt = copy @/a.txt\n");
+  int runs = 0;
+  const BuildDirectoryTree tree(
+      source, counting_into_files(runs, scratch, {"input.txt"}));
+
+  const std::shared_ptr<const OpenedFile> a =
+      DirectoryTreeUtil::open(tree, "a.txt").value();
+  const std::shared_ptr<const OpenedFile> b =
+      DirectoryTreeUtil::open(tree, "b.txt").value();
+  EXPECT_EQ(DirectoryTreeUtil::wait_read(b->read(0, 16)).value(), "build 1");
+  EXPECT_EQ(b->stat().value().size, 7U);
+  EXPECT_GE(b->stat().value().mtime, a->stat().value().mtime);
+  EXPECT_EQ(runs, 1);
+
+  source.write_file("input.txt", "v2");
+  EXPECT_EQ(read_output(tree, "b.txt"), "build 2");
+  EXPECT_EQ(DirectoryTreeUtil::wait_read(b->read(0, 16)).value(), "build 1");
+}
+
+// A file a runner leaves that cannot be opened fails the build, as the reader
+// would otherwise get nothing.
+TEST_F(BuildDirectoryTreeTest,
+       AFileARunnerLeftThatCannotBeOpenedFailsTheBuild) {
+  write_manifest("@/output.txt = run build %out\n");
+  const BuildDirectoryTree tree(source, [this](Command /*command*/) {
+    return finished(
+        BuildOutput{.content = scratch / "missing.out", .inputs = {}});
+  });
+  EXPECT_FALSE(DirectoryTreeUtil::open(tree, "output.txt").has_value());
 }
 
 // As `BuildDirectoryTreeTest`, keeping builds in a cache that each test can
@@ -2927,7 +3023,85 @@ TEST_F(BuildDirectoryTreeCacheTest, ARemovedRuleLeavesNothingBehind) {
 
   const BuildDirectoryTree tree(source, echoing(commands), {}, &reopen());
   EXPECT_EQ(recorded(), std::vector<std::filesystem::path>{"b.txt"});
-  EXPECT_FALSE(cache->read(BuildCache::hash("ran a %out")).has_value());
+  EXPECT_FALSE(cache->open(BuildCache::hash("ran a %out")).has_value());
+}
+
+// A file a runner leaves in the cache's scratch directory becomes the cache's
+// content for that output - moved, not copied - and a restart serves it from
+// there.
+TEST_F(BuildDirectoryTreeCacheTest, KeepsTheFileARunnerLeftAsItsContent) {
+  source.write_file("input.txt", "v1");
+  write_manifest("@/output.txt = run build %out\n");
+  int runs = 0;
+  {
+    const BuildDirectoryTree tree(
+        source,
+        counting_into_files(runs, cache->scratch_directory(), {"input.txt"}),
+        {}, &*cache);
+    EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+  }
+  EXPECT_TRUE(entries_of(cache->scratch_directory()).empty());
+  EXPECT_EQ(entries_of(cache_directory / "objects"),
+            std::vector<std::filesystem::path>{BuildCache::hash("build 1")});
+
+  const BuildDirectoryTree tree(
+      source,
+      counting_into_files(runs, cache->scratch_directory(), {"input.txt"}), {},
+      &reopen());
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+  EXPECT_EQ(runs, 1);
+}
+
+// An output opened from the cache's content reads on once a rebuild drops
+// that content, as a reader of a file renamed over would.
+TEST_F(BuildDirectoryTreeCacheTest, AnOpenOutputOutlivesItsDroppedContent) {
+  source.write_file("input.txt", "v1");
+  write_manifest("@/output.txt = run build %out\n");
+  int runs = 0;
+  {
+    const BuildDirectoryTree tree(
+        source,
+        counting_into_files(runs, cache->scratch_directory(), {"input.txt"}),
+        {}, &*cache);
+    read_output(tree, "output.txt");
+  }
+  const BuildDirectoryTree tree(
+      source,
+      counting_into_files(runs, cache->scratch_directory(), {"input.txt"}), {},
+      &reopen());
+  const std::shared_ptr<const OpenedFile> restored =
+      DirectoryTreeUtil::open(tree, "output.txt").value();
+
+  source.write_file("input.txt", "v2");
+  // Dropped as the input changed, before the rebuild started.
+  EXPECT_FALSE(std::filesystem::exists(cache_directory / "objects" /
+                                       BuildCache::hash("build 1")));
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 2");
+  EXPECT_EQ(DirectoryTreeUtil::wait_read(restored->read(0, 16)).value(),
+            "build 1");
+}
+
+// A copy of an output is kept naming that output's content, and both come
+// back on a restart.
+TEST_F(BuildDirectoryTreeCacheTest, KeepsACopyOfAnOutputAsItsContent) {
+  source.write_file("input.txt", "v1");
+  write_manifest("@/a.txt = run build %out\n@/b.txt = copy @/a.txt\n");
+  int runs = 0;
+  {
+    const BuildDirectoryTree tree(
+        source,
+        counting_into_files(runs, cache->scratch_directory(), {"input.txt"}),
+        {}, &*cache);
+    EXPECT_EQ(read_output(tree, "b.txt"), "build 1");
+  }
+  EXPECT_EQ(recorded(), (std::vector<std::filesystem::path>{"a.txt", "b.txt"}));
+
+  const BuildDirectoryTree tree(
+      source,
+      counting_into_files(runs, cache->scratch_directory(), {"input.txt"}), {},
+      &reopen());
+  EXPECT_EQ(read_output(tree, "b.txt"), "build 1");
+  EXPECT_EQ(runs, 1);
 }
 
 TEST_F(BuildDirectoryTreeCacheTest, RemovingARuleWhileServingDropsItsRecord) {
@@ -2992,8 +3166,8 @@ TEST_F(BuildDirectoryTreeCacheTest, GoingStaleDropsTheRecord) {
       source,
       [&runs](Command) -> BuildSender {
         if (++runs == 1) {
-          return finished(
-              BuildOutput{.bytes = "built", .inputs = {"input.txt"}});
+          return finished(BuildOutput{.content = std::string("built"),
+                                      .inputs = {"input.txt"}});
         }
         return finished(
             std::unexpected(std::make_error_code(std::errc::io_error)));
@@ -3070,8 +3244,8 @@ TEST_F(BuildDirectoryTreeCacheTest, OnlyBuildsThatCanBeCheckedAreKept) {
           return finished(
               std::unexpected(std::make_error_code(std::errc::io_error)));
         }
-        return finished(
-            BuildOutput{.bytes = "y", .inputs = {"no-such-input.txt"}});
+        return finished(BuildOutput{.content = std::string("y"),
+                                    .inputs = {"no-such-input.txt"}});
       },
       {}, &*cache);
   EXPECT_FALSE(DirectoryTreeUtil::open(tree, "failed.txt").has_value());

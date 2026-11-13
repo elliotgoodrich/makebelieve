@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <string>
 
 namespace {
@@ -108,6 +109,28 @@ TEST_F(DirectoryTreeUtil, DifferenceIsFoundInsideAMatchingDirectory) {
 
   EXPECT_EQ(makebelieve::DirectoryTreeUtil::diff(a, b),
             "sub/nested.txt: content differs (9 bytes in a, 9 bytes in b)");
+}
+
+TEST_F(DirectoryTreeUtil, NormalizesPathsUnderTheRootAndRejectsOthers) {
+  using makebelieve::DirectoryTreeUtil;
+  EXPECT_EQ(DirectoryTreeUtil::normalize(""), std::filesystem::path());
+  EXPECT_EQ(DirectoryTreeUtil::normalize("."), std::filesystem::path());
+  EXPECT_EQ(DirectoryTreeUtil::normalize("a/./b/../c"),
+            std::filesystem::path("a/c").lexically_normal());
+  EXPECT_FALSE(DirectoryTreeUtil::normalize("../a").has_value());
+  EXPECT_FALSE(DirectoryTreeUtil::normalize("a/../../b").has_value());
+  EXPECT_FALSE(
+      DirectoryTreeUtil::normalize(std::filesystem::current_path() / "a")
+          .has_value());
+}
+
+TEST_F(DirectoryTreeUtil, IsWithinOnlyStrictlyBeneath) {
+  using makebelieve::DirectoryTreeUtil;
+  EXPECT_TRUE(DirectoryTreeUtil::is_within("a/b", "a"));
+  EXPECT_TRUE(DirectoryTreeUtil::is_within("a", ""));
+  EXPECT_FALSE(DirectoryTreeUtil::is_within("a", "a"));
+  EXPECT_FALSE(DirectoryTreeUtil::is_within("ab", "a"));
+  EXPECT_FALSE(DirectoryTreeUtil::is_within("a", "a/b"));
 }
 
 }  // namespace

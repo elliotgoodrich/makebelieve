@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -86,46 +87,115 @@ std::expected<std::string, std::error_code> FileSystemUtil::read_file(
   return contents;
 }
 
-std::error_code FileSystemUtil::write_file(const std::filesystem::path& path,
-                                           std::string_view contents) {
+namespace {
+
+// A file created, or truncated, for writing, which no command launched
+// meanwhile inherits - or the error that stopped that.
+class OutputFile {
 #ifdef _WIN32
-  // Not inheritable, as no SECURITY_ATTRIBUTES asks for it to be.
-  const HANDLE file =
-      CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                  FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return {static_cast<int>(GetLastError()), std::system_category()};
-  }
-  const ScopeGuard close_file([file] { CloseHandle(file); });
-  while (!contents.empty()) {
-    // WriteFile takes at most a DWORD's worth at a time.
-    const DWORD chunk = static_cast<DWORD>(
-        std::min<std::size_t>(contents.size(), DWORD{1} << 30U));
-    DWORD n = 0;
-    if (!WriteFile(file, contents.data(), chunk, &n, nullptr)) {
-      return {static_cast<int>(GetLastError()), std::system_category()};
+  HANDLE m_file;
+#else
+  int m_file;
+#endif
+  std::error_code m_error;
+
+ public:
+  explicit OutputFile(const std::filesystem::path& path)
+#ifdef _WIN32
+      // Not inheritable, as no SECURITY_ATTRIBUTES asks for it to be.
+      : m_file(CreateFileW(path.c_str(),
+                           GENERIC_WRITE,
+                           0,
+                           nullptr,
+                           CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL,
+                           nullptr)) {
+    if (m_file == INVALID_HANDLE_VALUE) {
+      m_error = {static_cast<int>(GetLastError()), std::system_category()};
     }
-    contents.remove_prefix(n);
   }
 #else
-  const int fd =
-      ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
-  if (fd < 0) {
-    return {errno, std::system_category()};
-  }
-  const ScopeGuard close_file([fd] { ::close(fd); });
-  while (!contents.empty()) {
-    const ssize_t n = ::write(fd, contents.data(), contents.size());
-    if (n < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      return {errno, std::system_category()};
+      : m_file(::open(path.c_str(),
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                      0666)) {
+    if (m_file < 0) {
+      m_error = {errno, std::system_category()};
     }
-    contents.remove_prefix(static_cast<std::size_t>(n));
   }
 #endif
-  return {};
+
+  ~OutputFile() {
+    if (!m_error) {
+#ifdef _WIN32
+      CloseHandle(m_file);
+#else
+      ::close(m_file);
+#endif
+    }
+  }
+
+  OutputFile(const OutputFile&) = delete;
+  OutputFile& operator=(const OutputFile&) = delete;
+  OutputFile(OutputFile&&) = delete;
+  OutputFile& operator=(OutputFile&&) = delete;
+
+  // Why the file could not be opened, if it could not.
+  [[nodiscard]] const std::error_code& error() const { return m_error; }
+
+  // Writes the whole of @a contents, or says why it could not.
+  [[nodiscard]] std::error_code write(std::string_view contents) const {
+    while (!contents.empty()) {
+#ifdef _WIN32
+      // WriteFile takes at most a DWORD's worth at a time.
+      const DWORD chunk = static_cast<DWORD>(
+          std::min<std::size_t>(contents.size(), DWORD{1} << 30U));
+      DWORD n = 0;
+      if (!WriteFile(m_file, contents.data(), chunk, &n, nullptr)) {
+        return {static_cast<int>(GetLastError()), std::system_category()};
+      }
+      contents.remove_prefix(n);
+#else
+      const ssize_t n = ::write(m_file, contents.data(), contents.size());
+      if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        return {errno, std::system_category()};
+      }
+      contents.remove_prefix(static_cast<std::size_t>(n));
+#endif
+    }
+    return {};
+  }
+};
+
+}  // namespace
+
+std::error_code FileSystemUtil::write_file(const std::filesystem::path& path,
+                                           std::string_view contents) {
+  const OutputFile file(path);
+  return file.error() ? file.error() : file.write(contents);
+}
+
+std::error_code FileSystemUtil::write_file(
+    const std::filesystem::path& path,
+    const std::function<std::expected<std::string, std::error_code>()>& next) {
+  const OutputFile file(path);
+  if (file.error()) {
+    return file.error();
+  }
+  while (true) {
+    const std::expected<std::string, std::error_code> piece = next();
+    if (!piece.has_value()) {
+      return piece.error();
+    }
+    if (piece->empty()) {
+      return {};
+    }
+    if (const std::error_code error = file.write(*piece)) {
+      return error;
+    }
+  }
 }
 
 std::error_code FileSystemUtil::hide(const std::filesystem::path& path) {

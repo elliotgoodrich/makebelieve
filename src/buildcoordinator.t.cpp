@@ -311,7 +311,7 @@ class FakeCommands {
     if (run.failed) {
       return std::unexpected(std::make_error_code(std::errc::io_error));
     }
-    return BuildOutput{.bytes = run.transcript, .inputs = {}};
+    return BuildOutput{.content = run.transcript, .inputs = {}};
   }
 
   template <class Receiver>
