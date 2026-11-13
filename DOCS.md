@@ -38,16 +38,18 @@ its inputs, so it is rebuilt whenever that output goes out of date.
 
 An output is assigned an action and what that action applies to. With
 `run` the command writes the output itself, to the path `%out` stands
-for. That path is a scratch file with the same name as the output, so
-a tool that picks its format from the extension needs no extra argument
-to say so:
+for. That path is a scratch file with the same name as the output, in a
+directory of its own under the build directory's `.makebelieve` (see
+[Resuming](#resuming)), so a tool that picks its format from the extension
+needs no extra argument to say so:
 
 ```mb
 @/paper.pdf = run pandoc paper.md -o %out
 ```
 
 With `capture` the command writes nothing, and the bytes it sends
-to standard output are the output:
+to standard output are the output. Its standard output is that scratch
+file rather than a pipe, as if run with `> %out`:
 
 ```mb
 @/version.txt = capture git describe --tags
@@ -354,7 +356,11 @@ Every successful build is kept in the build directory's `.makebelieve`,
 beside its `mount` - `makebelieve mount ../output` keeps builds in
 `../output/.makebelieve`. With each output it keeps the command that built
 it and what each input it read looked like: a source file's modification
-time and size, or the content of an output read through the mount.
+time and size, or the content of an output read through the mount. The
+mount serves each output from the file kept there, rather than holding it
+in memory, so outputs larger than memory are fine; a reader that opened an
+output goes on reading the build it opened even once a rebuild replaces
+it.
 
 `.makebelieve` is hidden (on Windows it also has the hidden attribute) and
 holds a `.gitignore` that ignores everything in it, so git never sees it,

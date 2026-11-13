@@ -10,8 +10,9 @@
 // measures opening an unchanged file again.
 //
 // Backends:
-//   memory - InMemoryDirectoryTree's own bytes, as outputs are served today.
-//   handle - one native handle on a file on disk, shared by every open.
+//   memory - InMemoryDirectoryTree's own bytes, as outputs used to be served.
+//   handle - one native handle on a file on disk, shared by every open, as
+//            outputs are served now.
 //   file   - the file on disk opened afresh by each open.
 #include "directorytreeutil.hpp"
 #include "filesystemutil.hpp"
