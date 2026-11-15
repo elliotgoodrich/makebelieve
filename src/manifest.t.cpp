@@ -139,9 +139,10 @@ INSTANTIATE_TEST_SUITE_P(
                   .input = "@/output.txt = copy my input.txt\n",
                   .expected = {{"output.txt", Action::Copy, "my input.txt"}}},
         // The `@/` prefix is stripped and surrounding whitespace trimmed from
-        // the output, the action and the command.
+        // the output, the action and the command - but not from the start of
+        // the line, where it would make the line a variable.
         ParseCase{.name = "strips_prefix_and_trims_whitespace",
-                  .input = "   @/out/foo.o   =   run   build foo   \n",
+                  .input = "@/out/foo.o   =   run   build foo   \n",
                   .expected = {{"out/foo.o", Action::Run, "build foo"}}},
         ParseCase{.name = "keeps_declaration_order",
                   .input = "@/one.txt = run a\n"
@@ -335,6 +336,119 @@ INSTANTIATE_TEST_SUITE_P(
                  {"e/*.md", Action::Copy, "@/e/sub/*.md", "e/sub/*.md", true},
                  {"f/*.html", Action::Copy, "@/f/*.md", "f/*.md", true}},
             .error_lines = {1, 2, 3, 4}},
+        // An output assigned a `!rule` declared above it takes the rule's
+        // action and its body, with `%in` replaced by the rest of the line
+        // and each variable by the value set under the output or, failing
+        // that, under the rule.
+        ParseCase{.name = "uses_a_rule",
+                  .input = "!cc = run clang++ $flags -c %in -o %out\n"
+                           "    flags = -O2\n"
+                           "@/foo.o = !cc foo.cpp\n"
+                           "@/bar.o = !cc bar.cpp\n"
+                           "    flags = -O0 -g\n",
+                  .expected = {{"foo.o", Action::Run,
+                                "clang++ -O2 -c foo.cpp -o %out"},
+                               {"bar.o", Action::Run,
+                                "clang++ -O0 -g -c bar.cpp -o %out"}}},
+        // A rule may be a `capture` or a `copy` too, need not take a `%in`,
+        // and may leave a variable for each use to set. A copy's path is
+        // checked and normalised once it is whole.
+        ParseCase{.name = "uses_capture_and_copy_rules",
+                  .input = "!describe = capture git describe $what\n"
+                           "@/version.txt = !describe\n"
+                           "  what = --tags\n"
+                           "!publish = copy ./pub/%in\n"
+                           "@/a.txt = !publish a.txt\n"
+                           "@/b.txt = !publish ../../b.txt\n",
+                  .expected = {{"version.txt", Action::Capture,
+                                "git describe --tags"},
+                               {"a.txt", Action::Copy, "pub/a.txt"}},
+                  .error_lines = {6}},
+        // The rule is expanded before the output is looked at, so a wildcard
+        // finds its sources in what `%in` became.
+        ParseCase{.name = "uses_a_rule_for_a_wildcard",
+                  .input = "!cc = run cc -c %in -o %out\n"
+                           "@/out/*.o = !cc src/*.cpp\n",
+                  .expected = {{"out/*.o", Action::Run,
+                                "cc -c src/*.cpp -o %out", "src/*.cpp"}}},
+        // `$$` is a `$` for the shell, as is one before anything that cannot
+        // start a name. A variable may be set to nothing, and its name ends
+        // where the next `$` begins.
+        ParseCase{.name = "leaves_other_dollars_for_the_shell",
+                  .input = "!r = run echo $$HOME $(date) $1 $x$y ${z} 100$\n"
+                           "\tx = a\n"
+                           "\ty =\n"
+                           "@/o.txt = !r\n",
+                  .expected = {{"o.txt", Action::Run,
+                                "echo $HOME $(date) $1 a ${z} 100$"}}},
+        // What a variable or `%in` is replaced with is not expanded again.
+        ParseCase{.name = "does_not_expand_what_it_substitutes",
+                  .input = "!r = run tool $a %in\n"
+                           "  a = $b %in\n"
+                           "@/o.txt = !r $a.txt\n",
+                  .expected = {{"o.txt", Action::Run, "tool $b %in $a.txt"}}},
+        // Any run of spaces and tabs indents a line, however long or mixed.
+        ParseCase{.name = "takes_any_indentation",
+                  .input = "!r = run tool $a $b $c $d\n"
+                           " a = 1\n"
+                           "\tb = 2\n"
+                           "\t\t  c = 3\n"
+                           "        d = 4\n"
+                           "@/o.txt = !r\n",
+                  .expected = {{"o.txt", Action::Run, "tool 1 2 3 4"}}},
+        // Blank lines and comments do not end the lines under a rule.
+        ParseCase{.name = "skips_blanks_and_comments_among_variables",
+                  .input = "!r = run tool $a $b\n"
+                           "\n"
+                           "  # the first\n"
+                           "  a = 1\n"
+                           "# the second\n"
+                           "  b = 2\n"
+                           "@/o.txt = !r\n",
+                  .expected = {{"o.txt", Action::Run, "tool 1 2"}}},
+        // Outside a rule's body nothing is expanded: `$` and `%in` in an
+        // output's own command are the shell's.
+        ParseCase{.name = "expands_nothing_outside_a_rule",
+                  .input = "!r = run tool $a\n"
+                           "  a = 1\n"
+                           "@/o.txt = run echo $a %in > %out\n",
+                  .expected = {{"o.txt", Action::Run, "echo $a %in > %out"}}},
+        ParseCase{
+            .name = "rejects_misused_rules",
+            .input = "@/a = !cc a.cpp\n"  // 1: declared only below
+                     "!cc = run cc $flags %in\n"
+                     "!cc = run again\n"  // 3: declared twice
+                     "!9x = run a\n"      // 4: not a name
+                     "!t = tracing\n"     // 5: not an action for a rule
+                     "!e = run\n"         // 6: no command
+                     "@/b = !cc\n"        // 7: nothing for `%in`
+                     "@/c = !cc c.cpp\n"  // 8: `flags` never set
+                     "@/d = !cc d.cpp\n"
+                     "  flags = -O2\n"
+                     "  other = 1\n"  // 11: not one of its variables
+                     "@/e = !cc e.cpp\n"
+                     "  flags = 1\n"
+                     "  flags = 2\n"  // 14: set twice
+                     "  nonsense\n"   // 15: not `name = value`
+                     "@/f = run f\n"
+                     "  flags = 1\n"  // 17: under no rule
+                     "!n = capture date\n"
+                     "@/g = !n arg\n"  // 19: no `%in` to take it
+                     "!u = run $a\n"
+                     "  b = 1\n"   // 21: a default it never uses
+                     "@/h = !u\n"  // 22: so `!u` was not declared
+                     "@/i = !cc i.cpp\n"
+                     "  flags = -O1\n",
+            .expected = {{"f", Action::Run, "f"},
+                         {"i", Action::Run, "cc -O1 i.cpp"}},
+            .error_lines = {1, 3, 4, 5, 6, 7, 8, 11, 14, 15, 17, 19, 21, 22}},
+        // An indented line belongs to the line above it, so one with nothing
+        // above it belongs nowhere.
+        ParseCase{.name = "rejects_an_indented_first_line",
+                  .input = "  @/a.txt = run a\n"
+                           "@/b.txt = run b\n",
+                  .expected = {{"b.txt", Action::Run, "b"}},
+                  .error_lines = {1}},
         ParseCase{
             .name = "handles_a_final_line_without_a_newline",
             .input = "@/output.txt = run cp input.txt %out",
