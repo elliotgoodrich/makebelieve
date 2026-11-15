@@ -2,15 +2,6 @@
 
 A manifest describes generated files and the commands used to produce them.
 
-## Variables
-
-User variables use `$`; **makebelieve** built-ins use `%`:
-
-```mb
-$cc = clang++
-$flags = -O2
-```
-
 ## Generated Files
 
 Generated files live in the mounted output namespace and use `@/`:
@@ -170,23 +161,55 @@ rebuilt as the report changes.
 
 ## Rules
 
-Reusable commands can be declared as rules:
+Reusable commands can be declared as rules: a name prefixed with `!`,
+assigned an action - `run`, `capture` or `copy` - and its argument.
 
 ```mb
-!cc = clang++ $flags -c %in -o %out
+!cc = run clang++ $flags -c %in -o %out
     flags = -O2
 ```
 
-Invoke them by name, prefixed with `!`:
+An output below the rule uses it by name, in place of an action:
 
 ```mb
 @/foo.o = !cc foo.cpp
+@/bar.o = !cc bar.cpp
     flags = -O0 -g
 ```
+
+`%in` in the rule becomes whatever follows the rule's name, and each
+`$variable` its value, so these are `run clang++ -O2 -c foo.cpp -o %out`
+and `run clang++ -O0 -g -c bar.cpp -o %out`. From there the output is
+treated as if it had been written out in full, so an output with a `*`
+takes its sources from the expanded command (see
+[Directory Expansion](#directory-expansion)):
+
+```mb
+@/out/*.o = !cc src/*.cpp
+```
+
+The indented `variable = value` lines under a rule give its variables
+default values, and those under an output set them for that output. A
+variable with no default must be set by every output using the rule. A
+value runs to the end of its line and may be empty. Setting a variable
+the rule does not name is an error, as is giving something for `%in` to
+a rule without one, or nothing to a rule with one.
+
+A name is letters, digits and `_`, not starting with a digit. In a rule,
+`$$` is a single `$`, and a `$` before anything that cannot start a
+name, as in `$(date)`, `${HOME}` or `$1`, is left for the shell. What a variable or
+`%in` is replaced with is not expanded again. Nothing is expanded
+outside a rule: in an output's own command, `$HOME` is the shell's.
+
+A rule must be declared above the outputs that use it, and only once.
 
 Without the `!`, the right-hand side is a built-in action (`run`,
 `capture`, `copy`, `tracing` or `status`) and its argument, if it takes
 one.
+
+Lines starting with `#` are comments. Any number of spaces or tabs at
+the start of a line, at least one, indents it. Only variables are
+indented: every other line starts at the left margin.
 
 ## Directory Expansion
 

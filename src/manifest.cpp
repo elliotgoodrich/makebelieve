@@ -132,6 +132,87 @@ struct NamePattern {
   }
 };
 
+// Whether @a c can start the name of a variable or a rule.
+bool is_name_start(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+bool is_name_char(char c) {
+  return is_name_start(c) || (c >= '0' && c <= '9');
+}
+
+// Whether @a text names a variable or a rule: a letter or `_`, then letters,
+// digits and `_`.
+bool is_name(std::string_view text) {
+  return !text.empty() && is_name_start(text.front()) &&
+         std::ranges::all_of(text, is_name_char);
+}
+
+constexpr std::string_view k_in_placeholder = "%in";
+
+// The body of a rule with every `$name` replaced by what @a value_of returns
+// for `name`, and every `%in` by what it returns for `%in`, which no variable
+// can be named. `$$` stands for a single `$`, and a `$` before anything else
+// that cannot start a name is left for the shell. What is substituted in is
+// not looked through again.
+template <typename ValueOf>
+std::string substitute(std::string_view body, ValueOf&& value_of) {
+  std::string result;
+  for (std::size_t i = 0; i < body.size();) {
+    if (body.substr(i).starts_with(k_in_placeholder)) {
+      result += value_of(k_in_placeholder);
+      i += k_in_placeholder.size();
+      continue;
+    }
+    if (body[i] == '$' && i + 1 < body.size()) {
+      if (body[i + 1] == '$') {
+        result += '$';
+        i += 2;
+        continue;
+      }
+      if (is_name_start(body[i + 1])) {
+        std::size_t end = i + 2;
+        while (end < body.size() && is_name_char(body[end])) {
+          ++end;
+        }
+        result += value_of(body.substr(i + 1, end - i - 1));
+        i = end;
+        continue;
+      }
+    }
+    result += body[i++];
+  }
+  return result;
+}
+
+// A line of the manifest that is neither blank nor a comment, trimmed.
+struct Line {
+  std::size_t number;
+  std::string_view text;
+  // Whether it began with whitespace, which makes it a variable of the line
+  // above it.
+  bool indented;
+};
+
+// A variable set by an indented `name = value` line.
+struct Binding {
+  std::string value;
+  std::size_t line;
+};
+using Bindings = std::map<std::string, Binding, std::less<>>;
+
+// A `!name = <action> <body>` rule, which outputs declared below it use.
+struct Declared {
+  Manifest::Action action;
+  std::string body;
+  // The variables its body names, and the values of those given a default.
+  std::set<std::string, std::less<>> variables;
+  Bindings defaults;
+  // Whether its body holds a `%in` for a use's argument.
+  bool takes_input;
+  std::size_t line;
+};
+
 }  // namespace
 
 std::optional<Manifest::Rule> Manifest::instantiate(
@@ -180,21 +261,91 @@ Manifest Manifest::parse(std::string_view text) {
   };
   std::vector<CopyOfOutput> copies;
 
+  // The rules declared so far, by name without the `!`.
+  std::map<std::string, Declared, std::less<>> declared;
+
+  std::vector<Line> lines;
   std::size_t start = 0;
   for (std::size_t number = 1; start <= text.size(); ++number) {
     const std::size_t newline = text.find('\n', start);
     const std::size_t end =
         newline == std::string_view::npos ? text.size() : newline;
-    const std::string_view line = trim(text.substr(start, end - start));
+    const std::string_view raw = text.substr(start, end - start);
+    const std::string_view line = trim(raw);
     start = end + 1;
+    if (!line.empty() && line.front() != '#') {
+      lines.push_back({.number = number,
+                       .text = line,
+                       .indented = raw.front() == ' ' || raw.front() == '\t'});
+    }
+  }
 
-    if (line.empty() || line.front() == '#') {
+  for (std::size_t next = 0; next < lines.size();) {
+    const std::size_t number = lines[next].number;
+    const std::string_view line = lines[next].text;
+    const bool indented = lines[next].indented;
+    ++next;
+
+    const auto reject_at = [&](std::size_t at, std::string message) {
+      manifest.m_errors.push_back({.line = at, .message = std::move(message)});
+    };
+    const auto reject = [&](std::string message) {
+      reject_at(number, std::move(message));
+    };
+
+    if (indented) {
+      reject(
+          "an indented line sets a variable of the rule above it, but "
+          "there is none");
       continue;
     }
 
-    const auto reject = [&](std::string message) {
-      manifest.m_errors.push_back(
-          {.line = number, .message = std::move(message)});
+    // The indented lines under this one, which set its variables. They are
+    // passed over without comment when the line itself is rejected.
+    const std::size_t first_under = next;
+    while (next < lines.size() && lines[next].indented) {
+      ++next;
+    }
+    const std::span<const Line> under =
+        std::span<const Line>(lines).subspan(first_under, next - first_under);
+
+    // The variables @a under sets, or nullopt, having rejected the lines at
+    // fault, when any is not a `name = value` or sets a variable again.
+    const auto bindings_of = [&]() -> std::optional<Bindings> {
+      Bindings bindings;
+      bool accepted = true;
+      for (const Line& binding : under) {
+        const std::size_t equals = binding.text.find('=');
+        const std::string_view name = trim(binding.text.substr(0, equals));
+        if (equals == std::string_view::npos || !is_name(name)) {
+          reject_at(binding.number, "expected `<variable> = <value>`");
+          accepted = false;
+        } else if (!bindings
+                        .emplace(name,
+                                 Binding{.value = std::string(trim(
+                                             binding.text.substr(equals + 1))),
+                                         .line = binding.number})
+                        .second) {
+          reject_at(binding.number, std::format("`{}` is already set", name));
+          accepted = false;
+        }
+      }
+      return accepted ? std::optional(std::move(bindings)) : std::nullopt;
+    };
+
+    // Rejects each variable of @a bindings that the rule named @a name does
+    // not use, returning whether there were none.
+    const auto all_used = [&](const Bindings& bindings, const Declared& rule,
+                              std::string_view name) {
+      bool used = true;
+      for (const auto& [variable, binding] : bindings) {
+        if (!rule.variables.contains(variable)) {
+          reject_at(binding.line, std::format("rule `!{}` does not use `${}`",
+                                              name, variable));
+          used = false;
+        }
+      }
+      return used;
     };
 
     const std::size_t equals = line.find('=');
@@ -205,24 +356,140 @@ Manifest Manifest::parse(std::string_view text) {
 
     const std::string_view left = trim(line.substr(0, equals));
     const std::string_view value = trim(line.substr(equals + 1));
+    const std::string_view word = first_word(value);
+
+    // `!name = <action> <body>` declares a rule for the outputs below it to
+    // use; the indented lines under it give its variables default values.
+    if (left.starts_with('!')) {
+      const std::string_view name = left.substr(1);
+      if (!is_name(name)) {
+        reject(
+            std::format("rule `{}` must be named with letters, digits and "
+                        "`_`, not starting with a digit",
+                        left));
+        continue;
+      }
+      const std::optional<Manifest::Action> action = to_action(word);
+      if (!action.has_value() || Manifest::is_report(*action)) {
+        reject(
+            std::format("rule `{}` must be assigned `run <command>`, "
+                        "`capture <command>` or `copy <path>`",
+                        left));
+        continue;
+      }
+      const std::string_view body = trim(value.substr(word.size()));
+      if (body.empty()) {
+        reject(std::format("rule `{}` has no {}", left, argument_of(*action)));
+        continue;
+      }
+      if (const auto it = declared.find(name); it != declared.end()) {
+        reject(std::format("rule `{}` is already declared on line {}", left,
+                           it->second.line));
+        continue;
+      }
+      std::optional<Bindings> defaults = bindings_of();
+      if (!defaults.has_value()) {
+        continue;
+      }
+      Declared rule{.action = *action,
+                    .body = std::string(body),
+                    .variables = {},
+                    .defaults = std::move(*defaults),
+                    .takes_input = body.contains(k_in_placeholder),
+                    .line = number};
+      (void)substitute(body, [&](std::string_view variable) {
+        if (variable != k_in_placeholder) {
+          rule.variables.emplace(variable);
+        }
+        return std::string_view();
+      });
+      if (all_used(rule.defaults, rule, name)) {
+        declared.emplace(name, std::move(rule));
+      }
+      continue;
+    }
+
     if (!left.starts_with("@/")) {
       reject(std::format("output `{}` must start with `@/`", left));
       continue;
     }
 
     // An output is assigned an action and what that action applies to; the
-    // rest of the line after the action is that argument.
-    const std::string_view word = first_word(value);
-    const std::optional<Manifest::Action> action = to_action(word);
+    // rest of the line after the action is that argument. Assigned a `!rule`
+    // instead, it takes the rule's action, and for its argument the rule's
+    // body with `%in` replaced by the rest of the line and each variable by
+    // its value: the one set under this line, or else the rule's default.
+    std::optional<Manifest::Action> action;
+    std::string expanded;
+    std::string_view argument;
+    if (word.starts_with('!')) {
+      const std::string_view name = word.substr(1);
+      const auto it = declared.find(name);
+      if (it == declared.end()) {
+        reject(std::format("`{}` uses `{}`, which no rule above it declares",
+                           left, word));
+        continue;
+      }
+      const Declared& rule = it->second;
+      const std::string_view input = trim(value.substr(word.size()));
+      if (rule.takes_input && input.empty()) {
+        reject(
+            std::format("`{}` gives `{}` nothing for its `%in`", left, word));
+        continue;
+      }
+      if (!rule.takes_input && !input.empty()) {
+        reject(
+            std::format("`{}` gives `{}` `{}`, but it has no `%in` to "
+                        "take it",
+                        left, word, input));
+        continue;
+      }
+      const std::optional<Bindings> given = bindings_of();
+      if (!given.has_value() || !all_used(*given, rule, name)) {
+        continue;
+      }
+      std::string_view unset;
+      expanded = substitute(rule.body, [&](std::string_view variable) {
+        if (variable == k_in_placeholder) {
+          return input;
+        }
+        if (const auto set = given->find(variable); set != given->end()) {
+          return std::string_view(set->second.value);
+        }
+        if (const auto set = rule.defaults.find(variable);
+            set != rule.defaults.end()) {
+          return std::string_view(set->second.value);
+        }
+        unset = variable;
+        return std::string_view();
+      });
+      if (!unset.empty()) {
+        reject(
+            std::format("`{}` uses `{}` without setting `${}`, which has "
+                        "no default",
+                        left, word, unset));
+        continue;
+      }
+      action = rule.action;
+      argument = trim(expanded);
+    } else {
+      for (const Line& binding : under) {
+        reject_at(binding.number,
+                  std::format("`{}` does not use a rule, so has no variables "
+                              "to set",
+                              left));
+      }
+      action = to_action(word);
+      argument = trim(value.substr(word.size()));
+    }
     if (!action.has_value()) {
       reject(
           std::format("`{}` must be assigned `run <command>`, "
-                      "`capture <command>`, `copy <path>`, `tracing` or "
-                      "`status`",
+                      "`capture <command>`, `copy <path>`, `tracing`, "
+                      "`status` or a `!<rule>`",
                       left));
       continue;
     }
-    const std::string_view argument = trim(value.substr(word.size()));
     if (Manifest::is_report(*action)) {
       if (!argument.empty()) {
         reject(
@@ -423,9 +690,7 @@ Manifest Manifest::parse(std::string_view text) {
     manifest.m_rules.erase(manifest.m_rules.begin() +
                            static_cast<std::ptrdiff_t>(rule));
   }
-  if (!dropped.empty()) {
-    std::ranges::stable_sort(manifest.m_errors, {}, &Manifest::Error::line);
-  }
+  std::ranges::stable_sort(manifest.m_errors, {}, &Manifest::Error::line);
 
   return manifest;
 }

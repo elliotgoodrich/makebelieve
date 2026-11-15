@@ -83,15 +83,29 @@ class Manifest {
   };
 
   /// Parses @a text into a `Manifest`. Blank lines and `#` comments are
-  /// skipped. Every other line must be a simple `@/output = run <command>`,
-  /// `@/output = capture <command>`, `@/output = copy <path>`,
-  /// `@/output = tracing` or `@/output = status` rule - the
-  /// richer manifest features (variables, `rule` declarations,
-  /// placeholders) are not handled yet - naming a file inside the output
+  /// skipped. Every other line that is not indented must be a simple
+  /// `@/output = run <command>`, `@/output = capture <command>`,
+  /// `@/output = copy <path>`, `@/output = tracing` or `@/output = status`
+  /// rule, or the use or declaration of a named rule (below) - top-level
+  /// variables are not handled yet - naming a file inside the output
   /// directory that no earlier rule declared, either as that file or as one of
   /// its parent directories. A `copy` rule must name a file inside the
   /// manifest's directory, so its source is always one the build can watch,
   /// or another declared output.
+  ///
+  /// `!name = <action> <body>`, with `run`, `capture` or `copy` for its
+  /// action, declares a named rule, which yields nothing itself. An output
+  /// below it written `@/output = !name <argument>` is the rule
+  /// `@/output = <action> <body>`, the body having each `%in` replaced by the
+  /// argument and each `$variable` by its value, and is then held to
+  /// everything a rule written out in full is. The indented
+  /// `variable = value` lines under the output set its variables, and those
+  /// under the declaration their defaults; a variable with neither is an
+  /// error, as is setting one the body does not name, and giving an argument
+  /// to a body with no `%in` or none to one with it. `$$` in a body is a `$`,
+  /// and a `$` before anything that cannot start a name is left alone. What
+  /// is substituted in is not expanded again, and nothing is expanded outside
+  /// a named rule's body.
   ///
   /// An output with a `*` makes a `run`, `capture` or `copy` rule a wildcard
   /// rule. The `*` must be the only one and in the file name, and so must the
