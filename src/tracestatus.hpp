@@ -20,8 +20,12 @@ namespace makebelieve {
 /// has lost a dependency.
 struct TraceStatus {
   /// The environment variable naming the run's log, which the hook appends
-  /// each read to.
+  /// each path looked at to, one per line.
   static constexpr wchar_t k_log_var[] = L"MAKEBELIEVE_TRACE_LOG";
+
+  /// Leads a line of the log naming a directory that was listed, rather than
+  /// only looked at. No path holds it.
+  static constexpr char k_listed_marker = '*';
 
   /// The environment variable naming the root whose reads are recorded.
   static constexpr wchar_t k_root_var[] = L"MAKEBELIEVE_TRACE_ROOT";

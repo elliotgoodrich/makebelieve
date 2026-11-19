@@ -163,11 +163,22 @@ class BuildDirectoryTree : public DirectoryTree {
   BuildDirectoryTree(BuildDirectoryTree&&) = delete;
   BuildDirectoryTree& operator=(BuildDirectoryTree&&) = delete;
 
+  /// The entry at @a path. Asked for a requester that is the command of one
+  /// of our builds, as @a context says - through the mount - that build
+  /// depends on what is there, as on a source path: an output's content,
+  /// that a directory is there, or that nothing is. One that looked up an
+  /// output still to be built saw what it was before, so goes out of date
+  /// once it is built - unless it then opened it, which waits for that
+  /// build.
   [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override;
+      const std::filesystem::path& path,
+      const OpenContext& context = {}) const override;
 
+  /// The entries of the directory at @a path. Asked for the command of one
+  /// of our builds, as for status(), that build depends on them too.
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
-      const std::filesystem::path& path) const override;
+      const std::filesystem::path& path,
+      const OpenContext& context = {}) const override;
 
   using DirectoryTree::open;
 

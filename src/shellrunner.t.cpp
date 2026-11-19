@@ -248,8 +248,7 @@ TEST_F(ShellRunnerTest, CopiesTheFileACopyRuleNamesAndReportsItAsTheInput) {
                              .text = "input.txt"});
   ASSERT_TRUE(built.result.has_value());
   EXPECT_EQ(built.bytes, "copied");
-  EXPECT_EQ(built.result->inputs,
-            std::vector<std::filesystem::path>{"input.txt"});
+  EXPECT_EQ(built.result->inputs, std::vector<Input>{"input.txt"});
 }
 
 // Every action builds into a file it leaves in the scratch directory, for the
@@ -349,6 +348,23 @@ TEST_F(ShellRunnerTest, KeepsWhatAFailingCommandRead) {
   EXPECT_EQ(built.result.error().error, makebelieve::exit_status_error(3));
   EXPECT_TRUE(std::ranges::contains(built.result.error().inputs,
                                     std::filesystem::path("input.txt")));
+}
+
+// A directory a command listed comes back as listed, relative to the root -
+// the root itself as the empty path - so a change to its entries rebuilds.
+TEST_F(ShellRunnerTest, ReportsTheDirectoryACommandListedAsListed) {
+  write_input("input.txt", "read");
+#ifdef _WIN32
+  const std::string listing = "dir /b > %out";
+#else
+  const std::string listing = "ls > %out";
+#endif
+  const Built built = build({.output = "output.txt",
+                             .action = Manifest::Action::Run,
+                             .text = listing});
+  ASSERT_TRUE(built.result.has_value());
+  EXPECT_TRUE(std::ranges::contains(built.result->inputs,
+                                    Input(std::filesystem::path(), true)));
 }
 
 // As does one that exits successfully without writing %out.
@@ -564,8 +580,7 @@ TEST_F(ShellRunnerTest, FailsACopyOfAMissingFile) {
       << built.result.error().standard_error;
   // Nothing opened it, so no tracer could say; its input is what it names,
   // so creating it retries the copy.
-  EXPECT_EQ(built.result.error().inputs,
-            std::vector<std::filesystem::path>{"missing.txt"});
+  EXPECT_EQ(built.result.error().inputs, std::vector<Input>{"missing.txt"});
 }
 
 // The execution requirement: a build's synchronous steps run on the given

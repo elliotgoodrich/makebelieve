@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -144,9 +145,9 @@ TEST_F(ProcessUtil, TracesFilesTheCommandReadAsInputs) {
   // under the working directory. (Files it read outside the root - cmake's own
   // install, say - are filtered out, so this stays about the command's inputs.)
   const bool found =
-      std::ranges::any_of(result->inputs, [&](const std::filesystem::path& p) {
+      std::ranges::any_of(result->inputs, [&](const makebelieve::Input& p) {
         std::error_code ec;
-        return std::filesystem::equivalent(p, work / "input.txt", ec);
+        return std::filesystem::equivalent(p.path, work / "input.txt", ec);
       });
   EXPECT_TRUE(found) << "expected input.txt among the traced reads";
 #else
@@ -154,6 +155,135 @@ TEST_F(ProcessUtil, TracesFilesTheCommandReadAsInputs) {
   EXPECT_TRUE(result->inputs.empty());
 #endif
 }
+
+#if defined(_WIN32) || defined(__linux__)
+// Whether @a result traced @a relative, a path under @a root that may not
+// exist - so compared by spelling, against the root as the tracer spells it,
+// and on Windows ignoring case, as the filesystem does - as listed, if
+// @a listed.
+bool traced(const makebelieve::ProcessUtil::Result& result,
+            const std::filesystem::path& root,
+            const std::filesystem::path& relative,
+            bool listed = false) {
+  const auto spelling = [](const std::filesystem::path& path) {
+    std::string text = path.lexically_normal().generic_string();
+#ifdef _WIN32
+    std::ranges::transform(text, text.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+#endif
+    return text;
+  };
+  const std::filesystem::path canonical_root = std::filesystem::canonical(root);
+  const std::string expected =
+      spelling(relative.empty() ? canonical_root : canonical_root / relative);
+  return std::ranges::any_of(
+      result->inputs, [&](const makebelieve::Input& input) {
+        return spelling(input.path) == expected && (input.listed || !listed);
+      });
+}
+
+// The shell's own test for whether a path exists, which neither opens nor
+// lists anything: a stat, as a tool asks whether a file is there.
+std::string exists_command(std::string_view path) {
+#ifdef _WIN32
+  return "if exist " + std::string(path) + " (echo yes) else (echo no)";
+#else
+  return "if test -e " + std::string(path) +
+         "; then echo yes; else echo no; fi";
+#endif
+}
+
+// A command listing the working directory by name.
+std::string list_command() {
+#ifdef _WIN32
+  return "dir /b";
+#else
+  return "ls";
+#endif
+}
+
+TEST_F(ProcessUtil, TracesAFileTheCommandOnlyStats) {
+  write_input("input.txt", "hello world");
+
+  const makebelieve::ProcessUtil::Result result =
+      run(exists_command("input.txt"));
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->standard_output.substr(0, 3), "yes");
+  EXPECT_TRUE(traced(result, work, "input.txt"));
+}
+
+TEST_F(ProcessUtil, TracesAPathTheCommandFindsMissing) {
+  const makebelieve::ProcessUtil::Result result =
+      run(exists_command("missing.txt"));
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->standard_output.substr(0, 2), "no");
+  EXPECT_TRUE(traced(result, work, "missing.txt"));
+}
+
+// A path whose directory is missing too traces the path as far as it goes -
+// the whole of it, or the first part missing - either of which a change that
+// makes it exist names.
+TEST_F(ProcessUtil, TracesAPathWhoseDirectoryIsMissing) {
+  const std::filesystem::path path =
+      std::filesystem::path("nowhere") / "missing.txt";
+  const makebelieve::ProcessUtil::Result result = run(
+      exists_command(std::filesystem::path(path).make_preferred().string()));
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->standard_output.substr(0, 2), "no");
+  EXPECT_TRUE(traced(result, work, path) || traced(result, work, "nowhere"));
+}
+
+TEST_F(ProcessUtil, TracesADirectoryTheCommandStats) {
+  std::filesystem::create_directory(work / "sub");
+
+  const makebelieve::ProcessUtil::Result result = run(exists_command("sub"));
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->standard_output.substr(0, 3), "yes");
+  EXPECT_TRUE(traced(result, work, "sub"));
+  // Looked at, not listed: whatever is in it, it would say the same.
+  EXPECT_FALSE(traced(result, work, "sub", true));
+}
+
+TEST_F(ProcessUtil, TracesADirectoryTheCommandLists) {
+  std::filesystem::create_directory(work / "sub");
+  write_input("sub/listed.txt", "");
+
+  const makebelieve::ProcessUtil::Result result =
+      run_in(work / "sub", list_command());
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->standard_output.substr(0, 10), "listed.txt");
+  // The working directory is the root here, which a listing of it names.
+  EXPECT_TRUE(traced(result, work / "sub", "", true));
+}
+
+// A directory that a command only passes through, on the way to a file in
+// it, is at most looked at - on Linux, where each step of the path is a
+// lookup - never listed: the command depends on there being a directory
+// there, not on what else is in it.
+TEST_F(ProcessUtil, DoesNotListADirectoryThePathOfAReadPassesThrough) {
+  std::filesystem::create_directories(work / "outer" / "inner");
+  write_input("outer/inner/input.txt", "hello world");
+
+  const makebelieve::ProcessUtil::Result result = run(print_file_command(
+      (std::filesystem::path("outer") / "inner" / "input.txt")
+          .make_preferred()
+          .string()));
+
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(result->standard_output, "hello world");
+  EXPECT_TRUE(traced(result, work,
+                     std::filesystem::path("outer") / "inner" / "input.txt"));
+  EXPECT_FALSE(traced(result, work, "outer", true));
+  EXPECT_FALSE(
+      traced(result, work, std::filesystem::path("outer") / "inner", true));
+}
+#endif
 
 #ifdef _WIN32
 // A working directory given in 8.3 short-name form - as a runner's temp path
@@ -178,9 +308,9 @@ TEST_F(ProcessUtil, TracesInputsWhenWorkingDirectoryIsAShortPath) {
 
   ASSERT_TRUE(result.has_value());
   const bool found =
-      std::ranges::any_of(result->inputs, [&](const std::filesystem::path& p) {
+      std::ranges::any_of(result->inputs, [&](const makebelieve::Input& p) {
         std::error_code ec;
-        return std::filesystem::equivalent(p, work / "input.txt", ec);
+        return std::filesystem::equivalent(p.path, work / "input.txt", ec);
       });
   EXPECT_TRUE(found) << "expected input.txt traced under a short-path root";
 }
@@ -211,9 +341,9 @@ TEST_F(ProcessUtil, TracesInputsWhenWorkingDirectoryIsSymlinked) {
 
   ASSERT_TRUE(result.has_value());
   const bool found =
-      std::ranges::any_of(result->inputs, [&](const std::filesystem::path& p) {
+      std::ranges::any_of(result->inputs, [&](const makebelieve::Input& p) {
         std::error_code equivalent_ec;
-        return std::filesystem::equivalent(p, work / "input.txt",
+        return std::filesystem::equivalent(p.path, work / "input.txt",
                                            equivalent_ec);
       });
   EXPECT_TRUE(found) << "expected input.txt traced under a symlinked root";
@@ -255,9 +385,11 @@ TEST_F(ProcessUtil, ReadsThroughASymlinkAndTracesItsTarget) {
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->exit_status, 0);
   EXPECT_EQ(result->standard_output, "hello world");
+  // The link too, as pointing it elsewhere changes what the command reads.
   EXPECT_EQ(result->inputs,
-            std::vector<std::filesystem::path>{
-                std::filesystem::canonical(work) / "target.txt"});
+            (std::vector<makebelieve::Input>{
+                std::filesystem::canonical(work) / "link.txt",
+                std::filesystem::canonical(work) / "target.txt"}));
 }
 #endif
 
@@ -739,9 +871,12 @@ TEST_F(ProcessUtil, ReadsThroughAnAbsoluteDirectorySymlinkAndTracesTheTarget) {
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->exit_status, 0);
   EXPECT_EQ(result->standard_output, "hello world");
+  // The link, the directory it leads to, and the file in it: each a lookup.
   EXPECT_EQ(result->inputs,
-            std::vector<std::filesystem::path>{
-                std::filesystem::canonical(work) / "sub" / "c.txt"});
+            (std::vector<makebelieve::Input>{
+                std::filesystem::canonical(work) / "linkdir",
+                std::filesystem::canonical(work) / "sub",
+                std::filesystem::canonical(work) / "sub" / "c.txt"}));
 }
 
 TEST_F(ProcessUtil, ReportsACommandKilledByASignalAsTheShellWould) {
@@ -989,10 +1124,10 @@ TEST_F(ProcessUtil, TracesAChildGivenATracingVariableInAnotherCase) {
 
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(result->standard_output, "hello world");
-  EXPECT_TRUE(std::ranges::any_of(result->inputs,
-                                  [](const std::filesystem::path& path) {
-                                    return path.filename() == "input.txt";
-                                  }));
+  EXPECT_TRUE(
+      std::ranges::any_of(result->inputs, [](const makebelieve::Input& input) {
+        return input.path.filename() == "input.txt";
+      }));
 }
 
 // Once a read cannot be recorded the command has lost a dependency, so it is
@@ -1020,10 +1155,10 @@ TEST_F(ProcessUtil, TracesAChildGivenAnEnvironmentWithoutTracing) {
 
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_EQ(result->standard_output, "hello world");
-  EXPECT_TRUE(std::ranges::any_of(result->inputs,
-                                  [](const std::filesystem::path& path) {
-                                    return path.filename() == "input.txt";
-                                  }));
+  EXPECT_TRUE(
+      std::ranges::any_of(result->inputs, [](const makebelieve::Input& input) {
+        return input.path.filename() == "input.txt";
+      }));
 }
 #endif
 

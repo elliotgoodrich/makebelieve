@@ -238,12 +238,14 @@ class SharedStatus {
   }
 };
 
-// Reads the hook's UTF-8, newline-terminated log of read paths, deduplicated
-// and sorted. An empty log means the command read nothing; a log that is
-// missing, or cannot be read or decoded, is an error rather than an empty list,
-// since tracing is required and a lost read is a lost dependency.
-std::expected<std::vector<std::filesystem::path>, std::error_code>
-read_trace_log(const std::filesystem::path& log) {
+// Reads the hook's UTF-8, newline-terminated log of the paths the command
+// looked at - one it listed marked by a leading `*`, which no path holds -
+// sorted, each once. An empty log means the command looked at nothing; a log
+// that is missing, or cannot be read or decoded, is an error rather than an
+// empty list, since tracing is required and a lost read is a lost
+// dependency.
+std::expected<std::vector<Input>, std::error_code> read_trace_log(
+    const std::filesystem::path& log) {
   std::ifstream stream(log, std::ios::binary);
   if (!stream) {
     std::error_code ec;
@@ -252,7 +254,7 @@ read_trace_log(const std::filesystem::path& log) {
             ? std::make_error_code(std::errc::io_error)
             : std::make_error_code(std::errc::no_such_file_or_directory));
   }
-  std::vector<std::filesystem::path> inputs;
+  std::vector<Input> inputs;
   std::string line;
   while (std::getline(stream, line)) {
     if (!line.empty() && line.back() == '\r') {
@@ -261,18 +263,18 @@ read_trace_log(const std::filesystem::path& log) {
     if (line.empty()) {
       continue;
     }
-    std::expected<std::wstring, std::error_code> wide =
-        StringUtil::to_wide(line);
+    const bool listed = line.front() == TraceStatus::k_listed_marker;
+    std::expected<std::wstring, std::error_code> wide = StringUtil::to_wide(
+        listed ? std::string_view(line).substr(1) : std::string_view(line));
     if (!wide.has_value()) {
       return std::unexpected(wide.error());
     }
-    inputs.emplace_back(std::move(*wide));
+    inputs.emplace_back(std::filesystem::path(std::move(*wide)), listed);
   }
   if (stream.bad()) {
     return std::unexpected(std::make_error_code(std::errc::io_error));
   }
-  std::ranges::sort(inputs);
-  inputs.erase(std::ranges::unique(inputs).begin(), inputs.end());
+  merge_inputs(inputs);
   return inputs;
 }
 
@@ -544,12 +546,11 @@ class TracingSession {
   // Signalled once any hook reports that it failed to record a read.
   [[nodiscard]] HANDLE failed() const { return m_status.failed(); }
 
-  // The files the command and everything it started read - or why they
-  // cannot be known: a hook reported a failure, none reported installing, or
-  // the log could not be read. @pre Everything traced has exited.
-  [[nodiscard]] std::expected<std::vector<std::filesystem::path>,
-                              std::error_code>
-  take_inputs() const {
+  // What the command and everything it started looked at - or why it cannot
+  // be known: a hook reported a failure, none reported installing, or the
+  // log could not be read. @pre Everything traced has exited.
+  [[nodiscard]] std::expected<std::vector<Input>, std::error_code> take_inputs()
+      const {
     if (const std::error_code error = m_status.verdict()) {
       return std::unexpected(error);
     }
@@ -995,7 +996,7 @@ exec::task<ProcessUtil::Result> ProcessUtil::run_task(
   if (terminate_error) {
     co_return std::unexpected(terminate_error);
   }
-  std::expected<std::vector<std::filesystem::path>, std::error_code> inputs =
+  std::expected<std::vector<Input>, std::error_code> inputs =
       (*tracing)->take_inputs();
   if (!inputs.has_value()) {
     co_return std::unexpected(inputs.error());

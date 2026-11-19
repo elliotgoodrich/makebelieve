@@ -43,12 +43,14 @@ class RealDirectoryTree : public DirectoryTree {
   /// Returns entry at @a path, or an error_code when it is missing,
   /// unreachable, or escapes the root.
   [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override;
+      const std::filesystem::path& path,
+      const OpenContext& context = {}) const override;
 
   /// Returns the children of @a path, or an error_code when it cannot be
   /// listed. An existing but empty directory yields an empty vector.
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
-      const std::filesystem::path& path) const override;
+      const std::filesystem::path& path,
+      const OpenContext& context = {}) const override;
 
   /// Pins the native file identity and reads on demand. Replacement by
   /// rename preserves the old handle; in-place writes are visible through it.

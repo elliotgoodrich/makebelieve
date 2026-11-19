@@ -267,6 +267,29 @@ enum class ChangeKind : std::uint8_t { modified, added };
 
 using Changes = std::map<std::filesystem::path, ChangeKind>;
 
+// What @a diff asks to be announced: an entry added or removed as added -
+// which of the two settled when it is announced, by whether it still exists -
+// and a written file as modified. A directory whose entries changed is not
+// announced at all: a watcher on it learns of that from the entry's own
+// event.
+Changes to_changes(const DirectoryTreeDiff& diff) {
+  Changes changes;
+  for (const auto& [path, reason] : diff.changes) {
+    switch (reason) {
+      case DirectoryTreeDiff::Reason::entries_changed:
+        break;
+      case DirectoryTreeDiff::Reason::modified:
+        changes.emplace(path, ChangeKind::modified);
+        break;
+      case DirectoryTreeDiff::Reason::added:
+      case DirectoryTreeDiff::Reason::removed:
+        changes.emplace(path, ChangeKind::added);
+        break;
+    }
+  }
+  return changes;
+}
+
 // Folds @a from into @a into, keeping the dominant kind for a repeated path.
 void merge_changes(Changes& into, const Changes& from) {
   for (const auto& [path, kind] : from) {
@@ -560,7 +583,17 @@ class VirtualFileSystem::Impl {
     // Whether this handle is still counted in m_open_counts. Cleared by
     // whichever of cleanup() and close() gets there first.
     bool counted = false;
+
+    // Who opened it, which a listing through it is put down to: a listing
+    // comes with no process of its own.
+    OpenContext requester;
   };
+
+  // Who made the request being dispatched, for the tree to tell what it
+  // depends on. Only Create, Open and Rename say.
+  static OpenContext requester() {
+    return OpenContext{.requester_pid = FspFileSystemOperationProcessId()};
+  }
 
   // Bridges an FSP_FILE_SYSTEM_INTERFACE C callback to a member function,
   // recovering the instance from FSP_FILE_SYSTEM::UserContext.
@@ -638,8 +671,11 @@ class VirtualFileSystem::Impl {
                                 PUINT32 attributes,
                                 PSECURITY_DESCRIPTOR descriptor,
                                 SIZE_T* descriptor_size) {
+    const std::filesystem::path path = to_tree_path(name);
+    // A build depends on what it finds here, or that it finds nothing - and,
+    // of a directory on the way to a file, that it is one.
     const std::expected<EntryInfo, std::error_code> status =
-        m_tree.status(to_tree_path(name));
+        m_tree.status(path, requester());
     if (!status.has_value()) {
       return to_ntstatus(status.error());
     }
@@ -691,7 +727,11 @@ class VirtualFileSystem::Impl {
                 PVOID* file_context,
                 FSP_FSCTL_FILE_INFO* file_info) {
     const std::filesystem::path path = to_tree_path(name);
-    std::expected<EntryInfo, std::error_code> status = m_tree.status(path);
+    // A stat is an open for attributes alone, which reaches the tree no
+    // further than this, so a build depends on what it finds here.
+    const OpenContext context = requester();
+    std::expected<EntryInfo, std::error_code> status =
+        m_tree.status(path, context);
     if (!status) {
       return to_ntstatus(status.error());
     }
@@ -707,6 +747,7 @@ class VirtualFileSystem::Impl {
 
     auto handle = std::make_unique<OpenFile>();
     handle->path = path;
+    handle->requester = context;
     if (!is_directory) {
       remember(path);
       const std::lock_guard<std::mutex> lock(m_open_mutex);
@@ -980,8 +1021,9 @@ class VirtualFileSystem::Impl {
   }
 
   void fill_directory_buffer(OpenFile* handle, PNTSTATUS result) {
+    // A build depends on the entries of a directory it lists.
     const std::expected<std::vector<TreeEntry>, std::error_code> entries =
-        m_tree.ls(handle->path);
+        m_tree.ls(handle->path, handle->requester);
     if (!entries.has_value()) {
       *result = to_ntstatus(entries.error());
       return;
@@ -1057,20 +1099,7 @@ class VirtualFileSystem::Impl {
     if (diff.everything_dirty) {
       m_everything_dirty = true;
     } else {
-      // An entry whose parent's child list changed in the same diff was added
-      // or removed rather than rewritten; which of the two is settled when it
-      // is announced, by whether it still exists. That is all
-      // child_lists_changed is needed for: a watcher on the parent learns about
-      // a new or missing child from the child's own record.
-      const std::set<std::filesystem::path> parents(
-          diff.child_lists_changed.begin(), diff.child_lists_changed.end());
-      Changes changes;
-      for (const std::filesystem::path& path : diff.entries_changed) {
-        changes.emplace(path, parents.contains(path.parent_path())
-                                  ? ChangeKind::added
-                                  : ChangeKind::modified);
-      }
-      merge_changes(m_pending, changes);
+      merge_changes(m_pending, to_changes(diff));
     }
     start_notifying();
   }

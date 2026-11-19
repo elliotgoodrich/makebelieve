@@ -604,6 +604,8 @@ TEST_F(RealDirectoryTree, OpenFailsAsReadDoes) {
   EXPECT_EQ(directory.error(), std::errc::is_a_directory);
 }
 
+using Reason = makebelieve::DirectoryTreeDiff::Reason;
+
 // Collects the diffs a tree reports, for a test to wait on.
 class ChangeLog {
   std::mutex m_mutex;
@@ -638,21 +640,26 @@ class ChangeLog {
     return std::ranges::any_of(m_diffs, matches);
   }
 
-  // Waits (bounded) until a diff names @a path as changed.
-  [[nodiscard]] bool wait_for_entry(const std::filesystem::path& path) {
+  // Waits (bounded) until a diff names @a path as changed - for @a reason,
+  // if given.
+  [[nodiscard]] bool wait_for_entry(
+      const std::filesystem::path& path,
+      std::optional<makebelieve::DirectoryTreeDiff::Reason> reason = {}) {
     return wait_for([&](const makebelieve::DirectoryTreeDiff& diff) {
-      return diff.everything_dirty ||
-             std::ranges::contains(diff.entries_changed, path);
+      if (diff.everything_dirty) {
+        return true;
+      }
+      const auto it = diff.changes.find(path);
+      return it != diff.changes.end() &&
+             (!reason.has_value() || it->second == *reason);
     });
   }
 
-  // Waits (bounded) until a diff names @a directory's child list as changed.
+  // Waits (bounded) until a diff names @a directory's entries as changed.
   [[nodiscard]] bool wait_for_child_list(
       const std::filesystem::path& directory) {
-    return wait_for([&](const makebelieve::DirectoryTreeDiff& diff) {
-      return diff.everything_dirty ||
-             std::ranges::contains(diff.child_lists_changed, directory);
-    });
+    return wait_for_entry(
+        directory, makebelieve::DirectoryTreeDiff::Reason::entries_changed);
   }
 };
 
@@ -681,12 +688,110 @@ TEST_F(RealDirectoryTree, ReportsAddedAndRemovedFilesInTheirParentsChildList) {
   const makebelieve::Subscription subscription =
       tree().subscribe_to_changes(log.callback());
   write_file(root() / "added.txt", "added");
-  EXPECT_TRUE(log.wait_for_entry("added.txt"));
+  EXPECT_TRUE(log.wait_for_entry("added.txt", Reason::added));
   EXPECT_TRUE(log.wait_for_child_list(""));
 
   std::filesystem::remove(root() / "sub" / "nested.txt");
-  EXPECT_TRUE(log.wait_for_entry(std::filesystem::path("sub") / "nested.txt"));
+  EXPECT_TRUE(log.wait_for_entry(std::filesystem::path("sub") / "nested.txt",
+                                 Reason::removed));
   EXPECT_TRUE(log.wait_for_child_list("sub"));
+}
+
+// A file whose modification time alone moves - `touch`, say - has changed.
+TEST_F(RealDirectoryTree, ReportsAFileWhoseModificationTimeAloneChanged) {
+  ChangeLog log;
+  const makebelieve::Subscription subscription =
+      tree().subscribe_to_changes(log.callback());
+  const std::filesystem::path file = root() / "sub" / "nested.txt";
+  std::filesystem::last_write_time(
+      file, std::filesystem::last_write_time(file) + std::chrono::hours(1));
+  EXPECT_TRUE(log.wait_for_entry(std::filesystem::path("sub") / "nested.txt",
+                                 Reason::modified));
+}
+
+TEST_F(RealDirectoryTree, ReportsAFileCreatedAndDeleted) {
+  ChangeLog log;
+  const makebelieve::Subscription subscription =
+      tree().subscribe_to_changes(log.callback());
+  const std::filesystem::path relative =
+      std::filesystem::path("sub") / "deeper" / "brief.txt";
+  write_file(root() / relative, "brief");
+  EXPECT_TRUE(log.wait_for_entry(relative, Reason::added));
+
+  ChangeLog after;
+  const makebelieve::Subscription second =
+      tree().subscribe_to_changes(after.callback());
+  std::filesystem::remove(root() / relative);
+  EXPECT_TRUE(after.wait_for_entry(relative, Reason::removed));
+  EXPECT_TRUE(after.wait_for_child_list(relative.parent_path()));
+}
+
+// A directory's value is its entries, so its own modification time moving is
+// no change.
+TEST_F(RealDirectoryTree,
+       DoesNotReportADirectoryWhoseModificationTimeAloneMoved) {
+  ChangeLog log;
+  const makebelieve::Subscription subscription =
+      tree().subscribe_to_changes(log.callback());
+  const std::filesystem::path directory = root() / "sub";
+  std::filesystem::last_write_time(
+      directory,
+      std::filesystem::last_write_time(directory) + std::chrono::hours(1));
+  write_file(root() / "hello.txt", "after");
+  // Whatever the directory's change was going to say has been said by the
+  // time a file written after it is.
+  ASSERT_TRUE(log.wait_for_entry("hello.txt"));
+  EXPECT_FALSE(log.has([](const makebelieve::DirectoryTreeDiff& diff) {
+    return diff.changes.contains("sub");
+  }));
+}
+
+// A directory an entry is added to is named as its entries changing, but
+// never as though it came or went, or as a file written.
+TEST_F(RealDirectoryTree, ReportsADirectoryAnEntryIsAddedToAsEntriesChanged) {
+  ChangeLog log;
+  const makebelieve::Subscription subscription =
+      tree().subscribe_to_changes(log.callback());
+  write_file(root() / "sub" / "added.txt", "added");
+  ASSERT_TRUE(log.wait_for_entry(std::filesystem::path("sub") / "added.txt"));
+  EXPECT_TRUE(log.wait_for_child_list("sub"));
+  EXPECT_FALSE(log.has([](const makebelieve::DirectoryTreeDiff& diff) {
+    const auto it = diff.changes.find("sub");
+    return it != diff.changes.end() && it->second != Reason::entries_changed;
+  }));
+}
+
+// A directory moved in whole brings everything in it, which has appeared as
+// much as the directory has, though the operating system names only the
+// directory.
+TEST_F(RealDirectoryTree, ReportsEverythingInADirectoryMovedIn) {
+  const std::filesystem::path staging = make_temp_directory();
+  ASSERT_FALSE(staging.empty());
+  const std::filesystem::path outside = staging / "arriving";
+  ASSERT_TRUE(std::filesystem::create_directories(outside / "inner"));
+  write_file(outside / "inner" / "deep.txt", "deep");
+  write_file(outside / "top.txt", "top");
+
+  ChangeLog log;
+  const makebelieve::Subscription subscription =
+      tree().subscribe_to_changes(log.callback());
+  // A rename only stays within one volume, which the temp directory is.
+  std::filesystem::rename(outside, root() / "sub" / "arrived");
+  const std::filesystem::path arrived =
+      std::filesystem::path("sub") / "arrived";
+  EXPECT_TRUE(log.wait_for_entry(arrived, Reason::added));
+  EXPECT_TRUE(log.wait_for_entry(arrived / "top.txt", Reason::added));
+  EXPECT_TRUE(log.wait_for_entry(arrived / "inner", Reason::added));
+  EXPECT_TRUE(
+      log.wait_for_entry(arrived / "inner" / "deep.txt", Reason::added));
+  EXPECT_TRUE(log.wait_for_child_list("sub"));
+
+  // And what lands in it afterwards is seen as usual: it is watched.
+  write_file(root() / arrived / "inner" / "later.txt", "later");
+  EXPECT_TRUE(log.wait_for_entry(arrived / "inner" / "later.txt"));
+
+  std::error_code ignored;
+  std::filesystem::remove_all(staging, ignored);
 }
 
 // Every subscriber hears of a change, and one that has gone hears of no more.
@@ -708,8 +813,7 @@ TEST_F(RealDirectoryTree, NotifiesEverySubscriberUntilItUnsubscribes) {
   // Both would have heard of it in the same pass, so the first having heard
   // is enough to know the second never will.
   EXPECT_FALSE(second.has([](const makebelieve::DirectoryTreeDiff& diff) {
-    return std::ranges::contains(diff.entries_changed,
-                                 std::filesystem::path("empty.txt"));
+    return diff.changes.contains("empty.txt");
   }));
 }
 

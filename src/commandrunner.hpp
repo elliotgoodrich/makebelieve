@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include "input.hpp"
 #include "manifest.hpp"
 
 #include <exec/any_sender_of.hpp>
@@ -22,8 +23,9 @@
 
 namespace makebelieve {
 
-/// What running a command produced: the output it built, and the input files
-/// it read (its dependencies), relative to the source tree's root.
+/// What running a command produced: the output it built, and the paths it
+/// looked at (its dependencies), relative to the source tree's root - the
+/// root itself as the empty path.
 struct BuildOutput {
   /// The output it built: its bytes, or a file holding them, which the tree
   /// takes over - once it has opened it, it moves it into its cache or
@@ -32,7 +34,9 @@ struct BuildOutput {
   /// in is a rename.
   std::variant<std::string, std::filesystem::path> content;
 
-  std::vector<std::filesystem::path> inputs;
+  /// Each path it looked at, as Input describes, so a change to what it
+  /// depends on of one rebuilds it.
+  std::vector<Input> inputs;
 };
 
 /// Why a build failed: the error; the input files it read on the way, relative
@@ -42,14 +46,14 @@ struct BuildOutput {
 /// tree keeps as it is, so a runner keeps it short.
 struct BuildFailure {
   std::error_code error;
-  std::vector<std::filesystem::path> inputs;
+  std::vector<Input> inputs;
   std::string standard_error;
 
   /// A failure that read nothing and wrote nothing to standard error, unless
   /// given. Implicit, so a build can fail with `std::unexpected(error)`.
   // NOLINTNEXTLINE(google-explicit-constructor,hicpp-explicit-conversions)
   BuildFailure(std::error_code error,
-               std::vector<std::filesystem::path> inputs = {},
+               std::vector<Input> inputs = {},
                std::string standard_error = {})
       : error(error),
         inputs(std::move(inputs)),
