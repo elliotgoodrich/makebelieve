@@ -228,6 +228,29 @@ enum class ChangeKind : std::uint8_t { modified, added };
 
 using Changes = std::unordered_map<std::filesystem::path, ChangeKind>;
 
+// What @a diff asks to be announced: an entry added or removed as added -
+// which of the two settled when it is announced, by whether it still exists -
+// and a written file as modified. A directory whose entries changed is not
+// announced at all: a watcher on it learns of that from the entry's own
+// event.
+Changes to_changes(const DirectoryTreeDiff& diff) {
+  Changes changes;
+  for (const auto& [path, reason] : diff.changes) {
+    switch (reason) {
+      case DirectoryTreeDiff::Reason::entries_changed:
+        break;
+      case DirectoryTreeDiff::Reason::modified:
+        changes.emplace(path, ChangeKind::modified);
+        break;
+      case DirectoryTreeDiff::Reason::added:
+      case DirectoryTreeDiff::Reason::removed:
+        changes.emplace(path, ChangeKind::added);
+        break;
+    }
+  }
+  return changes;
+}
+
 // Folds @a from into @a into, keeping the dominant kind for a repeated path.
 void merge_changes(Changes& into, const Changes& from) {
   for (const auto& [path, kind] : from) {
@@ -521,6 +544,12 @@ class VirtualFileSystem::Impl {
   template <auto Member>
   static constexpr auto bridge = Bridge<Member>::call;
 
+  // Who made @a req, for the tree to tell what it depends on.
+  static OpenContext requester(fuse_req_t req) {
+    return OpenContext{.requester_pid =
+                           static_cast<std::uint32_t>(fuse_req_ctx(req)->pid)};
+  }
+
   bool is_self_request(fuse_req_t req) const {
     const auto writer = m_notifier_tid.load(std::memory_order_relaxed);
     return writer && fuse_req_ctx(req)->pid == writer;
@@ -672,8 +701,10 @@ class VirtualFileSystem::Impl {
       return -ENOENT;
     }
 
-    const std::expected<EntryInfo, std::error_code> status =
-        m_tree.status(relative);
+    // A build looking something up depends on what it finds, or that it
+    // finds nothing - but not on what we make up for our own requests.
+    const std::expected<EntryInfo, std::error_code> status = m_tree.status(
+        relative, pretence == Pretence::none ? requester(req) : OpenContext{});
     if (!status.has_value()) {
       // Made up only while the path really is gone. One recreated since its
       // removal was queued shares the kernel's inode with it, so made-up
@@ -969,7 +1000,8 @@ class VirtualFileSystem::Impl {
   using Directory = FileHandle;
   void opendir(fuse_req_t req, fuse_ino_t ino, fuse_file_info* fi) {
     const auto name = path(ino);
-    auto entries = m_tree.ls(name);
+    // A build depends on the entries of a directory it lists.
+    auto entries = m_tree.ls(name, requester(req));
     if (!entries) {
       fuse_reply_err(req, to_errno(entries.error()));
       return;
@@ -1103,14 +1135,18 @@ class VirtualFileSystem::Impl {
   // serviced it, which is not something to make the tree's watcher wait on:
   // stall that thread and its own event queue is what overflows.
   void on_tree_changed(const DirectoryTreeDiff& diff) {
+    // Worked out before the lock, as it allocates.
+    const Changes changes =
+        diff.everything_dirty ? Changes() : to_changes(diff);
     const std::lock_guard<std::mutex> lock(m_notify_mutex);
     // Under the same lock as the queueing below, so that every generation
-    // there is of a file is either announced or on its way to it.
+    // there is of a file is either announced or on its way to it - so only
+    // what is announced gets one.
     if (diff.everything_dirty) {
       m_everything_generation = ++m_clock;
       m_generations.clear();
     } else {
-      for (const std::filesystem::path& path : diff.entries_changed) {
+      for (const auto& [path, kind] : changes) {
         m_generations.insert_or_assign(path, ++m_clock);
       }
     }
@@ -1120,19 +1156,6 @@ class VirtualFileSystem::Impl {
     if (diff.everything_dirty) {
       m_everything_dirty = true;
     } else {
-      // An entry whose parent's child list changed in the same diff was added
-      // or removed rather than rewritten; which of the two is settled when it
-      // is announced, by whether it still exists. That is all
-      // child_lists_changed is needed for: a watcher on the parent learns
-      // about a new or missing child from the child's own event.
-      const std::unordered_set<std::filesystem::path> parents(
-          diff.child_lists_changed.begin(), diff.child_lists_changed.end());
-      Changes changes;
-      for (const std::filesystem::path& path : diff.entries_changed) {
-        changes.emplace(path, parents.contains(path.parent_path())
-                                  ? ChangeKind::added
-                                  : ChangeKind::modified);
-      }
       merge_changes(m_pending, changes);
     }
     start_notifying();

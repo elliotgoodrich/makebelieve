@@ -32,6 +32,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <ranges>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -171,7 +172,22 @@ class LayoutLock {
 // @a output as an input of the builds that read it, kept apart from source
 // files by its `@/`.
 std::filesystem::path as_input(const std::filesystem::path& output) {
-  return std::filesystem::path("@") / output;
+  return output.empty() ? std::filesystem::path("@")
+                        : std::filesystem::path("@") / output;
+}
+
+// Whether @a path is @a ancestor or lies beneath it. Every path lies beneath
+// the root, the empty path.
+bool is_within(const std::filesystem::path& path,
+               const std::filesystem::path& ancestor) {
+  return std::ranges::mismatch(ancestor, path).in1 == ancestor.end();
+}
+
+// Whether @a error says there is nothing at a path: neither it nor, perhaps,
+// a directory on the way to it.
+bool is_missing(const std::error_code& error) {
+  return error == std::errc::no_such_file_or_directory ||
+         error == std::errc::not_a_directory;
 }
 
 // The name of @a action as a manifest spells it.
@@ -498,11 +514,21 @@ class BuildDirectoryTree::Impl {
   };
   std::map<std::filesystem::path, Attempts> m_attempts;
 
-  // The outputs each build under way has opened through us, by the output
-  // it builds, added to its inputs when it finishes. Tracing sees only the
-  // source, so not these.
-  std::unordered_map<std::filesystem::path, std::set<std::filesystem::path>>
+  // The outputs each build under way has opened, or looked up or listed,
+  // through us, by the output it builds, each with whether it was listed,
+  // added to its inputs when it finishes. Tracing sees only the source, so
+  // not these.
+  std::unordered_map<std::filesystem::path,
+                     std::map<std::filesystem::path, bool>>
       m_reads;
+
+  // The builds under way, or finished since, that looked up each output
+  // through the mount while it was unbuilt, out of date or building: they saw
+  // what it was before, and so go out of date once it is built. A build that
+  // goes on to open the output waits for it to be up to date, and so is
+  // dropped.
+  std::map<std::filesystem::path, std::set<std::filesystem::path>>
+      m_saw_out_of_date;
 
   // Outputs opened at least once, which an input change rebuilds eagerly.
   std::set<std::filesystem::path> m_materialized;
@@ -528,12 +554,14 @@ class BuildDirectoryTree::Impl {
 
   // The inputs each built output last read. Kept so a rebuild can refresh
   // m_dependents when an output's set of inputs changes.
-  std::map<std::filesystem::path, std::vector<std::filesystem::path>>
-      m_dependencies;
+  std::map<std::filesystem::path, std::vector<Input>> m_dependencies;
 
-  // The reverse of m_dependencies: each input mapped to the outputs that read
-  // it, matched against a source change to find what to rebuild.
-  std::map<std::filesystem::path, std::set<std::filesystem::path>> m_dependents;
+  // The reverse of m_dependencies: each input's path mapped to the outputs
+  // that read it, and whether each listed it, matched against a change to
+  // find what to rebuild. Ordered, so that everything beneath a path is a
+  // run starting at it.
+  std::map<std::filesystem::path, std::map<std::filesystem::path, bool>>
+      m_dependents;
 
   // How many times each output has gone stale through invalidate(), or had
   // its rule removed: a build started at one count describes the output only
@@ -709,13 +737,55 @@ class BuildDirectoryTree::Impl {
   Impl& operator=(Impl&&) = delete;
 
   [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const {
+      const std::filesystem::path& path,
+      const OpenContext& context) {
+    record_look(path, context, false);
     return m_structure.status(path);
   }
 
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
-      const std::filesystem::path& path) const {
+      const std::filesystem::path& path,
+      const OpenContext& context) {
+    record_look(path, context, true);
     return m_structure.ls(path);
+  }
+
+  // Records, against the build whose command @a context says asked, that it
+  // looked up - or, if @a listed, listed - @a path through the mount. A
+  // request from anything else, such as a command outside any build,
+  // records nothing.
+  void record_look(const std::filesystem::path& path,
+                   const OpenContext& context,
+                   bool listed) {
+    if (context.requester_pid == 0) {
+      return;
+    }
+    {
+      // Nothing to resolve while no build is under way.
+      const std::lock_guard lock(m_mutex);
+      if (m_reads.empty()) {
+        return;
+      }
+    }
+    // Unlocked: it may read /proc.
+    const std::optional<std::filesystem::path> reader =
+        m_coordinator->resolve(context.requester_pid);
+    if (!reader.has_value()) {
+      return;
+    }
+    const std::filesystem::path output = path.lexically_normal();
+    const std::lock_guard lock(m_mutex);
+    const auto reads = m_reads.find(*reader);
+    if (reads == m_reads.end()) {
+      return;
+    }
+    bool& was_listed = reads->second[as_input(output)];
+    was_listed = was_listed || listed;
+    // What it saw of an output that is not yet what it will be.
+    if (output != *reader && m_commands.contains(output) &&
+        (m_stale.contains(output) || m_in_flight.contains(output))) {
+      m_saw_out_of_date[output].insert(*reader);
+    }
   }
 
   // What a `status` output holds: the manifest's problems, then each build
@@ -863,32 +933,22 @@ class BuildDirectoryTree::Impl {
             callback(diff);
             return;
           }
-          // A rewrite rather than an addition or a removal, which changes the
-          // parent's list of children too.
-          const auto is_trace_rewrite = [&](const std::filesystem::path& path) {
-            const auto it = m_commands.find(path);
-            return it != m_commands.end() &&
-                   Manifest::is_report(it->second.action) &&
-                   !std::ranges::contains(diff.child_lists_changed,
-                                          path.parent_path());
-          };
-
-          DirectoryTreeDiff filtered;
+          DirectoryTreeDiff filtered = diff;
           {
             // Callers hold at most m_layout_mutex, which comes first.
             const std::lock_guard lock(m_mutex);
-            if (std::ranges::none_of(diff.entries_changed, is_trace_rewrite)) {
-              filtered = diff;
-            } else {
-              filtered.child_lists_changed = diff.child_lists_changed;
-              std::ranges::copy_if(diff.entries_changed,
-                                   std::back_inserter(filtered.entries_changed),
-                                   std::not_fn(is_trace_rewrite));
-            }
+            // A rewrite rather than an addition or a removal, which changes
+            // the parent's entries too.
+            std::erase_if(filtered.changes, [&](const auto& change) {
+              const auto& [path, reason] = change;
+              const auto it = m_commands.find(path);
+              return reason == DirectoryTreeDiff::Reason::modified &&
+                     it != m_commands.end() &&
+                     Manifest::is_report(it->second.action);
+            });
           }
           // Outside m_mutex, so the callback may read back through us.
-          if (!filtered.entries_changed.empty() ||
-              !filtered.child_lists_changed.empty()) {
+          if (!filtered.changes.empty()) {
             callback(filtered);
           }
         });
@@ -905,7 +965,11 @@ class BuildDirectoryTree::Impl {
       const std::lock_guard lock(m_subscribers_mutex);
       callbacks.assign(m_subscribers.begin(), m_subscribers.end());
     }
-    const DirectoryTreeDiff diff{.entries_changed = std::move(outputs)};
+    DirectoryTreeDiff diff;
+    for (std::filesystem::path& output : outputs) {
+      diff.changes.emplace(std::move(output),
+                           DirectoryTreeDiff::Reason::modified);
+    }
     for (const auto& callback : callbacks) {
       callback(diff);
     }
@@ -925,7 +989,7 @@ class BuildDirectoryTree::Impl {
     // The file its runner left, still to be moved into the cache or deleted.
     ScratchFile scratch;
 
-    std::vector<std::filesystem::path> inputs;
+    std::vector<Input> inputs;
   };
   using Outcome = std::expected<Built, BuildFailure>;
 
@@ -978,7 +1042,7 @@ class BuildDirectoryTree::Impl {
   // A successful build to keep in the cache, as finish_build found it.
   struct Keep {
     Command command;
-    std::vector<std::filesystem::path> inputs;
+    std::vector<Input> inputs;
     std::chrono::file_clock::time_point mtime;
     std::uint64_t invalidations_at_start = 0;
   };
@@ -1121,7 +1185,12 @@ class BuildDirectoryTree::Impl {
                    const std::filesystem::path& output) {
     const std::lock_guard lock(m_mutex);
     if (const auto reads = m_reads.find(reader); reads != m_reads.end()) {
-      reads->second.insert(as_input(output));
+      reads->second.try_emplace(as_input(output), false);
+    }
+    // It reads the output once up to date, whatever it saw before.
+    if (const auto saw = m_saw_out_of_date.find(output);
+        saw != m_saw_out_of_date.end()) {
+      saw->second.erase(reader);
     }
   }
 
@@ -1326,6 +1395,9 @@ class BuildDirectoryTree::Impl {
                     Outcome result) {
     // What to keep in the cache once waiters are released, if anything.
     std::optional<Keep> keep;
+    // What saw the output before this build, and is out of date once it is
+    // in place.
+    std::vector<std::filesystem::path> saw_before;
     if (result.has_value()) {
       const LayoutLock layout(m_layout_mutex, this);
       bool declared = false;
@@ -1360,6 +1432,9 @@ class BuildDirectoryTree::Impl {
             }
           }
           update_dependents(output, std::move(result->inputs));
+          if (auto saw = m_saw_out_of_date.extract(output); !saw.empty()) {
+            saw_before.assign(saw.mapped().begin(), saw.mapped().end());
+          }
         }
       }
       // Outside m_mutex: write_file notifies subscribers, who may read back
@@ -1467,6 +1542,11 @@ class BuildDirectoryTree::Impl {
       free_lane(output);
     }
 
+    // Once nothing is held, as an eager rebuild of one may start here.
+    if (!saw_before.empty()) {
+      invalidate(std::move(saw_before));
+    }
+
     if (next.has_value()) {
       launch_build(std::move(*next));
     }
@@ -1567,9 +1647,9 @@ class BuildDirectoryTree::Impl {
     const std::optional<std::filesystem::path> copied =
         ran.action == Manifest::Action::Copy ? output_named_by(ran.text)
                                              : std::nullopt;
-    for (const std::filesystem::path& input : result.error().inputs) {
+    for (const Input& input : result.error().inputs) {
       if (const std::optional<std::filesystem::path> named =
-              output_named_by(input);
+              output_named_by(input.path);
           named.has_value() && *named != output && is_failing(*named)) {
         failure.failed_input = named;
         failure.copies_failed_input = named == copied;
@@ -1737,32 +1817,101 @@ class BuildDirectoryTree::Impl {
     }
   }
 
-  // The stamp of the source file or directory @a path as it is now, or
-  // nothing if it cannot be had.
-  [[nodiscard]] std::optional<BuildCache::Input> stamp_source(
-      const std::filesystem::path& path) const {
-    const std::expected<EntryInfo, std::error_code> info =
-        m_source.status(path);
-    if (!info.has_value()) {
-      return std::nullopt;
+  // The stamp of @a input, a path with nothing at it, or a directory listing
+  // @a entries - or nothing if those could not be had.
+  static std::optional<BuildCache::Input> stamp_missing_or_directory(
+      const std::filesystem::path& input,
+      const std::expected<std::vector<TreeEntry>, std::error_code>& entries) {
+    if (entries.has_value()) {
+      return BuildCache::Input{.path = input,
+                               .mtime = 0,
+                               .size = BuildCache::Input::k_directory,
+                               .hash = BuildCache::hash_entries(*entries)};
     }
-    if (const auto* const file = std::get_if<FileInfo>(&*info)) {
-      return BuildCache::Input{.path = path,
-                               .mtime = BuildCache::raw_mtime(file->mtime),
-                               .size = static_cast<std::int64_t>(file->size),
+    if (is_missing(entries.error())) {
+      return BuildCache::Input{.path = input,
+                               .mtime = 0,
+                               .size = BuildCache::Input::k_missing,
                                .hash = {}};
     }
-    return BuildCache::Input{
-        .path = path,
-        .mtime = BuildCache::raw_mtime(std::get<DirectoryInfo>(*info).mtime),
-        .size = -1,
-        .hash = {}};
+    return std::nullopt;
   }
 
-  // The output @a input names, if it names one rather than a source file.
+  // The stamp of a directory at @a input that was only looked at, which
+  // stands for there being one there.
+  static BuildCache::Input stamp_directory(const std::filesystem::path& input) {
+    return BuildCache::Input{.path = input,
+                             .mtime = 0,
+                             .size = BuildCache::Input::k_directory,
+                             .hash = {}};
+  }
+
+  // Whether @a stamp is of a directory that was listed, rather than only
+  // looked at: one stamped with its entries.
+  static bool stamps_listing(const BuildCache::Input& stamp) {
+    return stamp.size == BuildCache::Input::k_directory && !stamp.hash.empty();
+  }
+
+  // The stamp of whatever is at the source path @a path now - a file's mtime
+  // and size, standing in for its content; a directory's entries, if
+  // @a listed, or else that a directory is there; or that nothing is there -
+  // or nothing if it cannot be had.
+  [[nodiscard]] std::optional<BuildCache::Input> stamp_source(
+      const std::filesystem::path& path,
+      bool listed) const {
+    const std::expected<EntryInfo, std::error_code> info =
+        m_source.status(path);
+    if (info.has_value()) {
+      if (const auto* const file = std::get_if<FileInfo>(&*info)) {
+        return BuildCache::Input{.path = path,
+                                 .mtime = BuildCache::raw_mtime(file->mtime),
+                                 .size = static_cast<std::int64_t>(file->size),
+                                 .hash = {}};
+      }
+      return listed ? stamp_missing_or_directory(path, m_source.ls(path))
+                    : stamp_directory(path);
+    }
+    return stamp_missing_or_directory(path, std::unexpected(info.error()));
+  }
+
+  // The stamp of whatever is at the output path @a input (`@/` and the path)
+  // in m_structure now: a directory's entries, if @a listed, or else that a
+  // directory is there; that nothing is there; or, given @a hash - the hash
+  // of the output's content, if it has one - a file. Nothing if it is a file
+  // with no hash, or if it cannot be had.
+  [[nodiscard]] std::optional<BuildCache::Input> stamp_output(
+      const std::filesystem::path& input,
+      const std::string* hash,
+      bool listed) const {
+    const std::optional<std::filesystem::path> output = output_named_by(input);
+    if (!output.has_value()) {
+      return std::nullopt;
+    }
+    const std::expected<EntryInfo, std::error_code> info =
+        m_structure.status(*output);
+    if (!info.has_value()) {
+      return stamp_missing_or_directory(input, std::unexpected(info.error()));
+    }
+    if (std::holds_alternative<DirectoryInfo>(*info)) {
+      return listed ? stamp_missing_or_directory(input, m_structure.ls(*output))
+                    : stamp_directory(input);
+    }
+    if (hash == nullptr) {
+      return std::nullopt;
+    }
+    return BuildCache::Input{
+        .path = input, .mtime = 0, .size = 0, .hash = *hash};
+  }
+
+  // The output @a input names, if it names one - or a directory of them -
+  // rather than a source path: `@` for the root of the outputs, or `@/` and
+  // the path.
   static std::optional<std::filesystem::path> output_named_by(
       const std::filesystem::path& input) {
     const std::string text = input.generic_string();
+    if (text == "@") {
+      return std::filesystem::path();
+    }
     if (!text.starts_with(k_generated_prefix)) {
       return std::nullopt;
     }
@@ -1778,6 +1927,8 @@ class BuildDirectoryTree::Impl {
                      const Keep& keep) {
     const std::lock_guard cache_lock(m_cache_mutex);
     std::vector<BuildCache::Input> stamps;
+    // The hash of each output it read that has one, as served.
+    std::map<std::filesystem::path, std::string> hashes;
     bool keepable = true;
     {
       const std::lock_guard lock(m_mutex);
@@ -1785,34 +1936,35 @@ class BuildDirectoryTree::Impl {
       keepable = (invalidations == m_invalidations.end()
                       ? 0
                       : invalidations->second) == keep.invalidations_at_start;
-      for (const std::filesystem::path& input : keep.inputs) {
-        if (!keepable) {
-          break;
-        }
+      for (const Input& input : keep.inputs) {
         if (const std::optional<std::filesystem::path> read =
-                output_named_by(input)) {
-          const auto hash = m_hashes.find(*read);
-          keepable = hash != m_hashes.end();
-          if (keepable) {
-            stamps.push_back(BuildCache::Input{
-                .path = input, .mtime = 0, .size = 0, .hash = hash->second});
+                output_named_by(input.path)) {
+          if (const auto hash = m_hashes.find(*read); hash != m_hashes.end()) {
+            hashes.emplace(input.path, hash->second);
           }
         }
       }
     }
-    // Source files are stamped outside m_mutex, as that reaches the disk. A
-    // change landing after the stamp invalidates the output, whose record is
-    // then dropped once this one is in place.
-    for (const std::filesystem::path& input : keep.inputs) {
+    // Stamped outside m_mutex, as a source stamp reaches the disk and an
+    // output's reaches m_structure. A change landing after the stamp
+    // invalidates the output, whose record is then dropped once this one is
+    // in place.
+    for (const Input& input : keep.inputs) {
       if (!keepable) {
         break;
       }
-      if (!output_named_by(input).has_value()) {
-        const std::optional<BuildCache::Input> stamp = stamp_source(input);
-        keepable = stamp.has_value();
-        if (keepable) {
-          stamps.push_back(*stamp);
-        }
+      std::optional<BuildCache::Input> stamp;
+      if (output_named_by(input.path).has_value()) {
+        const auto hash = hashes.find(input.path);
+        stamp = stamp_output(input.path,
+                             hash == hashes.end() ? nullptr : &hash->second,
+                             input.listed);
+      } else {
+        stamp = stamp_source(input.path, input.listed);
+      }
+      keepable = stamp.has_value();
+      if (keepable) {
+        stamps.push_back(std::move(*stamp));
       }
     }
     // Best-effort: a build the cache cannot keep is just built again next run.
@@ -1896,11 +2048,19 @@ class BuildDirectoryTree::Impl {
     for (const BuildCache::Input& input : record->second->inputs) {
       if (const std::optional<std::filesystem::path> read =
               output_named_by(input.path)) {
-        if (!record_holds(*read, restoring) ||
-            restoring.records.at(*read)->hash != input.hash) {
+        // A directory of outputs, or nothing, is as it was; an output holds,
+        // with the content that was read.
+        if (input.size == BuildCache::Input::k_directory ||
+            input.size == BuildCache::Input::k_missing) {
+          if (stamp_output(input.path, nullptr, stamps_listing(input)) !=
+              input) {
+            return false;
+          }
+        } else if (!record_holds(*read, restoring) ||
+                   restoring.records.at(*read)->hash != input.hash) {
           return false;
         }
-      } else if (stamp_source(input.path) != input) {
+      } else if (stamp_source(input.path, stamps_listing(input)) != input) {
         return false;
       }
     }
@@ -1953,10 +2113,10 @@ class BuildDirectoryTree::Impl {
         const std::lock_guard lock(m_mutex);
         m_stale.erase(output);
         m_hashes.insert_or_assign(output, record.hash);
-        std::vector<std::filesystem::path> inputs;
+        std::vector<Input> inputs;
         inputs.reserve(record.inputs.size());
         for (const BuildCache::Input& input : record.inputs) {
-          inputs.push_back(input.path);
+          inputs.emplace_back(input.path, stamps_listing(input));
         }
         update_dependents(output, std::move(inputs));
       }
@@ -1972,11 +2132,11 @@ class BuildDirectoryTree::Impl {
   // from its previous inputs' dependent sets and adds it to the new ones.
   // @pre m_mutex is held.
   void update_dependents(const std::filesystem::path& output,
-                         std::vector<std::filesystem::path> inputs) {
+                         std::vector<Input> inputs) {
     const auto previous = m_dependencies.find(output);
     if (previous != m_dependencies.end()) {
-      for (const std::filesystem::path& input : previous->second) {
-        const auto it = m_dependents.find(input);
+      for (const Input& input : previous->second) {
+        const auto it = m_dependents.find(input.path);
         if (it != m_dependents.end()) {
           it->second.erase(output);
           if (it->second.empty()) {
@@ -1985,19 +2145,41 @@ class BuildDirectoryTree::Impl {
         }
       }
     }
-    for (const std::filesystem::path& input : inputs) {
-      m_dependents[input].insert(output);
+    for (const Input& input : inputs) {
+      bool& listed = m_dependents[input.path][output];
+      listed = listed || input.listed;
     }
     m_dependencies.insert_or_assign(output, std::move(inputs));
   }
 
-  // Adds to @a inputs, those @a output's build read, the outputs it opened
-  // through us, which tracing does not see - whether it built or failed.
-  // @pre m_mutex is held, and the build's reads are still in m_reads.
+  // Adds to @a into every output that depends on what is at @a path: on its
+  // entries alone, if @a entries_only, as a change to them leaves the rest
+  // of what is there alone - so only one that listed it - or else on
+  // anything about it. @pre m_mutex is held.
+  void add_dependents(std::vector<std::filesystem::path>& into,
+                      const std::filesystem::path& path,
+                      bool entries_only) const {
+    if (const auto readers = m_dependents.find(path);
+        readers != m_dependents.end()) {
+      for (const auto& [reader, listed] : readers->second) {
+        if (listed || !entries_only) {
+          into.push_back(reader);
+        }
+      }
+    }
+  }
+
+  // Adds to @a inputs, those @a output's build read, the outputs it opened,
+  // looked up or listed through us, which tracing does not see - whether it
+  // built or failed. @pre m_mutex is held, and the build's reads are still
+  // in m_reads.
   void add_reads(const std::filesystem::path& output,
-                 std::vector<std::filesystem::path>& inputs) const {
+                 std::vector<Input>& inputs) const {
     if (const auto reads = m_reads.find(output); reads != m_reads.end()) {
-      inputs.insert(inputs.end(), reads->second.begin(), reads->second.end());
+      for (const auto& [path, listed] : reads->second) {
+        inputs.emplace_back(path, listed);
+      }
+      merge_inputs(inputs);
     }
   }
 
@@ -2067,6 +2249,9 @@ class BuildDirectoryTree::Impl {
     std::vector<std::string> conflict_reports;
     // Outputs that were not `status` outputs before, but are now.
     std::vector<std::filesystem::path> now_status;
+    // Directories of outputs that may come or go with the outputs that do,
+    // mapped to whether each was there before; then only those that did.
+    std::map<std::filesystem::path, bool> directories;
     // What a `status` output that is new shows from the start.
     std::string report;
     {
@@ -2159,6 +2344,17 @@ class BuildDirectoryTree::Impl {
         }
       }
 
+      for (const std::vector<std::filesystem::path>* outputs :
+           {&removed, &added, &now_conflicting, &unclaimed}) {
+        for (const std::filesystem::path& output : *outputs) {
+          for (std::filesystem::path directory = output.parent_path();
+               !directory.empty(); directory = directory.parent_path()) {
+            directories.try_emplace(directory,
+                                    m_structure.status(directory).has_value());
+          }
+        }
+      }
+
       // Removals first, so a new output can take the place of a directory that
       // only removed outputs occupied. A `status` output holds what it shows
       // from the start, never a placeholder. A conflict keeps its place, but
@@ -2186,22 +2382,36 @@ class BuildDirectoryTree::Impl {
           m_structure.write_file(output, report);
         }
       }
+      std::erase_if(directories, [&](const auto& directory) {
+        return m_structure.status(directory.first).has_value() ==
+               directory.second;
+      });
     }
 
     // Whatever read an output that came or went - or became a conflict, or
     // stopped being one - or became a `status` output, read something else
-    // now.
+    // now; as did whatever looked up a directory of outputs that came or
+    // went, or looked at the directory such a one came or went in, whose
+    // entries changed.
     {
       const std::lock_guard lock(m_mutex);
+      const auto add_readers = [&](const std::filesystem::path& path,
+                                   bool entries_only) {
+        add_dependents(changed, as_input(path), entries_only);
+      };
       for (const std::vector<std::filesystem::path>* outputs :
-           {&removed, &added, &now_status, &unclaimed}) {
+           {&removed, &added, &now_conflicting, &unclaimed}) {
         for (const std::filesystem::path& output : *outputs) {
-          if (const auto readers = m_dependents.find(as_input(output));
-              readers != m_dependents.end()) {
-            changed.insert(changed.end(), readers->second.begin(),
-                           readers->second.end());
-          }
+          add_readers(output, false);
+          add_readers(output.parent_path(), true);
         }
+      }
+      for (const std::filesystem::path& output : now_status) {
+        add_readers(output, false);
+      }
+      for (const auto& [directory, existed] : directories) {
+        add_readers(directory, false);
+        add_readers(directory.parent_path(), true);
       }
     }
 
@@ -2232,17 +2442,19 @@ class BuildDirectoryTree::Impl {
   // depending on whatever changed and invalidates each. Invalidation runs
   // outside the lock, since it may start an eager rebuild.
   void on_source_change(const DirectoryTreeDiff& diff) {
-    MB_TRACE_SCOPE("build", "source change", "changed",
-                   diff.entries_changed.size(), "everything_dirty",
-                   diff.everything_dirty);
+    MB_TRACE_SCOPE("build", "source change", "changed", diff.changes.size(),
+                   "everything_dirty", diff.everything_dirty);
     if (diff.everything_dirty ||
-        std::ranges::contains(diff.entries_changed,
-                              std::filesystem::path(k_manifest_name))) {
+        diff.changes.contains(std::filesystem::path(k_manifest_name))) {
       reload_manifest();
-    } else if (std::ranges::any_of(diff.child_lists_changed,
-                                   [&](const std::filesystem::path& directory) {
+    } else if (std::ranges::any_of(diff.changes | std::views::keys,
+                                   [&](const std::filesystem::path& path) {
+                                     // A directory a wildcard matches in, or
+                                     // one on the way to it, whose entries
+                                     // changed or that came or went: a file
+                                     // written in it matches as it did.
                                      return m_wildcard_directories.contains(
-                                         directory.lexically_normal());
+                                         path.lexically_normal());
                                    })) {
       apply_rules(expand_rules(m_source, m_rules));
     }
@@ -2257,11 +2469,19 @@ class BuildDirectoryTree::Impl {
           affected.push_back(output);
         }
       } else {
-        for (const std::filesystem::path& changed : diff.entries_changed) {
-          const auto it = m_dependents.find(changed);
-          if (it != m_dependents.end()) {
-            affected.insert(affected.end(), it->second.begin(),
-                            it->second.end());
+        for (const auto& [path, reason] : diff.changes) {
+          // Whatever looked at a path that changed - only what listed it,
+          // if only its entries did - and, at one removed, at anything that
+          // was beneath it, which went with it unnamed.
+          add_dependents(affected, path,
+                         reason == DirectoryTreeDiff::Reason::entries_changed);
+          if (reason == DirectoryTreeDiff::Reason::removed) {
+            for (auto it = m_dependents.upper_bound(path);
+                 it != m_dependents.end() && is_within(it->first, path); ++it) {
+              for (const auto& [reader, listed] : it->second) {
+                affected.push_back(reader);
+              }
+            }
           }
         }
       }
@@ -2272,6 +2492,7 @@ class BuildDirectoryTree::Impl {
   // Marks @a outputs stale along with everything that read them, transitively,
   // then starts the eager rebuilds - only once all are marked, so nothing
   // downstream is served old content meanwhile.
+  // NOLINTNEXTLINE(misc-no-recursion): see launch_build.
   void invalidate(std::vector<std::filesystem::path> outputs) {
     std::vector<std::filesystem::path> eager;
     // Outputs that read each other must not loop.
@@ -2292,11 +2513,7 @@ class BuildDirectoryTree::Impl {
         if (m_materialized.contains(output) && !m_in_flight.contains(output)) {
           eager.push_back(output);
         }
-        if (const auto readers = m_dependents.find(as_input(output));
-            readers != m_dependents.end()) {
-          outputs.insert(outputs.end(), readers->second.begin(),
-                         readers->second.end());
-        }
+        add_dependents(outputs, as_input(output), false);
       }
     }
     // Before any rebuild starts, so a record of the stale content never
@@ -2347,13 +2564,15 @@ void BuildDirectoryTreeTestUtil::before_next_status_write(
 }
 
 std::expected<EntryInfo, std::error_code> BuildDirectoryTree::status(
-    const std::filesystem::path& path) const {
-  return m_impl->status(path);
+    const std::filesystem::path& path,
+    const OpenContext& context) const {
+  return m_impl->status(path, context);
 }
 
 std::expected<std::vector<TreeEntry>, std::error_code> BuildDirectoryTree::ls(
-    const std::filesystem::path& path) const {
-  return m_impl->ls(path);
+    const std::filesystem::path& path,
+    const OpenContext& context) const {
+  return m_impl->ls(path, context);
 }
 
 void BuildDirectoryTree::materialize_all() const {

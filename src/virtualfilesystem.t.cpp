@@ -802,13 +802,15 @@ class FailingReadTree : public makebelieve::DirectoryTree {
       : m_inner(inner), m_error(error) {}
 
   [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.status(path);
   }
 
   [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
                               std::error_code>
-  ls(const std::filesystem::path& path) const override {
+  ls(const std::filesystem::path& path,
+     const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.ls(path);
   }
 
@@ -857,7 +859,8 @@ class FailingStatusTree : public makebelieve::DirectoryTree {
       : m_inner(inner), m_path(std::move(path)), m_error(error) {}
 
   [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     if (path == m_path) {
       return std::unexpected(m_error);
     }
@@ -866,7 +869,8 @@ class FailingStatusTree : public makebelieve::DirectoryTree {
 
   [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
                               std::error_code>
-  ls(const std::filesystem::path& path) const override {
+  ls(const std::filesystem::path& path,
+     const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.ls(path);
   }
 
@@ -897,13 +901,15 @@ class SettleOnOpenTree : public makebelieve::DirectoryTree {
   [[nodiscard]] int opens() const { return m_opens; }
 
   [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.status(path);
   }
 
   [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
                               std::error_code>
-  ls(const std::filesystem::path& path) const override {
+  ls(const std::filesystem::path& path,
+     const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.ls(path);
   }
 
@@ -950,13 +956,15 @@ class ParkingTree : public makebelieve::DirectoryTree {
   void release() { m_coordinator.complete(m_attempt, {}); }
 
   [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.status(path);
   }
 
   [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
                               std::error_code>
-  ls(const std::filesystem::path& path) const override {
+  ls(const std::filesystem::path& path,
+     const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.ls(path);
   }
 
@@ -1079,11 +1087,13 @@ class InlineStopTree : public makebelieve::DirectoryTree {
       : m_inner(inner), m_stopped(stopped) {}
 
   std::expected<makebelieve::EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.status(path);
   }
   std::expected<std::vector<makebelieve::TreeEntry>, std::error_code> ls(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.ls(path);
   }
   makebelieve::OpenSender open(
@@ -1131,13 +1141,15 @@ class GatedOpenTree : public makebelieve::DirectoryTree {
   void release() { m_coordinator.complete(m_attempt, {}); }
 
   [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.status(path);
   }
 
   [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
                               std::error_code>
-  ls(const std::filesystem::path& path) const override {
+  ls(const std::filesystem::path& path,
+     const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.ls(path);
   }
 
@@ -1949,12 +1961,14 @@ class CountingTree final : public DirectoryTree {
   [[nodiscard]] int reads() const { return m_reads->load(); }
 
   [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_tree.status(path);
   }
 
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_tree.ls(path);
   }
 

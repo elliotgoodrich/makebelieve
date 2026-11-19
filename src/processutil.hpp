@@ -2,6 +2,7 @@
 #pragma once
 
 #include "buildprocesstracker.hpp"
+#include "input.hpp"
 
 #include <exec/task.hpp>
 #include <stdexec/execution.hpp>
@@ -37,18 +38,22 @@ struct CaptureOptions {
 /// Provides a namespace for running external commands.
 struct ProcessUtil {
   /// What a command produced: the bytes it wrote to standard output and to
-  /// standard error, and the files it read while running - its discovered
+  /// standard error, and what it looked at while running - its discovered
   /// input dependencies.
   struct Output {
     std::string standard_output;
     std::string standard_error;
 
     /// Absolute paths, under @a working_directory, that the command (or
-    /// anything it started) opened for reading, de-duplicated. Tracing is
-    /// required, so this is complete: a run whose reads could not all be
-    /// recorded fails rather than reporting fewer of them, and an empty list
-    /// means the command really read nothing under @a working_directory.
-    std::vector<std::filesystem::path> inputs;
+    /// anything it started) looked at, as Input describes, sorted and each
+    /// once: each file it read or got the attributes of, each directory it
+    /// got the attributes of - passing through it on the way to something
+    /// beneath it included - or listed, and each path it looked for and found
+    /// nothing at. Tracing is required, so this is complete: a run whose
+    /// lookups could not all be recorded fails rather than reporting fewer of
+    /// them, and an empty list means the command really looked at nothing
+    /// under @a working_directory.
+    std::vector<Input> inputs;
 
     /// The status the command exited with - on Linux, 128 plus the signal
     /// that ended it, if one did, as a shell reports it. What a nonzero

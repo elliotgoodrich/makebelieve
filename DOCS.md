@@ -23,9 +23,12 @@ mount, which builds it on the way:
 
 Outside quotes the path runs to the next space or shell metacharacter and
 is quoted, so a mountpoint with spaces in it survives the shell; inside
-quotes (`"@/my notes.md"`) it runs to the closing quote. Every output a
-command opens through the mount - named with `@/` or not - becomes one of
-its inputs, so it is rebuilt whenever that output goes out of date.
+quotes (`"@/my notes.md"`) it runs to the closing quote. Whatever a
+command looks at through the mount - named with `@/` or not - becomes one
+of its inputs, as anything it looks at in the source does (see
+[Inputs](#inputs)): it is rebuilt whenever an output it opened goes out of
+date, an output it found missing is declared, a directory of outputs it
+listed gains or loses one, or a directory of outputs it looked at goes.
 
 An output is assigned an action and what that action applies to. With
 `run` the command writes the output itself, to the path `%out` stands
@@ -158,6 +161,39 @@ meanwhile - so it can reread as often as suits it. Between reads, the
 size it reports before being opened may be out of date. A command that
 reads a `status` output gets what it showed then, and its output is not
 rebuilt as the report changes.
+
+## Inputs
+
+Every command runs traced, and everything it looks at in the manifest's
+directory becomes one of its inputs - whatever tool it runs, and whatever
+that starts in turn:
+
+- each file it reads, or only looks at the size or modification time of;
+- each directory it lists, looks at the attributes of, or passes through on
+  the way to something beneath it; and
+- each path it looks for and finds nothing at.
+
+An output is rebuilt whenever what it saw of an input changes:
+
+- a file's content, which its modification time and size stand in for, so
+  touching a file rebuilds what read it, even if its content is the same;
+- a directory's entries, if it listed it: the names of the files and
+  directories directly in it, so adding, removing or renaming one rebuilds
+  what listed it, but writing a file in it, or touching the directory
+  itself, does not;
+- a directory going, or becoming a file, if it only looked at it - which is
+  all that looking at a directory without listing it shows;
+- a path found missing appearing - as a file, or as a directory, or inside
+  a directory that appears.
+
+On Windows, a listing also shows each file's size and modification time.
+They are not part of a directory's value there either, so a tool that
+decides what is out of date from a listing alone, without looking at the
+files, is not rebuilt when one of them is rewritten.
+
+Commands are expected to run and exit. A long-lived service that learns of
+changes without looking at the files again - a file watcher or a compile
+server, say - is not supported, as what it learns is not traced.
 
 ## Rules
 
@@ -378,8 +414,10 @@ Windows defers WinFsp transactions. Unmount cancels pending requests.
 Every successful build is kept in the build directory's `.makebelieve`,
 beside its `mount` - `makebelieve mount ../output` keeps builds in
 `../output/.makebelieve`. With each output it keeps the command that built
-it and what each input it read looked like: a source file's modification
-time and size, or the content of an output read through the mount. The
+it and what each input looked like: a source file's modification time and
+size, a directory's entries if it was listed, or that one was there if it
+was only looked at, that nothing was there, or the content of an output
+read through the mount. The
 mount serves each output from the file kept there, rather than holding it
 in memory, so outputs larger than memory are fine; a reader that opened an
 output goes on reading the build it opened even once a rebuild replaces
@@ -394,9 +432,12 @@ When `mount` starts, an output is served as already built, without running
 anything, if
 
 - its rule is still in the manifest, with the same command;
-- every source file it read has the same modification time and size; and
+- every source file it looked at has the same modification time and size,
+  every directory it looked at has the same entries, and every path it
+  found missing is still missing; and
 - every output it read is itself served as already built, with the content
-  it read.
+  it read, and every output path it looked at is still what it was: a
+  directory of the same outputs, or not declared.
 
 Every other output is built on its next open, as usual, and its old build is
 discarded, as is the build of any output no longer in the manifest. The

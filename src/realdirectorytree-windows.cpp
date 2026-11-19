@@ -82,56 +82,87 @@ EntryInfo make_info(DWORD attributes,
                   to_file_time(last_write)};
 }
 
+// Notes in @a diff everything beneath @a relative, under @a root, as added,
+// if it is a real directory. Not through a symlink, which keeps a cycle from
+// looping here, and best-effort: a directory gone again already has nothing
+// in it to report.
+void add_contents(const std::filesystem::path& root,
+                  const std::filesystem::path& relative,
+                  DirectoryTreeDiff& diff) {
+  std::error_code error;
+  const std::filesystem::path absolute = root / relative;
+  if (!std::filesystem::is_directory(
+          std::filesystem::symlink_status(absolute, error))) {
+    return;
+  }
+  for (std::filesystem::recursive_directory_iterator it(absolute, error), end;
+       !error && it != end; it.increment(error)) {
+    diff.note(relative / it->path().lexically_relative(absolute),
+              DirectoryTreeDiff::Reason::added);
+  }
+}
+
 // Walks the FILE_NOTIFY_INFORMATION chain into a diff.
 //
 // Three details of that structure are each easy to get wrong: FileName is
 // relative to the watch root, FileNameLength counts bytes rather than
 // characters, and the name is not null-terminated.
 //
-// Every record names something whose own identity moved, so each one lands
-// in entries_changed regardless of action. Only appearing and disappearing
-// changes a *parent's* child list, so those four actions additionally mark
-// the parent. A plain write does not: the name set is untouched.
+// Each record's action says why its path changed: added, removed, or - for a
+// write - modified, with a rename one of each. Appearing and disappearing
+// change the parent's entries too, so mark it modified. Repeated records for
+// one path collapse, keeping the reason that says the most.
 //
-// Because both lists are sets, the action no longer needs classifying and
-// repeated records for one path collapse on their own - a file created and
-// then written in the same batch is one entry, and a rename is simply two
-// paths that both moved.
-//
-// Directories land in entries_changed alongside files. The notification
-// carries no way to tell them apart, and stat-ing each one to find out
-// would cost a round trip per change.
-DirectoryTreeDiff parse_changes(const std::byte* buffer, DWORD bytes) {
-  // Ordered sets: one directory gaining a thousand entries has to collapse
-  // to a single child_lists_changed entry, and sorted output is what
-  // makes each list cheap to merge against state a subscriber already holds.
-  std::set<std::filesystem::path> files;
-  std::set<std::filesystem::path> directories;
+// The notification carries no way to tell directories from files, so two
+// kinds of record are looked at under @a root: one that appeared, since a
+// directory that appears may have arrived full, moved in whole, and Windows
+// names only the directory, so everything already in it is added too; and
+// one modified, since a directory's own modification time or attributes
+// changing - as they do each time an entry is added to it - is no change to
+// its value, its entries.
+DirectoryTreeDiff parse_changes(const std::filesystem::path& root,
+                                const std::byte* buffer,
+                                DWORD bytes) {
+  // Ordered: one directory gaining a thousand entries is named once, and
+  // sorted output is what makes it cheap to merge against state a subscriber
+  // already holds.
+  DirectoryTreeDiff diff;
 
   for (DWORD offset = 0; offset < bytes;) {
     // Each record is DWORD-aligned by the kernel and the buffer itself came
     // from the allocator, so this is suitably aligned to read through.
     const auto* record =
         reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buffer + offset);
-    const std::wstring_view name(record->FileName,
-                                 record->FileNameLength / sizeof(WCHAR));
-    const auto it = files.emplace(name).first;
+    const std::filesystem::path name(std::wstring_view(
+        record->FileName, record->FileNameLength / sizeof(WCHAR)));
 
     switch (record->Action) {
       case FILE_ACTION_ADDED:
-      case FILE_ACTION_REMOVED:
-      case FILE_ACTION_RENAMED_OLD_NAME:
       case FILE_ACTION_RENAMED_NEW_NAME:
+        diff.note(name, DirectoryTreeDiff::Reason::added);
+        add_contents(root, name, diff);
         // parent_path() of a root-level entry is the empty path, which is
         // exactly how the interface spells the tree root.
-        directories.emplace(it->parent_path());
+        diff.note(name.parent_path(),
+                  DirectoryTreeDiff::Reason::entries_changed);
         break;
-      case FILE_ACTION_MODIFIED:
+      case FILE_ACTION_MODIFIED: {
+        // One gone again by now was a file, or is reported otherwise.
+        const DWORD attributes = ::GetFileAttributesW((root / name).c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES ||
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+          diff.note(name, DirectoryTreeDiff::Reason::modified);
+        }
+        break;
+      }
+      case FILE_ACTION_REMOVED:
+      case FILE_ACTION_RENAMED_OLD_NAME:
       default:
-        // Anything unrecognised has already been recorded in entries_changed,
-        // which is the conservative half. Leaving the parent alone risks
-        // missing a listing change, so if an unknown action ever shows up
-        // that is the direction to widen.
+        // An action never seen before is taken as the one that says the
+        // most, which is the conservative side.
+        diff.note(name, DirectoryTreeDiff::Reason::removed);
+        diff.note(name.parent_path(),
+                  DirectoryTreeDiff::Reason::entries_changed);
         break;
     }
 
@@ -140,12 +171,6 @@ DirectoryTreeDiff parse_changes(const std::byte* buffer, DWORD bytes) {
     }
     offset += record->NextEntryOffset;
   }
-
-  DirectoryTreeDiff diff;
-  diff.entries_changed.assign(std::make_move_iterator(files.begin()),
-                              std::make_move_iterator(files.end()));
-  diff.child_lists_changed.assign(std::make_move_iterator(directories.begin()),
-                                  std::make_move_iterator(directories.end()));
   return diff;
 }
 
@@ -431,7 +456,7 @@ void RealDirectoryTree::Impl::on_change() const {
   // there is nothing to hand over but the blanket signal.
   const DirectoryTreeDiff diff =
       bytes == 0 ? DirectoryTreeDiff{.everything_dirty = true}
-                 : parse_changes(m_buffer.data(), bytes);
+                 : parse_changes(m_root, m_buffer.data(), bytes);
 
   // The next read goes out before anyone hears of this one, so nothing that
   // changes while they react is missed. A read that will not issue leaves the
@@ -461,12 +486,14 @@ RealDirectoryTree::RealDirectoryTree(const std::filesystem::path& root,
 RealDirectoryTree::~RealDirectoryTree() = default;
 
 std::expected<EntryInfo, std::error_code> RealDirectoryTree::status(
-    const std::filesystem::path& path) const {
+    const std::filesystem::path& path,
+    const OpenContext& /*context*/) const {
   return m_impl->status(path);
 }
 
 std::expected<std::vector<TreeEntry>, std::error_code> RealDirectoryTree::ls(
-    const std::filesystem::path& path) const {
+    const std::filesystem::path& path,
+    const OpenContext& /*context*/) const {
   return m_impl->ls(path);
 }
 

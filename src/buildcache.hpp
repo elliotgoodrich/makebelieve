@@ -43,19 +43,33 @@ namespace makebelieve {
 /// Thread-safe: every member may be called from any thread.
 class BuildCache {
  public:
-  /// What an input looked like when the output that read it was built.
+  /// What an input looked like when the output that read it was built: a
+  /// stamp of whatever was at its path, cheap to take again and compare.
   struct Input {
-    /// A source file or directory, relative to the source tree's root, or
-    /// `@/` and the output that was read.
+    /// The @link size of a directory, whose mtime is zero, and whose
+    /// @link hash is that of its entries, as @link hash_entries works it out,
+    /// if it was listed - or empty if it was only looked at, as there being
+    /// a directory there is all that was seen of it.
+    static constexpr std::int64_t k_directory = -1;
+
+    /// The @link size of a path with nothing there, whose mtime is zero and
+    /// hash empty.
+    static constexpr std::int64_t k_missing = -2;
+
+    /// A source path, relative to the source tree's root, or `@/` and the
+    /// path of an output or a directory of them (`@` alone for the root of
+    /// the outputs).
     std::filesystem::path path;
 
-    /// For a source file or directory: its mtime as @link raw_mtime counts
-    /// it, and its size - `-1` for a directory. Zero for an output.
+    /// For a source file: its mtime as @link raw_mtime counts it, and its
+    /// size - which stand in for its content, which is never hashed. Zero
+    /// for an output. For a directory or a missing path, zero and
+    /// @link k_directory or @link k_missing.
     std::int64_t mtime = 0;
     std::int64_t size = 0;
 
-    /// For an output: the hash of the content that was read. Empty for a
-    /// source file or directory.
+    /// For an output: the hash of the content that was read. For a
+    /// directory that was listed: the hash of its entries. Empty otherwise.
     std::string hash;
 
     [[nodiscard]] friend bool operator==(const Input&, const Input&) = default;
@@ -160,6 +174,12 @@ class BuildCache {
   /// @a time as an Input stores it.
   [[nodiscard]] static std::int64_t raw_mtime(
       std::chrono::file_clock::time_point time);
+
+  /// The hash of a directory holding @a entries - its value - whatever order
+  /// they come in: of each one's name and whether it is a directory. Nothing
+  /// else an entry shows counts, however a listing came by it.
+  [[nodiscard]] static std::string hash_entries(
+      std::span<const TreeEntry> entries);
 
  private:
   std::filesystem::path m_directory;
