@@ -21,8 +21,8 @@ find_package(Threads REQUIRED)
 include(FetchContent)
 FetchContent_Declare(
   stdexec
-  URL https://github.com/NVIDIA/stdexec/archive/ead186b1d8db3ebe37a946ff84a6ce08bf795153.tar.gz
-  URL_HASH SHA256=df8570088f9221ce79570d857aa3d481dd7eaa583102fb76ffacce1c09f82e88
+  URL https://github.com/NVIDIA/stdexec/archive/5afe072bc89627cf5e0b960ee588ee28259fca33.tar.gz
+  URL_HASH SHA256=5a12deff9072068064bdd66c8609afc13fcc9d9dc3af5033bec1f97041a10609
   # A missing directory, so stdexec is only downloaded and its CMakeLists never runs, see https://cmake.org/cmake/help/latest/module/FetchContent.html#populating-content-without-adding-it-to-the-build
   SOURCE_SUBDIR do-not-configure
 )
