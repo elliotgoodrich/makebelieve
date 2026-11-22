@@ -15,6 +15,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -68,24 +69,63 @@ class TreeEntry {
 /// \class DirectoryTreeDiff
 /// Describes a change in between states of a DirectoryTree.  Paths are
 /// relative to the tree root; the root itself is the empty path.
+///
+/// A diff says what a consumer must treat as out of date, in three sets that
+/// are independent of each other, so that combining two diffs is a union:
+///
+/// | Change            | changed_paths | changed_listings | changed_subtrees |
+/// |-------------------|---------------|------------------|------------------|
+/// | file written      | it            |                  |                  |
+/// | file/dir created  |               | its parent       | it               |
+/// | file/dir deleted  |               | its parent       | it               |
+/// | file/dir renamed  |               | both parents     | old and new      |
+/// | dir mtime/attrs   |               |                  |                  |
+///
+/// A path in `changed_subtrees` came or went, so nothing at or beneath it can
+/// be assumed to be as it was - and it need not be said what is beneath it,
+/// which by then may be gone, or may be a whole directory that was moved in.
+///
+/// False positives are allowed: a path may be named that did not really
+/// change, such as a file rewritten with the same bytes, or whose
+/// modification time alone moved, since telling those apart would mean
+/// reading it. They cost the consumer work, so are best avoided where that
+/// is cheap. A change that is not reported is never allowed.
 class DirectoryTreeDiff {
  public:
   /// Set when the tree lost track of what changed and everything could
-  /// be dirty.  If this is true then the below entries are empty.
+  /// be dirty.  If this is true then the sets below are empty.
   bool everything_dirty = false;
 
-  /// Paths whose own identity changed: files added, written or deleted,
-  /// and directories added or deleted. A cached status() or read() for any
-  /// of these is stale.
-  std::vector<std::filesystem::path> entries_changed;
+  /// Files whose content changed where they are.
+  std::set<std::filesystem::path> changed_paths;
 
-  /// Directories whose set of children changed. A cached ls() for any of
-  /// these is stale.
-  ///
-  /// This also implies the directory's own status() is stale, since adding
-  /// or removing an entry moves the directory's mtime. Those directories
-  /// are deliberately not repeated in entries_changed.
-  std::vector<std::filesystem::path> child_lists_changed;
+  /// Directories that are still there but whose entries changed.
+  std::set<std::filesystem::path> changed_listings;
+
+  /// Paths that came or went, along with anything beneath them.
+  std::set<std::filesystem::path> changed_subtrees;
+
+  /// Whether this says nothing has changed.
+  [[nodiscard]] bool empty() const {
+    return !everything_dirty && changed_paths.empty() &&
+           changed_listings.empty() && changed_subtrees.empty();
+  }
+
+  /// Whether what is at @a path is named as changed, in any of the sets or by
+  /// lying in a changed subtree.
+  [[nodiscard]] bool changes(const std::filesystem::path& path) const {
+    if (changed_paths.contains(path) || changed_listings.contains(path)) {
+      return true;
+    }
+    for (std::filesystem::path at = path;; at = at.parent_path()) {
+      if (changed_subtrees.contains(at)) {
+        return true;
+      }
+      if (at.empty() || at == at.parent_path()) {
+        return false;
+      }
+    }
+  }
 };
 
 /// \class Subscription
@@ -170,13 +210,24 @@ class DirectoryTree {
 
   /// Returns entry at @a path, or an error_code when it is missing,
   /// unreachable, or escapes the root.
+  ///
+  /// @a context identifies the requester, as for open(). A tree that depends
+  /// on who looks at what, as a `BuildDirectoryTree` does, takes a look on
+  /// behalf of a requester as one of what that requester depends on, which
+  /// may read `/proc` to find out who it is - so call it for a requester
+  /// holding no lock. A look on nobody's behalf, such as one a tree or a
+  /// mount makes for its own ends, passes no requester.
   [[nodiscard]] virtual std::expected<EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const = 0;
+      const std::filesystem::path& path,
+      const OpenContext& context = {}) const = 0;
 
   /// Returns the children of @a path, or an error_code when it cannot be
   /// listed. An existing but empty directory yields an empty vector.
+  /// @a context is as for status(): a listing for a requester depends on the
+  /// directory's entries.
   [[nodiscard]] virtual std::expected<std::vector<TreeEntry>, std::error_code>
-  ls(const std::filesystem::path& path) const = 0;
+  ls(const std::filesystem::path& path,
+     const OpenContext& context = {}) const = 0;
 
   /// Opens @a path and retains its file identity for the life of the handle.
   /// Returns `is_a_directory` for a directory. @a context identifies the

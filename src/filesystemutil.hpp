@@ -38,6 +38,14 @@ struct FileSystemUtil {
       const std::filesystem::path& path,
       const std::function<std::expected<std::string, std::error_code>()>& next);
 
+  /// @a path in the form to compare with others to tell whether they name the
+  /// same thing as a filesystem would: as it is on Linux, and with its case
+  /// folded on Windows, where a directory usually ignores case. So on Windows
+  /// two paths in a case-sensitive directory can share a key, which only
+  /// costs whatever keeps them the work of treating them as one.
+  [[nodiscard]] static std::filesystem::path path_key(
+      const std::filesystem::path& path);
+
   /// Attempts to hide the existing file or directory @a path from listings
   /// that skip hidden entries, returning the error that stopped it, if any.
   [[nodiscard]] static std::error_code hide(const std::filesystem::path& path);

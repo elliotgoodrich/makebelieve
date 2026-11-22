@@ -65,12 +65,14 @@ class SharedHandleTree final : public DirectoryTree {
   }
 
   [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_tree.status(path);
   }
 
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_tree.ls(path);
   }
 

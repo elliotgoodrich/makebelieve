@@ -31,10 +31,12 @@
 #include <fstream>
 #include <future>
 #include <ios>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -54,6 +56,15 @@ BuildResult built(std::string bytes) {
   return BuildOutput{.content = std::move(bytes), .inputs = {}};
 }
 
+// Adds to @a named every path @a diff names, once each and in order.
+void append_named(std::vector<std::filesystem::path>& named,
+                  const DirectoryTreeDiff& diff) {
+  std::set<std::filesystem::path> paths = diff.changed_paths;
+  paths.insert(diff.changed_listings.begin(), diff.changed_listings.end());
+  paths.insert(diff.changed_subtrees.begin(), diff.changed_subtrees.end());
+  named.insert(named.end(), paths.begin(), paths.end());
+}
+
 // A build that has already finished with @a result, completing as soon as it
 // is started.
 BuildSender finished(BuildResult result) {
@@ -71,8 +82,7 @@ CommandRunner returning(std::string output) {
 // A runner that reports a fixed set of traced @a inputs alongside its output,
 // and whose output ("build N") reflects how many times it has run, so a rebuild
 // is observable. @a runs is bumped on every invocation.
-CommandRunner counting_with_inputs(int& runs,
-                                   std::vector<std::filesystem::path> inputs) {
+CommandRunner counting_with_inputs(int& runs, std::vector<Input> inputs) {
   return [&runs, inputs = std::move(inputs)](Command /*command*/) {
     ++runs;
     return finished(BuildOutput{.content = "build " + std::to_string(runs),
@@ -84,7 +94,7 @@ CommandRunner counting_with_inputs(int& runs,
 // of its own in @a directory, as a real runner does, rather than giving bytes.
 CommandRunner counting_into_files(int& runs,
                                   std::filesystem::path directory,
-                                  std::vector<std::filesystem::path> inputs) {
+                                  std::vector<Input> inputs) {
   return [&runs, directory = std::move(directory),
           inputs = std::move(inputs)](Command /*command*/) {
     ++runs;
@@ -173,18 +183,21 @@ class DeferredRunner {
       // complete and leaves that to the block below.
       m_on_stop.emplace(stdexec::get_stop_token(stdexec::get_env(m_receiver)),
                         OnStop{this});
+      // Its own copy, as once queued this build may be completed and destroyed
+      // by another thread before the notification below.
+      const std::shared_ptr<State> state = m_state;
       bool stopped = false;
       {
-        const std::lock_guard lock(m_state->mutex);
-        ++m_state->runs;
+        const std::lock_guard lock(state->mutex);
+        ++state->runs;
         stopped = m_stopped_early;
         if (stopped) {
-          ++m_state->stopped;
+          ++state->stopped;
         } else {
-          m_state->pending.push_back(this);
+          state->pending.push_back(this);
         }
       }
-      m_state->started.notify_all();
+      state->started.notify_all();
       if (stopped) {
         complete_stopped();
       }
@@ -543,7 +556,7 @@ TEST_F(BuildDirectoryTreeTest,
   std::map<std::string, int> runs;
   const BuildDirectoryTree tree(source, [&runs](Command command) {
     const int run = ++runs[command.text];
-    std::vector<std::filesystem::path> inputs;
+    std::vector<Input> inputs;
     if (command.text == "first %out") {
       inputs = {"input.txt"};
     } else {
@@ -825,8 +838,7 @@ TEST_F(BuildDirectoryTreeTest, AnEagerRebuildNotifiesSubscribers) {
   std::vector<std::filesystem::path> changed;
   const Subscription subscription =
       tree.subscribe_to_changes([&changed](const DirectoryTreeDiff& diff) {
-        changed.insert(changed.end(), diff.entries_changed.begin(),
-                       diff.entries_changed.end());
+        append_named(changed, diff);
       });
 
   source.write_file("input.txt", "v2");  // eager rebuild -> notification
@@ -880,9 +892,8 @@ TEST_F(BuildDirectoryTreeTest, ARebuildRefreshesTheTrackedInputs) {
   // The first build reads a.txt; every rebuild thereafter reads b.txt instead.
   const BuildDirectoryTree tree(source, [&runs](Command) {
     ++runs;
-    std::vector<std::filesystem::path> inputs =
-        runs == 1 ? std::vector<std::filesystem::path>{"a.txt"}
-                  : std::vector<std::filesystem::path>{"b.txt"};
+    std::vector<Input> inputs =
+        runs == 1 ? std::vector<Input>{"a.txt"} : std::vector<Input>{"b.txt"};
     return finished(BuildOutput{.content = "build " + std::to_string(runs),
                                 .inputs = std::move(inputs)});
   });
@@ -1209,11 +1220,13 @@ class FlakyTree : public DirectoryTree {
   std::atomic<bool> fail_reads = false;
 
   [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return inner.status(path);
   }
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return inner.ls(path);
   }
   [[nodiscard]] makebelieve::OpenSender open(
@@ -1426,9 +1439,9 @@ TEST_F(BuildDirectoryTreeTest, ChangingAnInputOfAFailedBuildRetriesIt) {
   const BuildDirectoryTree tree(source, [&](const Command& command) {
     ++runs[command.text];
     const bool compiles = command.text.starts_with("compile");
-    std::vector<std::filesystem::path> inputs = {
-        compiles ? std::filesystem::path("source.txt")
-                 : std::filesystem::path("@") / "compiled.txt"};
+    std::vector<Input> inputs = {compiles ? std::filesystem::path("source.txt")
+                                          : std::filesystem::path("@") /
+                                                "compiled.txt"};
     return finished(
         broken ? BuildResult(std::unexpected(
                      BuildFailure(exit_status_error(1), std::move(inputs))))
@@ -1794,8 +1807,7 @@ TEST_F(BuildDirectoryTreeTest, AStatusOutputIsAnnouncedOnceAfterEachRead) {
   std::vector<std::filesystem::path> changed;
   const Subscription subscription =
       tree.subscribe_to_changes([&changed](const DirectoryTreeDiff& diff) {
-        changed.insert(changed.end(), diff.entries_changed.begin(),
-                       diff.entries_changed.end());
+        append_named(changed, diff);
       });
 
   read_output(tree, "status.txt");
@@ -1836,8 +1848,7 @@ TEST_F(BuildDirectoryTreeTracingTest,
   std::vector<std::filesystem::path> changed;
   const Subscription subscription =
       tree.subscribe_to_changes([&changed](const DirectoryTreeDiff& diff) {
-        changed.insert(changed.end(), diff.entries_changed.begin(),
-                       diff.entries_changed.end());
+        append_named(changed, diff);
       });
 
   read_output(tree, "status.txt");
@@ -2019,8 +2030,7 @@ TEST_F(BuildDirectoryTreeTest, AStatusOutputCanBeReadWhenItIsAnnounced) {
   std::vector<std::string> seen;
   const Subscription subscription =
       tree.subscribe_to_changes([&](const DirectoryTreeDiff& diff) {
-        if (std::ranges::contains(diff.entries_changed,
-                                  std::filesystem::path("status.txt"))) {
+        if (diff.changes(std::filesystem::path("status.txt"))) {
           seen.push_back(read_output(tree, "status.txt"));
         }
       });
@@ -2061,8 +2071,7 @@ TEST_F(BuildDirectoryTreeTest, AStatusChangeDuringAnAnnouncementIsAnnounced) {
   bool held = false;
   const Subscription subscription =
       tree.subscribe_to_changes([&](const DirectoryTreeDiff& diff) {
-        if (!std::ranges::contains(diff.entries_changed,
-                                   std::filesystem::path("status.txt"))) {
+        if (!diff.changes(std::filesystem::path("status.txt"))) {
           return;
         }
         // The first time a's failure is announced, b fails before the
@@ -2121,8 +2130,7 @@ TEST_F(BuildDirectoryTreeTest,
   std::vector<std::string> seen;
   const Subscription subscription =
       tree.subscribe_to_changes([&](const DirectoryTreeDiff& diff) {
-        if (std::ranges::contains(diff.entries_changed,
-                                  std::filesystem::path("status.txt"))) {
+        if (diff.changes(std::filesystem::path("status.txt"))) {
           seen.push_back(read_output(other, "status.txt"));
         }
       });
@@ -2183,16 +2191,14 @@ TEST_F(BuildDirectoryTreeTest, TreesReadingEachOthersStatusDoNotDeadlock) {
   bool other_told = false;
   const Subscription a_subscription =
       tree.subscribe_to_changes([&](const DirectoryTreeDiff& diff) {
-        if (std::ranges::contains(diff.entries_changed,
-                                  std::filesystem::path("status.txt")) &&
+        if (diff.changes(std::filesystem::path("status.txt")) &&
             !std::exchange(tree_told, true)) {
           meet_then_read(other);
         }
       });
   const Subscription x_subscription =
       other.subscribe_to_changes([&](const DirectoryTreeDiff& diff) {
-        if (std::ranges::contains(diff.entries_changed,
-                                  std::filesystem::path("status.txt")) &&
+        if (diff.changes(std::filesystem::path("status.txt")) &&
             !std::exchange(other_told, true)) {
           meet_then_read(tree);
         }
@@ -2395,15 +2401,14 @@ TEST_F(BuildDirectoryTreeTracingTest, RewritingATracingOutputIsNotAnnounced) {
   std::vector<std::filesystem::path> changed;
   const Subscription subscription =
       tree.subscribe_to_changes([&changed](const DirectoryTreeDiff& diff) {
-        changed.insert(changed.end(), diff.entries_changed.begin(),
-                       diff.entries_changed.end());
+        append_named(changed, diff);
       });
 
   write_manifest(
       "@/output.txt = run build %out\n"
       "@/trace.json = tracing\n");
-  ASSERT_EQ(changed.size(), 1U);
-  EXPECT_EQ(changed[0], std::filesystem::path("trace.json"));
+  // It appearing changes the root's entries too.
+  EXPECT_EQ(changed, (std::vector<std::filesystem::path>{"", "trace.json"}));
 
   changed.clear();
   read_output(tree, "trace.json");
@@ -2801,8 +2806,7 @@ TEST_F(BuildDirectoryTreeTest, AConflictStartingAndEndingIsAnnounced) {
   std::vector<std::filesystem::path> changed;
   const Subscription subscription =
       tree.subscribe_to_changes([&changed](const DirectoryTreeDiff& diff) {
-        changed.insert(changed.end(), diff.entries_changed.begin(),
-                       diff.entries_changed.end());
+        append_named(changed, diff);
       });
   const std::filesystem::path index =
       std::filesystem::path("site") / "index.html";
@@ -3233,10 +3237,12 @@ TEST_F(BuildDirectoryTreeCacheTest, AStatusOutputIsNeverKept) {
   EXPECT_TRUE(recorded().empty());
 }
 
-// A failed build is not kept; one with an input that cannot be stamped is not
-// either.
+// A failed build is not kept; one that looked at an output not yet built,
+// which has nothing to stamp it by, is not either.
 TEST_F(BuildDirectoryTreeCacheTest, OnlyBuildsThatCanBeCheckedAreKept) {
-  write_manifest("@/failed.txt = run x %out\n@/missing.txt = run y %out\n");
+  write_manifest(
+      "@/failed.txt = run x %out\n@/unbuilt.txt = run y %out\n"
+      "@/stats.txt = run z %out\n");
   const BuildDirectoryTree tree(
       source,
       [](const Command& command) -> BuildSender {
@@ -3244,13 +3250,138 @@ TEST_F(BuildDirectoryTreeCacheTest, OnlyBuildsThatCanBeCheckedAreKept) {
           return finished(
               std::unexpected(std::make_error_code(std::errc::io_error)));
         }
-        return finished(BuildOutput{.content = std::string("y"),
-                                    .inputs = {"no-such-input.txt"}});
+        return finished(BuildOutput{.content = std::string("z"),
+                                    .inputs = {"@/unbuilt.txt"}});
       },
       {}, &*cache);
   EXPECT_FALSE(DirectoryTreeUtil::open(tree, "failed.txt").has_value());
-  read_output(tree, "missing.txt");
+  read_output(tree, "stats.txt");
   EXPECT_TRUE(recorded().empty());
+}
+
+// A path found missing is kept as missing: still missing on the next run, the
+// build is served; there by then, it is built afresh.
+TEST_F(BuildDirectoryTreeCacheTest, AMissingInputIsCheckedOnResume) {
+  write_manifest("@/output.txt = run build %out\n");
+  int runs = 0;
+  {
+    const BuildDirectoryTree tree(
+        source, counting_with_inputs(runs, {"missing.h"}), {}, &*cache);
+    EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+  }
+  {
+    const BuildDirectoryTree tree(
+        source, counting_with_inputs(runs, {"missing.h"}), {}, &reopen());
+    EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+  }
+
+  source.write_file("missing.h", "here now");
+  const BuildDirectoryTree tree(
+      source, counting_with_inputs(runs, {"missing.h"}), {}, &reopen());
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 2");
+}
+
+// A directory listed is kept by its entries: one added while nothing watched
+// builds afresh, but a file in it rewritten - or the directory's own mtime
+// moving - does not.
+TEST_F(BuildDirectoryTreeCacheTest, AListedDirectoryIsCheckedByItsEntries) {
+  source.make_directory("src");
+  source.write_file("src/a.txt", "a");
+  write_manifest("@/output.txt = run ls src %out\n");
+  int runs = 0;
+  const std::vector<Input> inputs = {Input("src", true)};
+  {
+    const BuildDirectoryTree tree(source, counting_with_inputs(runs, inputs),
+                                  {}, &*cache);
+    EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+  }
+
+  source.write_file("src/a.txt", "rewritten");
+  source.set_mtime("src",
+                   std::chrono::file_clock::now() + std::chrono::hours(1));
+  {
+    const BuildDirectoryTree tree(source, counting_with_inputs(runs, inputs),
+                                  {}, &reopen());
+    EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+  }
+
+  source.write_file("src/b.txt", "b");
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, inputs), {},
+                                &reopen());
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 2");
+}
+
+// A directory only looked at is kept by there being one there: one added to
+// while nothing watched still holds, but one gone builds afresh.
+TEST_F(BuildDirectoryTreeCacheTest, AStattedDirectoryIsCheckedByBeingThere) {
+  source.make_directory("src");
+  write_manifest("@/output.txt = run test -d src %out\n");
+  int runs = 0;
+  {
+    const BuildDirectoryTree tree(source, counting_with_inputs(runs, {"src"}),
+                                  {}, &*cache);
+    EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+  }
+
+  source.write_file("src/b.txt", "b");
+  {
+    const BuildDirectoryTree tree(source, counting_with_inputs(runs, {"src"}),
+                                  {}, &reopen());
+    EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+  }
+
+  source.remove("src");
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, {"src"}), {},
+                                &reopen());
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 2");
+}
+
+// A file only statted is kept by its mtime and size, as one read is: one
+// touched while nothing watched builds afresh.
+TEST_F(BuildDirectoryTreeCacheTest,
+       AStattedFileIsCheckedByItsModificationTime) {
+  source.write_file("input.txt", "v1");
+  write_manifest("@/output.txt = run test -e input.txt %out\n");
+  int runs = 0;
+  {
+    const BuildDirectoryTree tree(
+        source, counting_with_inputs(runs, {"input.txt"}), {}, &*cache);
+    EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+  }
+
+  source.set_mtime("input.txt",
+                   std::chrono::file_clock::now() + std::chrono::hours(1));
+  const BuildDirectoryTree tree(
+      source, counting_with_inputs(runs, {"input.txt"}), {}, &reopen());
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 2");
+}
+
+// An output path looked up through the mount and found missing, or a
+// directory of outputs listed there, is kept as what it was, and checked
+// against the outputs the manifest declares on the next run.
+TEST_F(BuildDirectoryTreeCacheTest, OutputPathsLookedAtAreCheckedOnResume) {
+  write_manifest("@/output.txt = run build %out\n@/site/a.html = run a %out\n");
+  int runs = 0;
+  const std::vector<Input> inputs = {"@/later.txt", Input("@/site", true),
+                                     Input("@", true)};
+  {
+    const BuildDirectoryTree tree(source, counting_with_inputs(runs, inputs),
+                                  {}, &*cache);
+    EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+    EXPECT_EQ(recorded().size(), 1U);
+  }
+  {
+    const BuildDirectoryTree tree(source, counting_with_inputs(runs, inputs),
+                                  {}, &reopen());
+    EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+  }
+
+  write_manifest(
+      "@/output.txt = run build %out\n@/site/a.html = run a %out\n"
+      "@/site/b.html = run b %out\n");
+  const BuildDirectoryTree tree(source, counting_with_inputs(runs, inputs), {},
+                                &reopen());
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 2");
 }
 
 // A path that became a conflict while nothing watched is not served from what
@@ -3276,6 +3407,386 @@ TEST_F(BuildDirectoryTreeCacheTest, AConflictIsNeverServedFromTheCache) {
   const BuildDirectoryTree tree(source, returning("built"), {}, &reopen());
   EXPECT_EQ(open_error(tree, "site/index.html"), std::errc::io_error);
   EXPECT_TRUE(recorded().empty());
+}
+
+// What a build depends on is the value of each path it looked at: a file's
+// content, that a directory is there - and, of one it listed, its entries -
+// or that nothing is there. Each test below has a build look at one path,
+// then changes the source.
+class BuildDirectoryTreeInputTest : public BuildDirectoryTreeTest {
+ protected:
+  int runs = 0;
+
+  // A tree whose one output looked at @a input, read once so it is built
+  // and rebuilt eagerly as that changes.
+  std::unique_ptr<BuildDirectoryTree> built_reading(const Input& input) {
+    write_manifest("@/output.txt = run build %out\n");
+    auto tree = std::make_unique<BuildDirectoryTree>(
+        source, counting_with_inputs(runs, {input}));
+    EXPECT_EQ(read_output(*tree, "output.txt"), "build 1");
+    return tree;
+  }
+};
+
+TEST_F(BuildDirectoryTreeInputTest, ANewFileInAListedDirectoryRebuilds) {
+  source.make_directory("src");
+  source.write_file("src/a.txt", "a");
+  const auto tree = built_reading(Input("src", true));
+
+  source.write_file("src/b.txt", "b");
+  EXPECT_EQ(runs, 2);
+}
+
+TEST_F(BuildDirectoryTreeInputTest, AFileRemovedFromAListedDirectoryRebuilds) {
+  source.make_directory("src");
+  source.write_file("src/a.txt", "a");
+  const auto tree = built_reading(Input("src", true));
+
+  source.remove("src/a.txt");
+  EXPECT_EQ(runs, 2);
+}
+
+TEST_F(BuildDirectoryTreeInputTest, ANewDirectoryInAListedDirectoryRebuilds) {
+  source.make_directory("src");
+  const auto tree = built_reading(Input("src", true));
+
+  source.make_directory("src/sub");
+  EXPECT_EQ(runs, 2);
+}
+
+// A directory's value is its entries, which a file in it being rewritten, or
+// the directory's own mtime moving, leaves alone.
+TEST_F(BuildDirectoryTreeInputTest, ARewriteInAListedDirectoryDoesNotRebuild) {
+  source.make_directory("src");
+  source.write_file("src/a.txt", "a");
+  const auto tree = built_reading(Input("src", true));
+
+  source.write_file("src/a.txt", "rewritten");
+  source.set_mtime("src",
+                   std::chrono::file_clock::now() + std::chrono::hours(1));
+  EXPECT_EQ(runs, 1);
+}
+
+TEST_F(BuildDirectoryTreeInputTest, ANewFileAtTheListedRootRebuilds) {
+  const auto tree = built_reading(Input("", true));
+
+  source.write_file("new.txt", "new");
+  EXPECT_EQ(runs, 2);
+}
+
+TEST_F(BuildDirectoryTreeInputTest, CreatingAPathFoundMissingRebuilds) {
+  const auto tree = built_reading("missing.h");
+
+  source.write_file("missing.h", "here now");
+  EXPECT_EQ(runs, 2);
+}
+
+// A directory that appears may have arrived full, and is not gone through to
+// find out, so what found a path beneath it missing rebuilds; as it does once
+// the path itself appears.
+TEST_F(BuildDirectoryTreeInputTest, AMissingPathRebuildsAsADirectoryAppears) {
+  const auto tree =
+      built_reading(std::filesystem::path("generated") / "missing.h");
+
+  source.make_directory("generated");
+  EXPECT_EQ(runs, 2);
+
+  source.write_file("generated/missing.h", "here now");
+  EXPECT_EQ(runs, 3);
+}
+
+// A path found missing keeps the case it was asked for, and the file that
+// then appears has the case it was made with. They are one path wherever the
+// filesystem ignores case.
+TEST_F(BuildDirectoryTreeInputTest, AMissingPathMatchesAsTheFilesystemDoes) {
+  const auto tree = built_reading("CONFIG.H");
+
+  source.write_file("config.h", "here now");
+#ifdef _WIN32
+  EXPECT_EQ(runs, 2);
+#else
+  EXPECT_EQ(runs, 1);
+#endif
+}
+
+// A directory that goes takes everything beneath it, so whatever read beneath
+// it rebuilds.
+TEST_F(BuildDirectoryTreeInputTest, RemovingADirectoryRebuildsWhatReadInIt) {
+  source.make_directory("src");
+  source.write_file("src/a.h", "a");
+  const auto tree = built_reading("src/a.h");
+
+  source.remove("src");
+  EXPECT_EQ(runs, 2);
+}
+
+TEST_F(BuildDirectoryTreeInputTest, TouchingAStattedFileRebuilds) {
+  source.write_file("input.txt", "v1");
+  const auto tree = built_reading("input.txt");
+
+  source.set_mtime("input.txt",
+                   std::chrono::file_clock::now() + std::chrono::hours(1));
+  EXPECT_EQ(runs, 2);
+}
+
+TEST_F(BuildDirectoryTreeInputTest, RemovingAStattedDirectoryRebuilds) {
+  source.make_directory("src");
+  const auto tree = built_reading("src");
+
+  source.remove("src");
+  EXPECT_EQ(runs, 2);
+}
+
+// All a stat of a directory sees is that one is there, which an entry coming
+// or going in it leaves alone - so walking through it to a file beneath it
+// depends on no more than that either.
+TEST_F(BuildDirectoryTreeInputTest, ANewFileInAStattedDirectoryDoesNotRebuild) {
+  source.make_directory("src");
+  source.write_file("src/a.txt", "a");
+  const auto tree = built_reading("src");
+
+  source.write_file("src/b.txt", "b");
+  source.remove("src/a.txt");
+  source.make_directory("src/sub");
+  EXPECT_EQ(runs, 1);
+}
+
+// Forwards to an InMemoryDirectoryTree, but lets a test announce changes of
+// its own - as a real tree does a directory moved away, naming it alone.
+class AnnouncingTree : public DirectoryTree {
+ public:
+  InMemoryDirectoryTree inner;
+
+  [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
+    return inner.status(path);
+  }
+  [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
+    return inner.ls(path);
+  }
+  [[nodiscard]] makebelieve::OpenSender open(
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& context) const override {
+    return inner.open(path, context);
+  }
+  [[nodiscard]] Subscription subscribe_to_changes(
+      const std::function<void(const DirectoryTreeDiff&)>& callback)
+      const override {
+    const std::lock_guard lock(m_mutex);
+    m_callbacks.push_back(callback);
+    return inner.subscribe_to_changes(callback);
+  }
+
+  void announce(const DirectoryTreeDiff& diff) const {
+    std::vector<std::function<void(const DirectoryTreeDiff&)>> callbacks;
+    {
+      const std::lock_guard lock(m_mutex);
+      callbacks = m_callbacks;
+    }
+    for (const auto& callback : callbacks) {
+      callback(diff);
+    }
+  }
+
+ private:
+  mutable std::mutex m_mutex;
+  mutable std::vector<std::function<void(const DirectoryTreeDiff&)>>
+      m_callbacks;
+};
+
+// A directory named alone stands for everything that was beneath it, which
+// once it has moved away can no longer be named.
+TEST_F(BuildDirectoryTreeTest, ADirectoryMovedAwayRebuildsWhatReadBeneathIt) {
+  AnnouncingTree announcing;
+  announcing.inner.write_file("build.makebelieve",
+                              "@/output.txt = run build %out\n");
+  announcing.inner.make_directory("src");
+  announcing.inner.make_directory("src/deep");
+  announcing.inner.write_file("src/deep/input.txt", "v1");
+  int runs = 0;
+  const BuildDirectoryTree tree(
+      announcing, counting_with_inputs(runs, {"src/deep/input.txt"}));
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 1");
+
+  // A neighbour going is no change to it.
+  announcing.announce(DirectoryTreeDiff{.changed_listings = {""},
+                                        .changed_subtrees = {"srcs"}});
+  EXPECT_EQ(runs, 1);
+
+  announcing.announce(
+      DirectoryTreeDiff{.changed_listings = {""}, .changed_subtrees = {"src"}});
+  EXPECT_EQ(runs, 2);
+}
+
+// Finds each build by the pid its command makes requests with: pid N is the
+// build of the output a test names for it.
+class NamingTracker final : public BuildProcessTracker {
+  std::map<std::uint32_t, std::filesystem::path> m_outputs;
+
+ public:
+  explicit NamingTracker(std::map<std::uint32_t, std::filesystem::path> outputs)
+      : m_outputs(std::move(outputs)) {}
+
+  std::expected<Token, std::error_code> add(
+      const std::filesystem::path& /*output*/,
+      const ProcessHandle& process) override {
+    return Token{process.pid};
+  }
+  void remove(Token /*token*/) noexcept override {}
+  std::optional<std::filesystem::path> find(
+      std::uint32_t requester_pid) override {
+    const auto it = m_outputs.find(requester_pid);
+    return it == m_outputs.end()
+               ? std::nullopt
+               : std::optional<std::filesystem::path>(it->second);
+  }
+};
+
+// The pid reader.txt's command makes requests through the mount with.
+constexpr std::uint32_t k_reader_pid = 7;
+
+// What a build looks at through the mount, without opening it, is among its
+// inputs - an output, a directory of them, or a path with no output there.
+class BuildDirectoryTreeMountLookupTest : public BuildDirectoryTreeTest {
+ protected:
+  exec::static_thread_pool workers{2};
+  NamingTracker tracker{{{k_reader_pid, "reader.txt"}}};
+  BuildCoordinator coordinator{unlimited_permits(), tracker,
+                               workers.get_scheduler()};
+  int runs = 0;
+  const BuildDirectoryTree* tree = nullptr;
+
+  // A runner for reader.txt that, as its command, looks up @a looked through
+  // the mount - or lists it, if @a listed; any other output builds as
+  // "other".
+  CommandRunner looking_up(std::filesystem::path looked, bool listed = false) {
+    return [this, looked = std::move(looked), listed](const Command& command) {
+      if (command.output != "reader.txt") {
+        return finished(built("other"));
+      }
+      ++runs;
+      const OpenContext context{.requester_pid = k_reader_pid};
+      if (listed) {
+        static_cast<void>(tree->ls(looked, context));
+      } else {
+        static_cast<void>(tree->status(looked, context));
+      }
+      return finished(built("build " + std::to_string(runs)));
+    };
+  }
+};
+
+TEST_F(BuildDirectoryTreeMountLookupTest,
+       AnOutputFoundMissingRebuildsOnceItIs) {
+  write_manifest("@/reader.txt = run read %out\n");
+  const BuildDirectoryTree mounted(source, looking_up("later.txt"),
+                                   coordinator);
+  tree = &mounted;
+  EXPECT_EQ(read_output(mounted, "reader.txt"), "build 1");
+
+  write_manifest("@/reader.txt = run read %out\n@/later.txt = run l %out\n");
+  EXPECT_EQ(runs, 2);
+}
+
+TEST_F(BuildDirectoryTreeMountLookupTest,
+       AListedDirectoryRebuildsOnANewOutput) {
+  write_manifest("@/reader.txt = run read %out\n@/site/a.html = run a %out\n");
+  const BuildDirectoryTree mounted(source, looking_up("site", true),
+                                   coordinator);
+  tree = &mounted;
+  EXPECT_EQ(read_output(mounted, "reader.txt"), "build 1");
+
+  write_manifest(
+      "@/reader.txt = run read %out\n@/site/a.html = run a %out\n"
+      "@/site/b.html = run b %out\n");
+  EXPECT_EQ(runs, 2);
+}
+
+// One only looked up depends on there being a directory there, which a new
+// output in it leaves alone; that directory going does not.
+TEST_F(BuildDirectoryTreeMountLookupTest,
+       AStattedDirectoryRebuildsOnlyOnceItGoes) {
+  write_manifest("@/reader.txt = run read %out\n@/site/a.html = run a %out\n");
+  const BuildDirectoryTree mounted(source, looking_up("site"), coordinator);
+  tree = &mounted;
+  EXPECT_EQ(read_output(mounted, "reader.txt"), "build 1");
+
+  write_manifest(
+      "@/reader.txt = run read %out\n@/site/a.html = run a %out\n"
+      "@/site/b.html = run b %out\n");
+  EXPECT_EQ(runs, 1);
+
+  write_manifest("@/reader.txt = run read %out\n");
+  EXPECT_EQ(runs, 2);
+}
+
+TEST_F(BuildDirectoryTreeMountLookupTest, ListingTheRootRebuildsOnANewOutput) {
+  write_manifest("@/reader.txt = run read %out\n");
+  const BuildDirectoryTree mounted(source, looking_up("", true), coordinator);
+  tree = &mounted;
+  EXPECT_EQ(read_output(mounted, "reader.txt"), "build 1");
+
+  write_manifest("@/reader.txt = run read %out\n@/new.txt = run n %out\n");
+  EXPECT_EQ(runs, 2);
+}
+
+// One that looked up an output still to be built saw it as it was, and so is
+// out of date once it is built.
+TEST_F(BuildDirectoryTreeMountLookupTest,
+       AnUnbuiltOutputLookedUpRebuildsOnceBuilt) {
+  write_manifest("@/reader.txt = run read %out\n@/other.txt = run o %out\n");
+  const BuildDirectoryTree mounted(source, looking_up("other.txt"),
+                                   coordinator);
+  tree = &mounted;
+  EXPECT_EQ(read_output(mounted, "reader.txt"), "build 1");
+
+  EXPECT_EQ(read_output(mounted, "other.txt"), "other");
+  EXPECT_EQ(runs, 2);
+}
+
+// One that looks an output up in the moment before its build puts it in place
+// sees it as it was, however late in that build it looks.
+TEST_F(BuildDirectoryTreeMountLookupTest,
+       ALookupJustBeforeAnOutputIsPublishedRebuilds) {
+  write_manifest("@/reader.txt = run read %out\n@/other.txt = run o %out\n");
+  const BuildDirectoryTree mounted(
+      source,
+      [this](const Command& command) {
+        if (command.output != "reader.txt") {
+          return finished(built("other"));
+        }
+        ++runs;
+        if (runs == 1) {
+          BuildDirectoryTreeTestUtil::before_next_publish([this] {
+            static_cast<void>(tree->status(
+                "other.txt", OpenContext{.requester_pid = k_reader_pid}));
+          });
+          EXPECT_EQ(read_output(*tree, "other.txt"), "other");
+        }
+        return finished(built("build " + std::to_string(runs)));
+      },
+      coordinator);
+  tree = &mounted;
+  read_output(mounted, "reader.txt");
+
+  EXPECT_EQ(read_output(mounted, "reader.txt"), "build 2");
+  EXPECT_EQ(runs, 2);
+}
+
+// A lookup from no build of ours - a person at a shell, say - records nothing.
+TEST_F(BuildDirectoryTreeMountLookupTest, ALookupFromNoBuildIsNotAnInput) {
+  write_manifest("@/reader.txt = run read %out\n");
+  const BuildDirectoryTree mounted(source, looking_up("nothing"), coordinator);
+  tree = &mounted;
+  static_cast<void>(
+      mounted.status("later.txt", OpenContext{.requester_pid = 99}));
+  EXPECT_EQ(read_output(mounted, "reader.txt"), "build 1");
+
+  write_manifest("@/reader.txt = run read %out\n@/later.txt = run l %out\n");
+  EXPECT_EQ(runs, 1);
 }
 
 }  // namespace

@@ -84,10 +84,12 @@ class InMemoryDirectoryTree : public DirectoryTree {
                  std::chrono::file_clock::time_point mtime);
 
   [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override;
+      const std::filesystem::path& path,
+      const OpenContext& context = {}) const override;
 
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
-      const std::filesystem::path& path) const override;
+      const std::filesystem::path& path,
+      const OpenContext& context = {}) const override;
 
   /// Shares the immutable bytes and metadata held by the file at @a path.
   [[nodiscard]] OpenSender open(const std::filesystem::path& path,
