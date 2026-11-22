@@ -562,6 +562,23 @@ class Fixture {
     }
     return true;
   }
+
+  // Waits (bounded) until no build is under way or waiting to start. An open
+  // can return while builds it did not wait on are still finishing.
+  [[nodiscard]] bool settled() const {
+    const auto deadline = std::chrono::steady_clock::now() + k_patience;
+    while (true) {
+      const std::string report = tree->status_report();
+      if (report.find(" building: ") == std::string::npos &&
+          report.find(" waiting to build: ") == std::string::npos) {
+        return true;
+      }
+      if (std::chrono::steady_clock::now() > deadline) {
+        return false;
+      }
+      std::this_thread::sleep_for(1ms);
+    }
+  }
 };
 
 TEST(BuildCoordinator, AtTheCapEachAttemptOpeningAnUnbuiltOutputCompletes) {
@@ -757,7 +774,10 @@ TEST(BuildCoordinator, APermitTakenBackIsGivenUpAgainWhileOpensStillWait) {
   fixture.commands.raise("y_go");
   EXPECT_EQ(a.get(), "ok");
   EXPECT_EQ(y.get(), "ok");
-  EXPECT_EQ(fixture.content("a"), "b=ok c=ok ");
+  // Its two threads write their answers in whichever order they get there.
+  const std::string transcript = fixture.content("a");
+  EXPECT_TRUE(transcript == "b=ok c=ok " || transcript == "c=ok b=ok ")
+      << transcript;
   EXPECT_EQ(fixture.counting.releases.load(), releases + 1);
   EXPECT_EQ(fixture.counting.reacquires.load(), 2);
 }
@@ -859,6 +879,9 @@ TEST(BuildCoordinator, AThreeAttemptCycleStopsAllOfThem) {
   // The cycle's attempts all failed, and a retry of any of them is another
   // cycle, never a hang.
   for (const char* output : {"b", "c"}) {
+    // Left to finish, or the retry could join one of them and be handed its
+    // failure rather than finding a cycle of its own.
+    ASSERT_TRUE(fixture.settled());
     const int a_runs = fixture.commands.runs("a");
     const int b_runs = fixture.commands.runs("b");
     const int c_runs = fixture.commands.runs("c");
@@ -1062,10 +1085,13 @@ TEST(BuildCoordinator, AHurriedBuildHurriesWhatItOpens) {
 TEST(BuildCoordinator, HurryingABuildHurriesWhatItAlreadyWaitsOn) {
   Fixture fixture(1);
   fixture.declare(
-      "@/a = run open d\n@/b = run wait go\n@/c = run signal c\n"
+      "@/a = run wait queued; open d\n@/b = run wait go\n@/c = run signal c\n"
       "@/d = run signal d\n");
-  // a starts, waits on d and gives its permit back, which b takes.
   fixture.tree->materialize_all();
+  // Only now are b, c and d all in line. Opened any sooner, d would join the
+  // line ahead of whatever had yet to, and take a's permit before b could.
+  fixture.commands.raise("queued");
+  // a waits on d and gives its permit back, which b takes.
   ASSERT_TRUE(fixture.until([&](const auto& stats) {
     return stats.edges == 1 && stats.held == 1 &&
            fixture.commands.runs("b") == 1;
