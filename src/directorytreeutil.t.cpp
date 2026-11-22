@@ -67,7 +67,8 @@ TEST_F(DirectoryTreeUtil, DiffSeesBytesBeyondTheSizeReportedByStatus) {
   // Model a file that grows from one byte to two between status and read.
   class GrowingTree : public makebelieve::InMemoryDirectoryTree {
     std::expected<makebelieve::EntryInfo, std::error_code> status(
-        const std::filesystem::path& path) const override {
+        const std::filesystem::path& path,
+        const makebelieve::OpenContext& /*context*/ = {}) const override {
       std::expected<makebelieve::EntryInfo, std::error_code> info =
           InMemoryDirectoryTree::status(path);
       if (info && path == "file") {

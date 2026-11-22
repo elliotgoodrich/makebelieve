@@ -802,13 +802,15 @@ class FailingReadTree : public makebelieve::DirectoryTree {
       : m_inner(inner), m_error(error) {}
 
   [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.status(path);
   }
 
   [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
                               std::error_code>
-  ls(const std::filesystem::path& path) const override {
+  ls(const std::filesystem::path& path,
+     const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.ls(path);
   }
 
@@ -857,7 +859,8 @@ class FailingStatusTree : public makebelieve::DirectoryTree {
       : m_inner(inner), m_path(std::move(path)), m_error(error) {}
 
   [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     if (path == m_path) {
       return std::unexpected(m_error);
     }
@@ -866,7 +869,8 @@ class FailingStatusTree : public makebelieve::DirectoryTree {
 
   [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
                               std::error_code>
-  ls(const std::filesystem::path& path) const override {
+  ls(const std::filesystem::path& path,
+     const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.ls(path);
   }
 
@@ -897,13 +901,15 @@ class SettleOnOpenTree : public makebelieve::DirectoryTree {
   [[nodiscard]] int opens() const { return m_opens; }
 
   [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.status(path);
   }
 
   [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
                               std::error_code>
-  ls(const std::filesystem::path& path) const override {
+  ls(const std::filesystem::path& path,
+     const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.ls(path);
   }
 
@@ -950,13 +956,15 @@ class ParkingTree : public makebelieve::DirectoryTree {
   void release() { m_coordinator.complete(m_attempt, {}); }
 
   [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.status(path);
   }
 
   [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
                               std::error_code>
-  ls(const std::filesystem::path& path) const override {
+  ls(const std::filesystem::path& path,
+     const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.ls(path);
   }
 
@@ -1079,11 +1087,13 @@ class InlineStopTree : public makebelieve::DirectoryTree {
       : m_inner(inner), m_stopped(stopped) {}
 
   std::expected<makebelieve::EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.status(path);
   }
   std::expected<std::vector<makebelieve::TreeEntry>, std::error_code> ls(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.ls(path);
   }
   makebelieve::OpenSender open(
@@ -1131,13 +1141,15 @@ class GatedOpenTree : public makebelieve::DirectoryTree {
   void release() { m_coordinator.complete(m_attempt, {}); }
 
   [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.status(path);
   }
 
   [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
                               std::error_code>
-  ls(const std::filesystem::path& path) const override {
+  ls(const std::filesystem::path& path,
+     const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_inner.ls(path);
   }
 
@@ -1949,12 +1961,14 @@ class CountingTree final : public DirectoryTree {
   [[nodiscard]] int reads() const { return m_reads->load(); }
 
   [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_tree.status(path);
   }
 
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
-      const std::filesystem::path& path) const override {
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& /*context*/ = {}) const override {
     return m_tree.ls(path);
   }
 
@@ -1998,6 +2012,89 @@ TEST_F(VirtualFileSystem, ReopeningAnUnchangedFileReadsItsCachedPages) {
   std::ranges::reverse(changed);
   tree().write_file("a.bin", changed, std::chrono::file_clock::now() + 1s);
   EXPECT_TRUE(read_file(mountpoint() / "a.bin") == changed);
+}
+
+// Forwards to another tree, but tells of a change only when told to, as a
+// real tree tells of a directory moved in: by naming that directory alone.
+class SubtreeAnnouncingTree final : public makebelieve::DirectoryTree {
+  const makebelieve::DirectoryTree& m_inner;
+  mutable std::mutex m_mutex;
+  mutable std::function<void(const makebelieve::DirectoryTreeDiff&)> m_callback;
+
+ public:
+  explicit SubtreeAnnouncingTree(const makebelieve::DirectoryTree& inner)
+      : m_inner(inner) {}
+
+  void announce_subtree(const std::filesystem::path& path) const {
+    std::function<void(const makebelieve::DirectoryTreeDiff&)> callback;
+    {
+      const std::lock_guard lock(m_mutex);
+      callback = m_callback;
+    }
+    callback(makebelieve::DirectoryTreeDiff{
+        .changed_listings = {path.parent_path()}, .changed_subtrees = {path}});
+  }
+
+  [[nodiscard]] std::expected<makebelieve::EntryInfo, std::error_code> status(
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& context = {}) const override {
+    return m_inner.status(path, context);
+  }
+
+  [[nodiscard]] std::expected<std::vector<makebelieve::TreeEntry>,
+                              std::error_code>
+  ls(const std::filesystem::path& path,
+     const makebelieve::OpenContext& context = {}) const override {
+    return m_inner.ls(path, context);
+  }
+
+  [[nodiscard]] makebelieve::OpenSender open(
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& context = {}) const override {
+    return m_inner.open(path, context);
+  }
+
+  [[nodiscard]] makebelieve::Subscription subscribe_to_changes(
+      const std::function<void(const makebelieve::DirectoryTreeDiff&)>&
+          callback) const override {
+    {
+      const std::lock_guard lock(m_mutex);
+      m_callback = callback;
+    }
+    return makebelieve::Subscription([this] {
+      const std::lock_guard lock(m_mutex);
+      m_callback = [](const makebelieve::DirectoryTreeDiff&) {};
+    });
+  }
+};
+
+// A directory replaced by another is named alone, so a file beneath it with
+// the same size and time is a new file all the same: a new open reads it,
+// while a handle to the old one reads on.
+TEST_F(VirtualFileSystem, ReplacingADirectoryReplacesTheFilesBeneathIt) {
+  const auto mtime = std::chrono::file_clock::now();
+  tree().make_directory("dir");
+  tree().write_file("dir/a.txt", "old", mtime);
+  const SubtreeAnnouncingTree announcing(tree());
+  const makebelieve::VirtualFileSystem vfs(announcing, mountpoint(),
+                                           notifier());
+  std::ifstream held(mountpoint() / "dir" / "a.txt", std::ios::binary);
+  ASSERT_TRUE(held);
+  ASSERT_EQ(read_file(mountpoint() / "dir" / "a.txt"), "old");
+
+  tree().remove("dir");
+  tree().make_directory("dir");
+  tree().write_file("dir/a.txt", "new", mtime);
+  announcing.announce_subtree("dir");
+
+  const auto deadline = std::chrono::steady_clock::now() + k_timeout;
+  std::optional<std::string> seen = read_file(mountpoint() / "dir" / "a.txt");
+  while (seen != "new" && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+    seen = read_file(mountpoint() / "dir" / "a.txt");
+  }
+  EXPECT_EQ(seen, "new");
+  EXPECT_EQ(read_rest(held), "old");
 }
 #endif
 

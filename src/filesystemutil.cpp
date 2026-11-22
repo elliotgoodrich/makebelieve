@@ -198,6 +198,31 @@ std::error_code FileSystemUtil::write_file(
   }
 }
 
+std::filesystem::path FileSystemUtil::path_key(
+    const std::filesystem::path& path) {
+#ifdef _WIN32
+  const std::wstring& native = path.native();
+  if (native.empty()) {
+    return path;
+  }
+  std::wstring folded;
+  folded.resize_and_overwrite(
+      native.size(), [&](wchar_t* out, std::size_t size) -> std::size_t {
+        const int length =
+            ::LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE,
+                            native.data(), static_cast<int>(size), out,
+                            static_cast<int>(size), nullptr, nullptr, 0);
+        return length == static_cast<int>(size) ? size : 0;
+      });
+  if (folded.size() != native.size()) {
+    return path;
+  }
+  return folded;
+#else
+  return path;
+#endif
+}
+
 std::error_code FileSystemUtil::hide(const std::filesystem::path& path) {
 #ifdef _WIN32
   const DWORD attributes = GetFileAttributesW(path.c_str());

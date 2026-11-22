@@ -153,6 +153,19 @@ TEST(WriteFile, ReportsAMissingDirectory) {
   EXPECT_EQ(written, std::errc::no_such_file_or_directory);
 }
 
+TEST(PathKey, FoldsCaseOnlyWhereTheFilesystemDoes) {
+  const std::filesystem::path lower = std::filesystem::path("src") / "config.h";
+  const std::filesystem::path upper = std::filesystem::path("SRC") / "CONFIG.H";
+#ifdef _WIN32
+  EXPECT_EQ(makebelieve::FileSystemUtil::path_key(lower),
+            makebelieve::FileSystemUtil::path_key(upper));
+#else
+  EXPECT_NE(makebelieve::FileSystemUtil::path_key(lower),
+            makebelieve::FileSystemUtil::path_key(upper));
+#endif
+  EXPECT_EQ(makebelieve::FileSystemUtil::path_key({}), std::filesystem::path());
+}
+
 TEST(Hide, HidesADirectory) {
   const std::filesystem::path path = temp_file();
   std::filesystem::create_directory(path);

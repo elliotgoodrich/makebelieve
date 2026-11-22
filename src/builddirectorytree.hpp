@@ -163,11 +163,22 @@ class BuildDirectoryTree : public DirectoryTree {
   BuildDirectoryTree(BuildDirectoryTree&&) = delete;
   BuildDirectoryTree& operator=(BuildDirectoryTree&&) = delete;
 
+  /// The entry at @a path. Asked for a requester that is the command of one
+  /// of our builds, as @a context says - through the mount - that build
+  /// depends on what is there, as on a source path: an output's content,
+  /// that a directory is there, or that nothing is. One that looked up an
+  /// output still to be built saw what it was before, so goes out of date
+  /// once it is built - unless it then opened it, which waits for that
+  /// build.
   [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
-      const std::filesystem::path& path) const override;
+      const std::filesystem::path& path,
+      const OpenContext& context = {}) const override;
 
+  /// The entries of the directory at @a path. Asked for the command of one
+  /// of our builds, as for status(), that build depends on them too.
   [[nodiscard]] std::expected<std::vector<TreeEntry>, std::error_code> ls(
-      const std::filesystem::path& path) const override;
+      const std::filesystem::path& path,
+      const OpenContext& context = {}) const override;
 
   using DirectoryTree::open;
 
@@ -232,6 +243,11 @@ class BuildDirectoryTreeTestUtil {
   /// tree, call @a hook once it has counted the change and taken on announcing
   /// it, just before it writes them. One-shot: consumed by that announcement.
   static void before_next_status_write(std::function<void()> hook);
+
+  /// Makes the next build to finish, of any tree, call @a hook just before
+  /// its output is put in place, holding only the tree's layout lock - so a
+  /// look at the output then sees it as it was. One-shot.
+  static void before_next_publish(std::function<void()> hook);
 };
 
 }  // namespace makebelieve

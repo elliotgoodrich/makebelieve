@@ -112,11 +112,14 @@ TEST_F(BuildCacheTest, KeepsAGitignoreThatIsAlreadyThere) {
 
 TEST_F(BuildCacheTest, StoredRecordsOutliveTheCache) {
   const std::vector<BuildCache::Input> inputs = {
-      {.path = "src/a.txt", .mtime = 42, .size = 7, .hash = {}},
-      {.path = "src", .mtime = 43, .size = -1, .hash = {}},
+      {.path = "src/a.txt", .mtime = 42, .size = 7},
+      {.path = "src", .kind = BuildCache::Input::Kind::directory},
+      {.path = "lib",
+       .kind = BuildCache::Input::Kind::listing,
+       .hash = BuildCache::hash("entries")},
+      {.path = "absent.h", .kind = BuildCache::Input::Kind::missing},
       {.path = "@/gen/b.txt",
-       .mtime = 0,
-       .size = 0,
+       .kind = BuildCache::Input::Kind::output,
        .hash = BuildCache::hash("b")},
   };
   std::string hash;
@@ -339,6 +342,32 @@ TEST_F(BuildCacheTest, StoresWhatAnOpenedFileReads) {
   EXPECT_EQ(object_count(), 1U);
   EXPECT_EQ(read(cache, BuildCache::hash("copied")), "copied");
   EXPECT_EQ(cache.records().size(), 2U);
+}
+
+// A directory's stamp is its entries - names, and which are directories - in
+// any order, and nothing else they show.
+TEST_F(BuildCacheTest, HashesADirectoryByItsEntriesAlone) {
+  const auto file = [](const char* name, std::size_t size) {
+    return TreeEntry{.name = name,
+                     .info = FileInfo{.size = size,
+                                      .mtime = std::chrono::file_clock::now()}};
+  };
+  const auto directory = [](const char* name) {
+    return TreeEntry{.name = name, .info = DirectoryInfo{}};
+  };
+  const std::vector<TreeEntry> entries = {file("a.txt", 1), directory("sub")};
+  const std::vector<TreeEntry> reordered = {directory("sub"),
+                                            file("a.txt", 999)};
+  const std::vector<TreeEntry> retyped = {directory("a.txt"), directory("sub")};
+  const std::vector<TreeEntry> renamed = {file("b.txt", 1), directory("sub")};
+
+  EXPECT_EQ(BuildCache::hash_entries(entries),
+            BuildCache::hash_entries(reordered));
+  EXPECT_NE(BuildCache::hash_entries(entries),
+            BuildCache::hash_entries(retyped));
+  EXPECT_NE(BuildCache::hash_entries(entries),
+            BuildCache::hash_entries(renamed));
+  EXPECT_NE(BuildCache::hash_entries(entries), BuildCache::hash_entries({}));
 }
 
 }  // namespace

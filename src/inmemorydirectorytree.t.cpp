@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <expected>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -47,15 +48,24 @@ std::vector<std::string> sorted_names(
   return names;
 }
 
-std::vector<std::string> sorted_paths(
-    const std::vector<std::filesystem::path>& paths) {
-  std::vector<std::string> names;
-  names.reserve(paths.size());
-  for (const std::filesystem::path& path : paths) {
-    names.push_back(path.generic_string());
+// What @a diff names, in path order, as `<set> <path>`: the root as `.`.
+std::vector<std::string> described(const makebelieve::DirectoryTreeDiff& diff) {
+  std::map<std::filesystem::path, std::string> named;
+  for (const std::filesystem::path& path : diff.changed_paths) {
+    named[path] = "path";
   }
-  std::sort(names.begin(), names.end());
-  return names;
+  for (const std::filesystem::path& path : diff.changed_listings) {
+    named[path] = "listing";
+  }
+  for (const std::filesystem::path& path : diff.changed_subtrees) {
+    named[path] = "subtree";
+  }
+  std::vector<std::string> lines;
+  for (const auto& [path, set] : named) {
+    lines.push_back(set + " " +
+                    (path.empty() ? std::string(".") : path.generic_string()));
+  }
+  return lines;
 }
 
 // Named for the type under test so TEST_F reads as InMemoryDirectoryTree.
@@ -380,10 +390,8 @@ TEST_F(InMemoryDirectoryTreeChanges, WriteFileCreatesANewFile) {
 
   ASSERT_EQ(diffs().size(), 1u);
   EXPECT_FALSE(diffs()[0].everything_dirty);
-  EXPECT_EQ(sorted_paths(diffs()[0].entries_changed),
-            std::vector<std::string>{"new.txt"});
-  EXPECT_EQ(sorted_paths(diffs()[0].child_lists_changed),
-            std::vector<std::string>{""});
+  EXPECT_EQ(described(diffs()[0]),
+            (std::vector<std::string>{"listing .", "subtree new.txt"}));
 }
 
 TEST_F(InMemoryDirectoryTreeChanges, WriteFileOverwritesAnExistingFile) {
@@ -392,11 +400,9 @@ TEST_F(InMemoryDirectoryTreeChanges, WriteFileOverwritesAnExistingFile) {
   EXPECT_EQ(makebelieve::DirectoryTreeUtil::read(tree(), "hello.txt", 0, 7),
             "goodbye");
 
-  // The parent's child list did not change - only the file's own content.
+  // The parent's entries did not change - only the file's own content.
   ASSERT_EQ(diffs().size(), 1u);
-  EXPECT_EQ(sorted_paths(diffs()[0].entries_changed),
-            std::vector<std::string>{"hello.txt"});
-  EXPECT_TRUE(diffs()[0].child_lists_changed.empty());
+  EXPECT_EQ(described(diffs()[0]), std::vector<std::string>{"path hello.txt"});
 }
 
 TEST_F(InMemoryDirectoryTreeChanges, MakeDirectoryAddsAnEmptyDirectory) {
@@ -408,10 +414,8 @@ TEST_F(InMemoryDirectoryTreeChanges, MakeDirectoryAddsAnEmptyDirectory) {
   EXPECT_TRUE(listing->empty());
 
   ASSERT_EQ(diffs().size(), 1u);
-  EXPECT_EQ(sorted_paths(diffs()[0].entries_changed),
-            std::vector<std::string>{"sub/new_dir"});
-  EXPECT_EQ(sorted_paths(diffs()[0].child_lists_changed),
-            std::vector<std::string>{"sub"});
+  EXPECT_EQ(described(diffs()[0]),
+            (std::vector<std::string>{"listing sub", "subtree sub/new_dir"}));
 }
 
 TEST_F(InMemoryDirectoryTreeChanges, RemoveDeletesAFile) {
@@ -421,10 +425,8 @@ TEST_F(InMemoryDirectoryTreeChanges, RemoveDeletesAFile) {
             std::errc::no_such_file_or_directory);
 
   ASSERT_EQ(diffs().size(), 1u);
-  EXPECT_EQ(sorted_paths(diffs()[0].entries_changed),
-            std::vector<std::string>{"hello.txt"});
-  EXPECT_EQ(sorted_paths(diffs()[0].child_lists_changed),
-            std::vector<std::string>{""});
+  EXPECT_EQ(described(diffs()[0]),
+            (std::vector<std::string>{"listing .", "subtree hello.txt"}));
 }
 
 TEST_F(InMemoryDirectoryTreeChanges, RemoveDeletesADirectoryAndItsContents) {
@@ -437,10 +439,10 @@ TEST_F(InMemoryDirectoryTreeChanges, RemoveDeletesADirectoryAndItsContents) {
             std::errc::no_such_file_or_directory);
 
   ASSERT_EQ(diffs().size(), 1u);
-  EXPECT_EQ(sorted_paths(diffs()[0].entries_changed),
-            (std::vector<std::string>{"sub", "sub/deeper", "sub/nested.txt"}));
-  EXPECT_EQ(sorted_paths(diffs()[0].child_lists_changed),
-            std::vector<std::string>{""});
+  EXPECT_EQ(described(diffs()[0]),
+            (std::vector<std::string>{"listing .", "subtree sub",
+                                      "subtree sub/deeper",
+                                      "subtree sub/nested.txt"}));
 }
 
 TEST_F(InMemoryDirectoryTreeChanges, SetMtimeUpdatesOnlyTheMtime) {
@@ -458,22 +460,22 @@ TEST_F(InMemoryDirectoryTreeChanges, SetMtimeUpdatesOnlyTheMtime) {
             "hello world");
 
   ASSERT_EQ(diffs().size(), 1u);
-  EXPECT_EQ(sorted_paths(diffs()[0].entries_changed),
-            std::vector<std::string>{"hello.txt"});
-  EXPECT_TRUE(diffs()[0].child_lists_changed.empty());
+  EXPECT_EQ(described(diffs()[0]), std::vector<std::string>{"path hello.txt"});
 }
 
-TEST_F(InMemoryDirectoryTreeChanges, SetMtimeCanTargetTheRoot) {
+// A directory's value is its entries, so its mtime moving alone - the root's
+// included - changes nothing a diff reports.
+TEST_F(InMemoryDirectoryTreeChanges, SetMtimeOfADirectoryIsNoChange) {
   const auto updated = std::chrono::file_clock::now() + std::chrono::hours(1);
   tree().set_mtime("", updated);
+  tree().set_mtime("sub", updated);
 
   const std::expected<makebelieve::EntryInfo, std::error_code> status =
       tree().status("");
   ASSERT_TRUE(status.has_value());
   EXPECT_EQ(std::get<makebelieve::DirectoryInfo>(*status).mtime, updated);
 
-  ASSERT_EQ(diffs().size(), 1u);
-  EXPECT_EQ(diffs()[0].entries_changed, std::vector<std::filesystem::path>{""});
+  EXPECT_TRUE(diffs().empty());
 }
 
 TEST_F(InMemoryDirectoryTreeChanges, EveryChangeIsReportedInOrder) {
@@ -482,12 +484,12 @@ TEST_F(InMemoryDirectoryTreeChanges, EveryChangeIsReportedInOrder) {
   tree().remove("a.txt");
 
   ASSERT_EQ(diffs().size(), 3u);
-  EXPECT_EQ(diffs()[0].entries_changed,
-            std::vector<std::filesystem::path>{"a.txt"});
-  EXPECT_EQ(diffs()[1].entries_changed,
-            std::vector<std::filesystem::path>{"b.txt"});
-  EXPECT_EQ(diffs()[2].entries_changed,
-            std::vector<std::filesystem::path>{"a.txt"});
+  EXPECT_EQ(described(diffs()[0]),
+            (std::vector<std::string>{"listing .", "subtree a.txt"}));
+  EXPECT_EQ(described(diffs()[1]),
+            (std::vector<std::string>{"listing .", "subtree b.txt"}));
+  EXPECT_EQ(described(diffs()[2]),
+            (std::vector<std::string>{"listing .", "subtree a.txt"}));
 }
 
 TEST_F(InMemoryDirectoryTree, MultipleSubscribersAreAllNotified) {

@@ -330,11 +330,12 @@ void RealDirectoryTree::Impl::add_watch(const WatchTarget& target) const {
   std::error_code error;
   for (std::filesystem::directory_iterator it(target.absolute, error), end;
        !error && it != end; it.increment(error)) {
+    const std::filesystem::path relative =
+        target.relative / it->path().filename();
     std::error_code entry_error;
     const std::filesystem::file_status entry = it->symlink_status(entry_error);
     if (!entry_error && std::filesystem::is_directory(entry)) {
-      add_watch({.absolute = it->path(),
-                 .relative = target.relative / it->path().filename()});
+      add_watch({.absolute = it->path(), .relative = relative});
     }
   }
 }
@@ -344,10 +345,8 @@ void RealDirectoryTree::Impl::drain_events() const {
   alignas(struct inotify_event) std::array<char, k_event_buffer_bytes> buffer;
 
   {
-    // Ordered sets so repeated records for one path collapse and the lists come
-    // out sorted, exactly as the Windows backend produces them.
-    std::set<std::filesystem::path> files;
-    std::set<std::filesystem::path> directories;
+    // Repeated records for one path collapse, as the sets hold each once.
+    DirectoryTreeDiff diff;
     bool overflowed = false;
 
     // Drain everything currently queued before notifying once, so a burst
@@ -393,18 +392,21 @@ void RealDirectoryTree::Impl::drain_events() const {
             directory.empty() ? std::filesystem::path(event->name)
                               : directory / event->name;
 
-        // Every record names something whose own identity moved.
-        files.insert(relative);
-
-        // Appearing, disappearing and renaming change the *directory's* child
-        // list; a plain write or attribute change does not.
+        // Appearing and disappearing - a rename is one of each - change the
+        // directory's entries too.
         if ((event->mask &
-             (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO)) != 0) {
-          directories.insert(directory);
+             (IN_CREATE | IN_MOVED_TO | IN_DELETE | IN_MOVED_FROM)) != 0) {
+          diff.changed_subtrees.insert(relative);
+          diff.changed_listings.insert(directory);
+        } else if ((event->mask & IN_ISDIR) == 0) {
+          // A directory's own modification time or attributes changing
+          // leaves its entries alone, so is no change.
+          diff.changed_paths.insert(relative);
         }
 
         // A directory that just appeared needs its own watch (inotify is not
-        // recursive), together with anything already inside it.
+        // recursive), together with anything already inside it - which its
+        // subtree has already said may have changed.
         if ((event->mask & IN_ISDIR) != 0 &&
             (event->mask & (IN_CREATE | IN_MOVED_TO)) != 0) {
           add_watch({.absolute = m_root / relative, .relative = relative});
@@ -412,18 +414,13 @@ void RealDirectoryTree::Impl::drain_events() const {
       }
     }
 
-    DirectoryTreeDiff diff;
-    diff.everything_dirty = overflowed;
-    diff.entries_changed.assign(std::make_move_iterator(files.begin()),
-                                std::make_move_iterator(files.end()));
-    diff.child_lists_changed.assign(
-        std::make_move_iterator(directories.begin()),
-        std::make_move_iterator(directories.end()));
+    if (overflowed) {
+      diff = DirectoryTreeDiff{.everything_dirty = true};
+    }
 
     // The interface promises a diff always says something, so stay silent when
     // a drain turned up nothing actionable (e.g. only bookkeeping events).
-    if (diff.everything_dirty || !diff.entries_changed.empty() ||
-        !diff.child_lists_changed.empty()) {
+    if (!diff.empty()) {
       notify_subscribers(diff);
     }
   }
@@ -451,12 +448,14 @@ RealDirectoryTree::RealDirectoryTree(const std::filesystem::path& root,
 RealDirectoryTree::~RealDirectoryTree() = default;
 
 std::expected<EntryInfo, std::error_code> RealDirectoryTree::status(
-    const std::filesystem::path& path) const {
+    const std::filesystem::path& path,
+    const OpenContext& /*context*/) const {
   return m_impl->status(path);
 }
 
 std::expected<std::vector<TreeEntry>, std::error_code> RealDirectoryTree::ls(
-    const std::filesystem::path& path) const {
+    const std::filesystem::path& path,
+    const OpenContext& /*context*/) const {
   return m_impl->ls(path);
 }
 

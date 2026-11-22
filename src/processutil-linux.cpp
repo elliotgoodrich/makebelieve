@@ -215,11 +215,17 @@ struct Inode {
 };
 
 // Services one command's FUSE mount: a read-only passthrough view over the
-// files rooted at the traced directory, recording the real path of every file
-// the command opens for reading.
+// files rooted at the traced directory, recording the real path of everything
+// the command looks at: everything it looks up - to open it, to stat it, or
+// to walk through it to what is beneath it - whether it finds anything there
+// or not; everything it gets the attributes of; and, as listed, every
+// directory it lists. Entry and attribute caching are off, so each of these
+// reaches us.
 class Tracer {
   std::mutex m_mutex;
-  std::vector<std::filesystem::path> m_read_files;
+
+  // What the command looked at, and whether it listed each.
+  std::unordered_map<std::filesystem::path, bool> m_looked_at;
 
   // Set when a request could not be handled, which may have lost a read.
   std::atomic<bool> m_failed = false;
@@ -269,7 +275,13 @@ class Tracer {
                                             : p->relative / name;
     const UniqueFd fd = open_beneath(m_root.get(), child, O_PATH);
     if (!fd) {
-      fuse_reply_err(req, errno);
+      const int error = errno;
+      // Finding nothing there is as much a dependency as finding something:
+      // the command may do otherwise once something is.
+      if (error == ENOENT || error == ENOTDIR) {
+        record(p->real_path / name);
+      }
+      fuse_reply_err(req, error);
       return;
     }
     struct stat st {};
@@ -278,6 +290,9 @@ class Tracer {
       fuse_reply_err(req, errno);
       return;
     }
+    // A symlink is a lookup of the link, on which the command depends as
+    // well as on its target, which it then looks up in turn.
+    record(p->real_path / name);
 
     auto [it, inserted] =
         m_by_dev_ino.try_emplace(std::pair(st.st_dev, st.st_ino), m_next_ino);
@@ -308,6 +323,12 @@ class Tracer {
       fuse_reply_err(req, errno);
       return;
     }
+    // A stat, which a path walk never asks for: of a directory too. But not
+    // of the root, which the kernel asks after for its own ends, and which
+    // a command lists when it depends on it.
+    if (ino != FUSE_ROOT_ID) {
+      record(n->real_path);
+    }
     fuse_reply_attr(req, &st, 0);
   }
 
@@ -328,10 +349,7 @@ class Tracer {
       return;
     }
 
-    {
-      const std::scoped_lock lock(m_mutex);
-      m_read_files.push_back(n->real_path);
-    }
+    record(n->real_path);
 
     // The fd now belongs to fi->fh; Tracer::release() closes it. Reads go
     // through the kernel's page cache - no direct_io, which would also refuse
@@ -369,10 +387,11 @@ class Tracer {
     fuse_reply_err(req, 0);
   }
 
-  // Listing a directory - and reading a symlink, below - is not recorded as a
-  // read, as on Windows, whose hook skips directories and records a symlink's
-  // target rather than the link. Following a link inside the tree still opens
-  // its target here, which records that.
+  // Opening a directory is not recorded: a command may open one only to look
+  // things up relative to it. Listing it, in readdir, is. Reading a symlink,
+  // below, is not recorded either, as on Windows, whose hook records a
+  // symlink's target rather than the link. Following a link inside the tree
+  // still looks up its target here, which records that.
   void opendir(fuse_req_t req, fuse_ino_t ino, fuse_file_info* fi) {
     Inode* n = find(ino);
     if (n == nullptr) {
@@ -401,11 +420,17 @@ class Tracer {
   // libfuse's signature.
   // NOLINTBEGIN(bugprone-easily-swappable-parameters)
   void readdir(fuse_req_t req,
-               fuse_ino_t /*ino*/,
+               fuse_ino_t ino,
                size_t size,
                off_t off,
                fuse_file_info* fi) {
     // NOLINTEND(bugprone-easily-swappable-parameters)
+    const Inode* const n = find(ino);
+    if (n == nullptr) {
+      fuse_reply_err(req, EIO);
+      return;
+    }
+    record(n->real_path, true);
     DIR* const dir = directory(fi);
     // Offsets are those telldir() gave for an earlier batch, or 0.
     if (off == 0) {
@@ -478,17 +503,30 @@ class Tracer {
   // Records that a request could not be handled.
   void fail() noexcept { m_failed = true; }
 
-  // The files the command opened for reading, or EIO if a request could not
-  // be handled - which may have lost one.
-  std::expected<std::vector<std::filesystem::path>, std::error_code>
-  take_read_files() && {
+  // What the command looked at, in no particular order and without repeats,
+  // or EIO if a request could not be handled - which may have lost
+  // something.
+  std::expected<std::vector<Input>, std::error_code> take_read_files() && {
     if (m_failed) {
       return std::unexpected(std::make_error_code(std::errc::io_error));
     }
-    return std::move(m_read_files);
+    std::vector<Input> inputs;
+    inputs.reserve(m_looked_at.size());
+    for (auto& [path, listed] : m_looked_at) {
+      inputs.emplace_back(path, listed);
+    }
+    return inputs;
   }
 
  private:
+  // Records that the command looked at @a path - and listed it, if
+  // @a listed - which a command looking at one file many times holds once.
+  void record(const std::filesystem::path& path, bool listed = false) {
+    const std::scoped_lock lock(m_mutex);
+    bool& was_listed = m_looked_at[path];
+    was_listed = was_listed || listed;
+  }
+
   Inode* find(fuse_ino_t ino) {
     auto it = m_inodes.find(ino);
     return it == m_inodes.end() ? nullptr : &it->second;
@@ -955,7 +993,7 @@ exec::task<Supervision> supervise(IoContext& io,
 // Turns a Supervision into the reported Result. @a inputs is empty on a
 // canceled or failed run.
 ProcessUtil::Result to_result(Supervision supervision,
-                              std::vector<std::filesystem::path> inputs) {
+                              std::vector<Input> inputs) {
   if (supervision.error) {
     return std::unexpected(supervision.error);
   }
@@ -1116,17 +1154,15 @@ class TracingSession {
     m_forced_error = error;
   }
 
-  // The files the command opened for reading, sorted and without repeats -
+  // What the command looked at, sorted and without repeats -
   // or why a request could not be handled, in which case what was recorded
   // may be incomplete and is not reported at all.
-  [[nodiscard]] std::expected<std::vector<std::filesystem::path>,
-                              std::error_code>
+  [[nodiscard]] std::expected<std::vector<Input>, std::error_code>
   take_inputs() && {
-    std::expected<std::vector<std::filesystem::path>, std::error_code> inputs =
+    std::expected<std::vector<Input>, std::error_code> inputs =
         std::move(m_tracer).take_read_files();
     if (inputs.has_value()) {
-      std::ranges::sort(*inputs);
-      inputs->erase(std::ranges::unique(*inputs).begin(), inputs->end());
+      merge_inputs(*inputs);
     }
     return inputs;
   }
@@ -1372,7 +1408,7 @@ exec::task<ProcessUtil::Result> run_traced(IoContext& io,
     co_return to_result(std::move(supervision), {});
   }
 
-  std::expected<std::vector<std::filesystem::path>, std::error_code> inputs =
+  std::expected<std::vector<Input>, std::error_code> inputs =
       std::move(**session).take_inputs();
   if (!inputs.has_value()) {
     co_return std::unexpected(inputs.error());

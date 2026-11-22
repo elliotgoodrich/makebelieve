@@ -248,11 +248,11 @@ std::error_code take(const std::filesystem::path& written,
              : not_a_file(target);
 }
 
-// Recasts absolute traced input paths into paths relative to @a root, dropping
-// any that fall outside it.
-std::vector<std::filesystem::path> relativize(
-    const std::vector<std::filesystem::path>& inputs,
-    const std::filesystem::path& root) {
+// Recasts absolute traced input paths into paths relative to @a root - the
+// root itself, which a command may list, as the empty path - dropping any that
+// fall outside it.
+std::vector<Input> relativize(const std::vector<Input>& inputs,
+                              const std::filesystem::path& root) {
   // relative() is lexical, so it only cancels root against an input whose
   // leading components match exactly. Traced inputs are canonicalised and can
   // differ in case from root as given, so canonicalise root to match.
@@ -263,12 +263,12 @@ std::vector<std::filesystem::path> relativize(
     canonical_root = root;
   }
 
-  std::vector<std::filesystem::path> result;
+  std::vector<Input> result;
   result.reserve(inputs.size());
-  for (const std::filesystem::path& input : inputs) {
+  for (const Input& input : inputs) {
     std::error_code relative_ec;
     const std::filesystem::path relative =
-        std::filesystem::relative(input, canonical_root, relative_ec);
+        std::filesystem::relative(input.path, canonical_root, relative_ec);
     if (relative_ec || relative.empty()) {
       continue;
     }
@@ -276,7 +276,8 @@ std::vector<std::filesystem::path> relativize(
     if (normal.begin() != normal.end() && *normal.begin() == "..") {
       continue;  // escapes the root
     }
-    result.push_back(normal);
+    result.emplace_back(normal == "." ? std::filesystem::path() : normal,
+                        input.listed);
   }
   return result;
 }
@@ -403,8 +404,7 @@ exec::task<BuildResult> detail::run_shell_command(
   }
   // What it read, whether or not it built anything: a failure is retried when
   // one of these changes, as a success is rebuilt.
-  std::vector<std::filesystem::path> inputs =
-      relativize(result->inputs, working_directory);
+  std::vector<Input> inputs = relativize(result->inputs, working_directory);
   const auto fail = [&inputs](std::error_code error,
                               std::string standard_error) {
     return std::unexpected(

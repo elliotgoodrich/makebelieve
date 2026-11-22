@@ -112,9 +112,11 @@ class InMemoryDirectoryTree::Impl {
               !std::holds_alternative<DirectoryInfo>(it->second)) &&
              "write_file() must not target an existing directory");
 
-      diff.entries_changed = {*normalized};
       if (it == m_entries.end()) {
-        diff.child_lists_changed = {normalized->parent_path()};
+        diff.changed_listings = {normalized->parent_path()};
+        diff.changed_subtrees = {*normalized};
+      } else {
+        diff.changed_paths = {*normalized};
       }
       m_entries.insert_or_assign(*normalized, std::move(file));
     }
@@ -136,8 +138,8 @@ class InMemoryDirectoryTree::Impl {
       assert(!m_entries.contains(*normalized) &&
              "make_directory() must not target an existing entry");
 
-      diff.entries_changed = {*normalized};
-      diff.child_lists_changed = {normalized->parent_path()};
+      diff.changed_listings = {normalized->parent_path()};
+      diff.changed_subtrees = {*normalized};
       m_entries[*normalized] = DirectoryInfo{.mtime = mtime};
     }
     notify_subscribers(diff);
@@ -155,11 +157,13 @@ class InMemoryDirectoryTree::Impl {
       assert(m_entries.contains(*normalized) &&
              "remove() must target an existing entry");
 
-      diff.child_lists_changed = {normalized->parent_path()};
+      // Everything beneath it is named too, though its subtree stands for
+      // it, as a mount announces each path that goes.
+      diff.changed_listings.insert(normalized->parent_path());
       for (auto it = m_entries.begin(); it != m_entries.end();) {
         if (it->first == *normalized ||
             DirectoryTreeUtil::is_within(it->first, *normalized)) {
-          diff.entries_changed.push_back(it->first);
+          diff.changed_subtrees.insert(it->first);
           it = m_entries.erase(it);
         } else {
           ++it;
@@ -182,7 +186,10 @@ class InMemoryDirectoryTree::Impl {
       assert(it != m_entries.end() &&
              "set_mtime() must target an existing entry");
       if (auto* dir = std::get_if<DirectoryInfo>(&it->second)) {
+        // A directory's value is its entries, which this leaves alone, so
+        // it is no change to announce.
         dir->mtime = mtime;
+        return;
       } else {
         auto& file = std::get<StoredFile>(it->second);
         if (file.info.mtime != mtime) {
@@ -191,7 +198,7 @@ class InMemoryDirectoryTree::Impl {
         }
       }
 
-      diff.entries_changed = {*normalized};
+      diff.changed_paths = {*normalized};
     }
     notify_subscribers(diff);
   }
@@ -340,12 +347,14 @@ void InMemoryDirectoryTree::set_mtime(
 }
 
 std::expected<EntryInfo, std::error_code> InMemoryDirectoryTree::status(
-    const std::filesystem::path& path) const {
+    const std::filesystem::path& path,
+    const OpenContext& /*context*/) const {
   return m_impl->status(path);
 }
 
 std::expected<std::vector<TreeEntry>, std::error_code>
-InMemoryDirectoryTree::ls(const std::filesystem::path& path) const {
+InMemoryDirectoryTree::ls(const std::filesystem::path& path,
+                          const OpenContext& /*context*/) const {
   return m_impl->ls(path);
 }
 

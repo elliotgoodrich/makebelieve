@@ -29,6 +29,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace makebelieve {
@@ -37,7 +38,7 @@ namespace {
 
 // Bumped whenever the tables change shape. A cache of any other version is
 // emptied rather than migrated: it only saves rebuilding.
-constexpr int k_schema_version = 1;
+constexpr int k_schema_version = 3;
 
 constexpr std::string_view k_schema = R"sql(
 CREATE TABLE outputs(
@@ -51,6 +52,7 @@ CREATE INDEX outputs_by_hash ON outputs(hash);
 CREATE TABLE inputs(
   output TEXT NOT NULL,
   path TEXT NOT NULL,
+  kind INTEGER NOT NULL,
   mtime INTEGER NOT NULL,
   size INTEGER NOT NULL,
   hash TEXT NOT NULL,
@@ -384,7 +386,8 @@ std::vector<BuildCache::Record> BuildCache::records() const {
 
   Statement inputs(
       m_db,
-      "SELECT output, path, mtime, size, hash FROM inputs ORDER BY rowid");
+      "SELECT output, path, kind, mtime, size, hash FROM inputs ORDER BY "
+      "rowid");
   while (inputs.step()) {
     const auto it = by_output.find(inputs.text(0));
     if (it == by_output.end()) {
@@ -392,9 +395,10 @@ std::vector<BuildCache::Record> BuildCache::records() const {
     }
     records[it->second].inputs.push_back(
         Input{.path = from_text(inputs.text(1)),
-              .mtime = inputs.integer(2),
-              .size = inputs.integer(3),
-              .hash = inputs.text(4)});
+              .kind = static_cast<Input::Kind>(inputs.integer(2)),
+              .mtime = inputs.integer(3),
+              .size = inputs.integer(4),
+              .hash = inputs.text(5)});
   }
   return records;
 }
@@ -511,11 +515,12 @@ void BuildCache::record(const Command& command,
               raw_mtime(mtime))
         .run();
     Statement insert(m_db,
-                     "INSERT OR IGNORE INTO inputs(output, path, mtime, size, "
-                     "hash) VALUES (?, ?, ?, ?, ?)");
+                     "INSERT OR IGNORE INTO inputs(output, path, kind, mtime, "
+                     "size, hash) VALUES (?, ?, ?, ?, ?, ?)");
     for (const Input& input : inputs) {
       insert
-          .bind(output, to_text(input.path), input.mtime, input.size,
+          .bind(output, to_text(input.path),
+                static_cast<std::int64_t>(input.kind), input.mtime, input.size,
                 input.hash)
           .run();
     }
@@ -612,6 +617,24 @@ std::expected<std::string, std::error_code> BuildCache::hash(
 
 std::int64_t BuildCache::raw_mtime(std::chrono::file_clock::time_point time) {
   return static_cast<std::int64_t>(time.time_since_epoch().count());
+}
+
+std::string BuildCache::hash_entries(std::span<const TreeEntry> entries) {
+  // Each entry is hashed alone - its name's bytes as the platform holds them,
+  // seeded by whether it is a directory - and the hashes summed, so the order
+  // a listing comes in counts for nothing, with nothing sorted or copied. The
+  // names in one directory are distinct, so no two of them cancel out.
+  XXH128_hash_t sum{.low64 = entries.size(), .high64 = 0};
+  for (const TreeEntry& entry : entries) {
+    const std::filesystem::path::string_type& name = entry.name.native();
+    const XXH128_hash_t one = XXH3_128bits_withSeed(
+        name.data(), name.size() * sizeof(name[0]),
+        std::holds_alternative<DirectoryInfo>(entry.info) ? 1 : 0);
+    const std::uint64_t low = sum.low64 + one.low64;
+    sum.high64 += one.high64 + (low < sum.low64 ? 1 : 0);
+    sum.low64 = low;
+  }
+  return to_text(sum);
 }
 
 }  // namespace makebelieve
