@@ -410,6 +410,45 @@ fails. Pending opens suspend as coroutines and consume no dispatcher
 thread, so there is no 64-open limit. Linux uses low-level FUSE replies;
 Windows defers WinFsp transactions. Unmount cancels pending requests.
 
+## Dependencies
+
+`deps` prints what an output was last built from, as a tree, in the style of
+`cargo tree`. It reads what is kept in the build directory, so it works
+whether or not that directory is mounted, and never builds anything:
+
+```text
+$ makebelieve deps ../output @/site/index.html
+@/site/index.html
+├── @/site/index.md
+│   └── index.txt
+└── template.html
+```
+
+Outputs are named `@/path`, and anything else by its path from the manifest's
+directory. Only what has been built is known: an output that has not been
+built since it last went out of date has no dependencies to print, and is an
+error to ask about.
+
+- `-i`, `--invert`: print what depends on each path instead, which may be a
+  source file, a directory, a missing path or an output.
+- `--depth <n>`: go at most `n` steps, so `--depth 1` is direct dependencies.
+- `--prefix <style>`: `indent`, the default, draws the tree; `depth` puts each
+  path's distance before it; `none` prints a sorted list of every path once,
+  for scripts.
+- `--charset <charset>`: `utf8`, the default, draws with box-drawing
+  characters; `ascii` uses `|`, `-` and a backtick, for terminals or pipes that
+  mangle them.
+- `--no-dedupe`: repeat what is beneath a path each time it appears. Otherwise
+  it is printed once, and later appearances are marked `(*)`.
+- `--all`: include directories that were only looked at, and paths found
+  missing, marked `(directory)` and `(missing)`. A directory that was listed
+  is always included, marked `(listed)`.
+
+```sh
+makebelieve deps --prefix none ../output @/site/index.html  # every input
+makebelieve deps -i ../output index.txt                     # what it affects
+```
+
 ## Resuming
 
 Every successful build is kept in the build directory's `.makebelieve`,

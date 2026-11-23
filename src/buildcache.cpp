@@ -275,6 +275,67 @@ void mark_as_cache(const std::filesystem::path& directory) {
              "#\thttps://bford.info/cachedir/\n");
 }
 
+// How long a connection waits on another's brief hold of the records.
+constexpr int k_busy_timeout_ms = 5000;
+
+// Opens the database at @a path with @a flags, or throws.
+sqlite3* open_database(const std::filesystem::path& path, int flags) {
+  const std::string name = to_text(path);
+  sqlite3* db = nullptr;
+  if (const int code = sqlite3_open_v2(name.c_str(), &db,
+                                       flags | SQLITE_OPEN_NOMUTEX, nullptr);
+      code != SQLITE_OK) {
+    // A handle comes back even on failure, to say why; it must still close.
+    const ScopeGuard close([db] { sqlite3_close(db); });
+    fail(db, code, std::format("opening {}", name));
+  }
+  return db;
+}
+
+// Every output recorded in @a db, with its inputs.
+std::vector<BuildCache::Record> select_records(sqlite3* db) {
+  std::vector<BuildCache::Record> records;
+  std::unordered_map<std::string, std::size_t> by_output;
+
+  Statement outputs(db,
+                    "SELECT path, action, command, hash, mtime FROM outputs");
+  while (outputs.step()) {
+    const std::optional<Manifest::Action> action =
+        action_from_text(outputs.text(1));
+    if (!action.has_value()) {
+      continue;  // nothing this version wrote, so nothing it can rebuild from
+    }
+    const std::string path = outputs.text(0);
+    by_output.emplace(path, records.size());
+    records.push_back(BuildCache::Record{
+        .command = Command{.output = from_text(path),
+                           .action = *action,
+                           .text = outputs.text(2)},
+        .hash = outputs.text(3),
+        .mtime = std::chrono::file_clock::time_point(
+            std::chrono::file_clock::duration(outputs.integer(4))),
+        .inputs = {}});
+  }
+
+  Statement inputs(
+      db,
+      "SELECT output, path, kind, mtime, size, hash FROM inputs ORDER BY "
+      "rowid");
+  while (inputs.step()) {
+    const auto it = by_output.find(inputs.text(0));
+    if (it == by_output.end()) {
+      continue;
+    }
+    records[it->second].inputs.push_back(BuildCache::Input{
+        .path = from_text(inputs.text(1)),
+        .kind = static_cast<BuildCache::Input::Kind>(inputs.integer(2)),
+        .mtime = inputs.integer(3),
+        .size = inputs.integer(4),
+        .hash = inputs.text(5)});
+  }
+  return records;
+}
+
 }  // namespace
 
 BuildCache::BuildCache(std::filesystem::path directory)
@@ -284,25 +345,22 @@ BuildCache::BuildCache(std::filesystem::path directory)
   std::filesystem::create_directories(m_objects);
   mark_as_cache(m_directory);
 
-  const std::string database = to_text(m_directory / "cache.sqlite");
-  if (const int code = sqlite3_open_v2(
-          database.c_str(), &m_db,
-          SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX,
-          nullptr);
-      code != SQLITE_OK) {
-    // A handle comes back even on failure, to say why; it must still close.
-    const ScopeGuard close([db = m_db] { sqlite3_close(db); });
-    fail(m_db, code, std::format("opening {}", database));
-  }
-  ScopeGuard close_on_failure([this] { sqlite3_close(m_db); });
+  ScopeGuard close_on_failure([this] {
+    sqlite3_close(m_db);
+    sqlite3_close(m_lock);
+  });
+  m_lock = open_database(m_directory / "lock.sqlite",
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
 
-  // Exclusive locking holds the database from the first transaction until the
-  // connection closes, which is what keeps a second instance out. Without a
+  // Exclusive locking holds this database from the first transaction until the
+  // connection closes, which is what keeps a second instance out. It is a
+  // database of its own so that the records stay open to readers. Without a
   // busy timeout, that instance fails at once rather than waiting: `makebelieve
   // unmount` returns only once the process it stops has closed its cache.
-  execute(m_db, "PRAGMA locking_mode = EXCLUSIVE");
-  const int locked =
-      sqlite3_exec(m_db, "BEGIN EXCLUSIVE; COMMIT", nullptr, nullptr, nullptr);
+  execute(m_lock, "PRAGMA locking_mode = EXCLUSIVE");
+  const int locked = sqlite3_exec(
+      m_lock, "BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS held(id); COMMIT",
+      nullptr, nullptr, nullptr);
   if (locked == SQLITE_BUSY || locked == SQLITE_LOCKED) {
     // The error appends what the code says.
     throw std::system_error(
@@ -314,8 +372,13 @@ BuildCache::BuildCache(std::filesystem::path directory)
             m_directory.string()));
   }
   if (locked != SQLITE_OK) {
-    fail(m_db, locked, "locking the database");
+    fail(m_lock, locked, "locking the database");
   }
+
+  m_db = open_database(m_directory / "cache.sqlite",
+                       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+  // Only a reader starting or finishing can hold this up, and only briefly.
+  sqlite3_busy_timeout(m_db, k_busy_timeout_ms);
   execute(m_db, "PRAGMA journal_mode = WAL");
   // A crash loses at most the last few records with WAL at NORMAL, but never
   // corrupts the database, which is all a cache needs.
@@ -348,7 +411,9 @@ BuildCache::BuildCache(std::filesystem::path directory)
 }
 
 BuildCache::~BuildCache() {
+  // In this order, so the next instance cannot get in before this one is done.
   sqlite3_close(m_db);
+  sqlite3_close(m_lock);
 }
 
 const std::filesystem::path& BuildCache::directory() const {
@@ -361,46 +426,27 @@ const std::filesystem::path& BuildCache::scratch_directory() const {
 
 std::vector<BuildCache::Record> BuildCache::records() const {
   const std::lock_guard lock(m_mutex);
-  std::vector<Record> records;
-  std::unordered_map<std::string, std::size_t> by_output;
+  return select_records(m_db);
+}
 
-  Statement outputs(m_db,
-                    "SELECT path, action, command, hash, mtime FROM outputs");
-  while (outputs.step()) {
-    const std::optional<Manifest::Action> action =
-        action_from_text(outputs.text(1));
-    if (!action.has_value()) {
-      continue;  // nothing this version wrote, so nothing it can rebuild from
-    }
-    const std::string path = outputs.text(0);
-    by_output.emplace(path, records.size());
-    records.push_back(
-        Record{.command = Command{.output = from_text(path),
-                                  .action = *action,
-                                  .text = outputs.text(2)},
-               .hash = outputs.text(3),
-               .mtime = std::chrono::file_clock::time_point(
-                   std::chrono::file_clock::duration(outputs.integer(4))),
-               .inputs = {}});
+std::vector<BuildCache::Record> BuildCache::read_records(
+    const std::filesystem::path& directory) {
+  const std::filesystem::path database = directory / "cache.sqlite";
+  if (!std::filesystem::exists(database)) {
+    return {};
   }
+  sqlite3* const db = open_database(database, SQLITE_OPEN_READONLY);
+  const ScopeGuard close([db] { sqlite3_close(db); });
+  sqlite3_busy_timeout(db, k_busy_timeout_ms);
 
-  Statement inputs(
-      m_db,
-      "SELECT output, path, kind, mtime, size, hash FROM inputs ORDER BY "
-      "rowid");
-  while (inputs.step()) {
-    const auto it = by_output.find(inputs.text(0));
-    if (it == by_output.end()) {
-      continue;
-    }
-    records[it->second].inputs.push_back(
-        Input{.path = from_text(inputs.text(1)),
-              .kind = static_cast<Input::Kind>(inputs.integer(2)),
-              .mtime = inputs.integer(3),
-              .size = inputs.integer(4),
-              .hash = inputs.text(5)});
+  // One transaction, so a build recorded meanwhile is seen whole or not at all.
+  const Transaction transaction(db);
+  Statement version(db, "PRAGMA user_version");
+  version.step();
+  if (version.integer(0) != k_schema_version) {
+    return {};
   }
-  return records;
+  return select_records(db);
 }
 
 std::expected<std::shared_ptr<const OpenedFile>, std::error_code>
