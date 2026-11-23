@@ -24,11 +24,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <ios>
 #include <iterator>
@@ -3619,6 +3621,67 @@ TEST_F(BuildDirectoryTreeTest, ADirectoryMovedAwayRebuildsWhatReadBeneathIt) {
   announcing.announce(
       DirectoryTreeDiff{.changed_listings = {""}, .changed_subtrees = {"src"}});
   EXPECT_EQ(runs, 2);
+}
+
+// As AnnouncingTree, but runs a hook once, just after the next look at a path
+// has found what it returns - so as if a change landed right after that look.
+class ChangedAfterLookTree : public AnnouncingTree {
+ public:
+  void after_next_look_at(std::filesystem::path path,
+                          std::function<void()> hook) {
+    const std::lock_guard lock(m_hook_mutex);
+    m_path = std::move(path);
+    m_hook = std::move(hook);
+  }
+
+  [[nodiscard]] std::expected<EntryInfo, std::error_code> status(
+      const std::filesystem::path& path,
+      const makebelieve::OpenContext& context = {}) const override {
+    std::expected<EntryInfo, std::error_code> found =
+        AnnouncingTree::status(path, context);
+    std::function<void()> hook;
+    {
+      const std::lock_guard lock(m_hook_mutex);
+      if (path == m_path) {
+        hook = std::exchange(m_hook, nullptr);
+      }
+    }
+    if (hook) {
+      hook();
+    }
+    return found;
+  }
+
+ private:
+  mutable std::mutex m_hook_mutex;
+  mutable std::filesystem::path m_path;
+  mutable std::function<void()> m_hook;
+};
+
+// A build's inputs are stamped holding no lock, so a change can land between
+// its stamp and its store. The stale stamp is not recorded, and the rebuild
+// that change causes keeps its own record.
+TEST_F(BuildDirectoryTreeTest, AChangeWhileStampingKeepsOnlyTheNewerBuild) {
+  ChangedAfterLookTree changing;
+  changing.inner.write_file("build.makebelieve",
+                            "@/output.txt = run build %out\n");
+  changing.inner.write_file("input.txt", "v1");
+  BuildCache cache(work / "cache");
+  int runs = 0;
+  const BuildDirectoryTree tree(
+      changing, counting_with_inputs(runs, {"input.txt"}), {}, &cache);
+
+  const std::string changed = "changed";
+  changing.after_next_look_at(
+      "input.txt", [&] { changing.inner.write_file("input.txt", changed); });
+  (void)read_output(tree, "output.txt");
+  EXPECT_EQ(read_output(tree, "output.txt"), "build 2");
+
+  const std::vector<BuildCache::Record> records = cache.records();
+  ASSERT_EQ(records.size(), 1U);
+  ASSERT_EQ(records[0].inputs.size(), 1U);
+  EXPECT_EQ(records[0].inputs[0].size,
+            static_cast<std::int64_t>(changed.size()));
 }
 
 // Finds each build by the pid its command makes requests with: pid N is the

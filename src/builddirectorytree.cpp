@@ -1925,24 +1925,35 @@ class BuildDirectoryTree::Impl {
     return std::filesystem::path(text.substr(k_generated_prefix.size()));
   }
 
+  // Whether nothing has invalidated @a output since the build @a keep describes
+  // started.
+  // @pre m_mutex is held.
+  [[nodiscard]] bool is_current(const std::filesystem::path& output,
+                                const Keep& keep) const {
+    const auto invalidations = m_invalidations.find(output);
+    return (invalidations == m_invalidations.end()
+                ? 0
+                : invalidations->second) == keep.invalidations_at_start;
+  }
+
   // Keeps @a output's build, @a built, in the cache - handing it the file the
-  // runner left, if there is one - unless something invalidated it since it
-  // started, or an input it read cannot be stamped, in which case the output
-  // is left with no record.
+  // runner left, if there is one. If something invalidated it since it
+  // started, this leaves the cache alone, as whatever did so drops the
+  // output's record itself, and may since have been followed by a newer build
+  // whose record this must not touch. If an input it read cannot be stamped,
+  // the output is left with no record.
   void keep_in_cache(const std::filesystem::path& output,
                      Built& built,
                      const Keep& keep) {
-    const std::lock_guard cache_lock(m_cache_mutex);
     std::vector<BuildCache::Input> stamps;
     // The hash of each output it read that has one, as served.
     std::map<std::filesystem::path, std::string> hashes;
     bool keepable = true;
     {
       const std::lock_guard lock(m_mutex);
-      const auto invalidations = m_invalidations.find(output);
-      keepable = (invalidations == m_invalidations.end()
-                      ? 0
-                      : invalidations->second) == keep.invalidations_at_start;
+      if (!is_current(output, keep)) {
+        return;
+      }
       for (const Input& input : keep.inputs) {
         if (const std::optional<std::filesystem::path> read =
                 output_named_by(input.path)) {
@@ -1952,10 +1963,11 @@ class BuildDirectoryTree::Impl {
         }
       }
     }
-    // Stamped outside m_mutex, as a source stamp reaches the disk and an
-    // output's reaches m_structure. A change landing after the stamp
-    // invalidates the output, whose record is then dropped once this one is
-    // in place.
+    // Stamped outside both locks, as a source stamp reaches the disk and an
+    // output's reaches m_structure, so that builds finishing together do not
+    // queue behind each other's inputs. A change landing after the stamp
+    // invalidates the output: either that is seen below, or its record is
+    // dropped once this one is in place.
     for (const Input& input : keep.inputs) {
       if (!keepable) {
         break;
@@ -1972,6 +1984,14 @@ class BuildDirectoryTree::Impl {
       keepable = stamp.has_value();
       if (keepable) {
         stamps.push_back(std::move(*stamp));
+      }
+    }
+
+    const std::lock_guard cache_lock(m_cache_mutex);
+    {
+      const std::lock_guard lock(m_mutex);
+      if (!is_current(output, keep)) {
+        return;
       }
     }
     // Best-effort: a build the cache cannot keep is just built again next run.
