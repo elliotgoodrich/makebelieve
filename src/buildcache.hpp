@@ -37,8 +37,9 @@ namespace makebelieve {
 /// names it and it is deleted. Beside them is `scratch/`, for builds to write
 /// to before what they built is stored, emptied whenever the cache opens.
 ///
-/// Holds the directory exclusively for its whole life: a second `BuildCache`
-/// on the same directory, in this process or another, fails to open.
+/// Holds the directory exclusively for its whole life, through a lock on
+/// `lock.sqlite`: a second `BuildCache` on the same directory, in this process
+/// or another, fails to open. @link read_records can still read it meanwhile.
 ///
 /// Thread-safe: every member may be called from any thread.
 class BuildCache {
@@ -127,6 +128,13 @@ class BuildCache {
   /// Every output recorded, in no particular order.
   [[nodiscard]] std::vector<Record> records() const;
 
+  /// Every output recorded in the cache in @a directory, in no particular
+  /// order, as of one moment - whether or not a `BuildCache` holds it, and
+  /// changing nothing there. Empty if there is no cache, or one written by an
+  /// incompatible version. Throws `std::system_error` if it cannot be read.
+  [[nodiscard]] static std::vector<Record> read_records(
+      const std::filesystem::path& directory);
+
   /// The content whose hash is @a hash, opened, or `no_such_file_or_directory`
   /// if it is missing or no longer matches its hash - which it reads it all
   /// through to find out. It goes on reading that content however the cache
@@ -200,6 +208,10 @@ class BuildCache {
   // files with the records naming them.
   mutable std::mutex m_mutex;
   sqlite3* m_db = nullptr;
+
+  // Held open and exclusively locked for as long as this cache lives, keeping
+  // out a second one while leaving m_db open to readers.
+  sqlite3* m_lock = nullptr;
 
   // Numbers the scratch files content is written to before being renamed into
   // place, so two writes never share one.

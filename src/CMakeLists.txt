@@ -36,6 +36,7 @@ add_library(makebelieve_core STATIC
   buildcoordinator.cpp
   builddirectorytree.cpp
   consoleinterrupthandler-${MAKEBELIEVE_PLATFORM}.cpp
+  dependencygraph.cpp
   directorytreeutil.cpp
   filesystemutil.cpp
   inmemorydirectorytree.cpp
@@ -159,6 +160,7 @@ if(BUILD_TESTING)
   makebelieve_add_test(buildcache)
   makebelieve_add_test(buildcoordinator)
   makebelieve_add_test(builddirectorytree)
+  makebelieve_add_test(dependencygraph)
   makebelieve_add_test(filesystemutil)
   makebelieve_add_test(manifest)
   makebelieve_add_test(osbuildprocesstracker)

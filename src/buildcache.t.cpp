@@ -4,9 +4,11 @@
 #include "directorytreeutil.hpp"
 #include "filesystemutil.hpp"
 #include "openedfileutil.hpp"
+#include "scopeguard.hpp"
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <expected>
@@ -15,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -256,6 +259,55 @@ TEST_F(BuildCacheTest, ASecondCacheOnTheSameDirectoryFails) {
 TEST_F(BuildCacheTest, TheDirectoryIsFreeOnceTheCacheGoes) {
   { const BuildCache cache(directory); }
   EXPECT_NO_THROW(const BuildCache cache(directory));
+}
+
+TEST_F(BuildCacheTest, ReadingRecordsWithNoCacheFindsNoneAndCreatesNothing) {
+  EXPECT_TRUE(BuildCache::read_records(directory).empty());
+  EXPECT_FALSE(std::filesystem::exists(directory));
+}
+
+TEST_F(BuildCacheTest, RecordsCanBeReadWhileTheCacheIsHeldAndAfter) {
+  const std::vector<BuildCache::Input> inputs{
+      {.path = "in.txt", .kind = BuildCache::Input::Kind::file, .size = 1}};
+  {
+    BuildCache cache(directory);
+    cache.store(run("out", "c"), "built", k_built, inputs);
+    const std::filesystem::path in_scratch =
+        cache.scratch_directory() / "in-progress";
+    ASSERT_FALSE(FileSystemUtil::write_file(in_scratch, "x"));
+
+    EXPECT_EQ(BuildCache::read_records(directory), cache.records());
+    EXPECT_TRUE(std::filesystem::exists(in_scratch));
+
+    // Reading does not take the cache from whoever holds it.
+    cache.store(run("other", "c"), "more", k_built, inputs);
+    EXPECT_EQ(BuildCache::read_records(directory).size(), 2U);
+  }
+  EXPECT_EQ(BuildCache::read_records(directory).size(), 2U);
+}
+
+TEST_F(BuildCacheTest, ARecordIsReadWholeWhileBeingWritten) {
+  const std::vector<BuildCache::Input> inputs{
+      {.path = "a", .kind = BuildCache::Input::Kind::file},
+      {.path = "b", .kind = BuildCache::Input::Kind::file},
+      {.path = "c", .kind = BuildCache::Input::Kind::file}};
+  BuildCache cache(directory);
+  cache.store(run("out", "c"), "0", k_built, inputs);
+
+  std::atomic<bool> done = false;
+  std::thread writer([&] {
+    for (int i = 1; i <= 200; ++i) {
+      cache.store(run("out", "c"), std::to_string(i), k_built, inputs);
+    }
+    done = true;
+  });
+  const ScopeGuard join([&writer] { writer.join(); });
+  while (!done) {
+    const std::vector<BuildCache::Record> records =
+        BuildCache::read_records(directory);
+    ASSERT_EQ(records.size(), 1U);
+    ASSERT_EQ(records[0].inputs, inputs);
+  }
 }
 
 TEST_F(BuildCacheTest, HashesAreThirtyTwoHexDigits) {

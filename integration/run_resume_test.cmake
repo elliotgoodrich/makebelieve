@@ -108,6 +108,37 @@ function(expect_size stage output size)
   endif()
 endfunction()
 
+# Fails, naming `stage`, unless `makebelieve deps` with the remaining arguments
+# succeeds and prints a line for each of the list `present` and none for any of
+# the list `absent`. Other lines are allowed, as what else a command looks at,
+# such as the directory it runs in, depends on the version of the tool.
+function(expect_deps stage present absent)
+  execute_process(COMMAND "${MAKEBELIEVE_EXE}" deps ${ARGN}
+                  OUTPUT_VARIABLE value ERROR_VARIABLE error
+                  RESULT_VARIABLE rc TIMEOUT ${READ_TIMEOUT})
+  if(NOT rc EQUAL 0)
+    set(FAILURES "${FAILURES};${stage}: deps failed (${rc}): ${error}"
+        PARENT_SCOPE)
+    return()
+  endif()
+  string(REPLACE "\r\n" "\n" value "${value}")
+  string(REPLACE "\n" ";" lines "${value}")
+  set(problems "")
+  foreach(line IN LISTS present)
+    list(FIND lines "${line}" found)
+    if(found EQUAL -1)
+      string(APPEND problems ";${stage}: deps did not print '${line}': '${value}'")
+    endif()
+  endforeach()
+  foreach(line IN LISTS absent)
+    list(FIND lines "${line}" found)
+    if(NOT found EQUAL -1)
+      string(APPEND problems ";${stage}: deps printed '${line}': '${value}'")
+    endif()
+  endforeach()
+  set(FAILURES "${FAILURES}${problems}" PARENT_SCOPE)
+endfunction()
+
 set(TOP_FIRST "top: middle: first input\n")
 
 # The first run builds both.
@@ -117,7 +148,16 @@ expect_builds("first run" "top\nmiddle\n")
 # Sized on disk rather than from what reading it gave, which on Windows has
 # lost its carriage returns.
 file(SIZE "${MNT}/top.txt" top_size)
+# What was built can be asked about while it is being served...
+expect_deps("while mounted" "@/middle.txt;build.cmake;input.txt" ""
+            --prefix=none "${BUILD_DIR}" @/top.txt)
+expect_deps("while mounted, inverted" "@/middle.txt;@/top.txt" ""
+            -i --prefix none "${BUILD_DIR}" input.txt)
 unmount()
+# ...and once it no longer is. Only @/middle.txt read input.txt, so it is two
+# steps from @/top.txt.
+expect_deps("unmounted" "@/middle.txt;build.cmake" "input.txt"
+            --depth 1 --prefix none "${BUILD_DIR}" @/top.txt)
 
 # The next run serves both as they were, building nothing.
 mount()

@@ -5,10 +5,12 @@
 #include "buildpermits.hpp"
 #include "buildqueue.hpp"
 #include "consoleinterrupthandler.hpp"
+#include "dependencygraph.hpp"
 #include "filesystemutil.hpp"
 #include "iocontext.hpp"
 #include "osbuildprocesstracker.hpp"
 #include "realdirectorytree.hpp"
+#include "scopeguard.hpp"
 #include "shellrunner.hpp"
 #include "tracer.hpp"
 #include "unmountchannel.hpp"
@@ -24,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <expected>
 #include <filesystem>
 #include <optional>
 #include <print>
@@ -34,8 +37,11 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/resource.h>
 #endif
 
@@ -62,6 +68,10 @@ int usage(const char* program) {
       stderr,
       "usage: {0} mount [-j <builds>] [--build=requested|all] <directory>\n"
       "       {0} unmount <directory>\n"
+      "       {0} deps [-i|--invert] [--depth <n>] "
+      "[--prefix <indent|depth|none>]\n"
+      "            [--charset <utf8|ascii>] [--no-dedupe] [--all]\n"
+      "            <directory> <path>...\n"
       "outputs are served at <directory>/mount and kept in\n"
       "<directory>/.makebelieve; mount's options may also follow the "
       "directory",
@@ -303,6 +313,150 @@ int unmount(const char* directory_arg) {
   std::unreachable();
 }
 
+// How `deps` was asked to print.
+struct DepsOptions {
+  // Holds the cache.
+  const char* directory = nullptr;
+  // The paths to print the dependencies of.
+  std::vector<std::string> paths;
+  DependencyGraph::Options graph;
+};
+
+// The prefix style @a name names, as `--prefix` spells it, if any.
+std::optional<DependencyGraph::Prefix> parse_prefix(std::string_view name) {
+  if (name == "indent") {
+    return DependencyGraph::Prefix::indent;
+  }
+  if (name == "depth") {
+    return DependencyGraph::Prefix::depth;
+  }
+  if (name == "none") {
+    return DependencyGraph::Prefix::none;
+  }
+  return std::nullopt;
+}
+
+// The charset @a name names, as `--charset` spells it, if any.
+std::optional<DependencyGraph::Charset> parse_charset(std::string_view name) {
+  if (name == "utf8") {
+    return DependencyGraph::Charset::utf8;
+  }
+  if (name == "ascii") {
+    return DependencyGraph::Charset::ascii;
+  }
+  return std::nullopt;
+}
+
+// Reads `deps`' arguments - @a args, those after the command - or nothing if
+// they are not a directory, at least one path and options, each given at most
+// once. An option's value may be the next argument or follow an `=`.
+std::optional<DepsOptions> parse_deps(std::span<char* const> args) {
+  DepsOptions options;
+  bool prefix_given = false;
+  bool charset_given = false;
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    const std::string_view arg = args[i];
+    const std::string_view name = arg.substr(0, arg.find('='));
+    if (name == "--depth" || name == "--prefix" || name == "--charset") {
+      std::string_view value;
+      if (name.size() != arg.size()) {
+        value = arg.substr(name.size() + 1);
+      } else if (++i < args.size()) {
+        value = args[i];
+      } else {
+        return std::nullopt;
+      }
+      if (name == "--depth") {
+        std::size_t depth = 0;
+        const auto [end, error] =
+            std::from_chars(value.data(), value.data() + value.size(), depth);
+        if (error != std::errc() || end != value.data() + value.size() ||
+            options.graph.depth.has_value()) {
+          return std::nullopt;
+        }
+        options.graph.depth = depth;
+      } else if (name == "--charset") {
+        const std::optional<DependencyGraph::Charset> charset =
+            parse_charset(value);
+        if (!charset.has_value() || charset_given) {
+          return std::nullopt;
+        }
+        options.graph.charset = *charset;
+        charset_given = true;
+      } else {
+        const std::optional<DependencyGraph::Prefix> prefix =
+            parse_prefix(value);
+        if (!prefix.has_value() || prefix_given) {
+          return std::nullopt;
+        }
+        options.graph.prefix = *prefix;
+        prefix_given = true;
+      }
+    } else if (arg == "-i" || arg == "--invert") {
+      if (options.graph.invert) {
+        return std::nullopt;
+      }
+      options.graph.invert = true;
+    } else if (arg == "--no-dedupe") {
+      if (options.graph.no_dedupe) {
+        return std::nullopt;
+      }
+      options.graph.no_dedupe = true;
+    } else if (arg == "--all") {
+      if (options.graph.all) {
+        return std::nullopt;
+      }
+      options.graph.all = true;
+    } else if (arg.starts_with('-')) {
+      return std::nullopt;
+    } else if (options.directory == nullptr) {
+      options.directory = args[i];
+    } else {
+      options.paths.emplace_back(arg);
+    }
+  }
+  if (options.directory == nullptr || options.paths.empty()) {
+    return std::nullopt;
+  }
+  return options;
+}
+
+// Writes the UTF-8 @a text to standard output. A Windows console decodes what
+// it is given by its output code page, which is rarely UTF-8, so that is
+// switched for the write and put back after.
+void print_utf8(std::string_view text) {
+#ifdef _WIN32
+  // Zero if there is no console.
+  const UINT code_page = ::GetConsoleOutputCP();
+  if (code_page != 0) {
+    ::SetConsoleOutputCP(CP_UTF8);
+  }
+  const ScopeGuard restore([code_page] {
+    if (code_page != 0) {
+      ::SetConsoleOutputCP(code_page);
+    }
+  });
+#endif
+  std::print("{}", text);
+  std::fflush(stdout);
+}
+
+// Prints what @a options asks about the builds kept in its directory, which
+// may be being served from at the time.
+int deps(const DepsOptions& options) {
+  const std::vector<BuildCache::Record> records =
+      BuildCache::read_records(cache_directory_for(options.directory));
+  const DependencyGraph graph(records);
+  const std::expected<std::string, std::string> printed =
+      graph.print(options.paths, options.graph);
+  if (!printed.has_value()) {
+    std::println(stderr, "makebelieve: {}", printed.error());
+    return 1;
+  }
+  print_utf8(*printed);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -324,6 +478,15 @@ int main(int argc, char** argv) {
     }
     if (command == "unmount" && argc == 3) {
       return unmount(argv[2]);
+    }
+    if (command == "deps") {
+      const std::optional<DepsOptions> options = parse_deps(
+          std::span<char* const>(argv, static_cast<std::size_t>(argc))
+              .subspan(2));
+      if (!options.has_value()) {
+        return usage(argv[0]);
+      }
+      return deps(*options);
     }
     return usage(argv[0]);
   } catch (const std::exception& error) {
