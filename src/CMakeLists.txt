@@ -108,8 +108,7 @@ target_link_libraries(makebelieve_core PRIVATE
 # linking the imported target PUBLIC propagates those to every TU sharing
 # directorytree.hpp's off_t.
 if(NOT WIN32)
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
+  makebelieve_find_fuse3()
   target_link_libraries(makebelieve_core PUBLIC PkgConfig::FUSE3)
   target_compile_definitions(makebelieve_core PRIVATE FUSE_USE_VERSION=35)
 endif()
@@ -148,13 +147,24 @@ if(BUILD_TESTING)
   add_executable(notifyprobe notifyprobe-${MAKEBELIEVE_PLATFORM}.m.cpp)
   makebelieve_apply_clang_tidy(notifyprobe)
 
+  # Disables the <target>_NOT_BUILT placeholder of a test binary not built.
+  function(makebelieve_discover_tests target)
+    gtest_discover_tests(${target} PROPERTIES TIMEOUT 30)
+    if(MAKEBELIEVE_SKIP_UNBUILT_TESTS)
+      set(skip_file "${CMAKE_CURRENT_BINARY_DIR}/${target}_skip_unbuilt.cmake")
+      file(CONFIGURE OUTPUT "${skip_file}" CONTENT
+        "set_tests_properties(${target}_NOT_BUILT PROPERTIES DISABLED TRUE)\n")
+      set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES "${skip_file}")
+    endif()
+  endfunction()
+
   function(makebelieve_add_test name)
     add_executable(${name}_test ${name}.t.cpp)
     target_link_libraries(${name}_test PRIVATE
       makebelieve_core
       GTest::gtest_main
     )
-    gtest_discover_tests(${name}_test PROPERTIES TIMEOUT 30)
+    makebelieve_discover_tests(${name}_test)
   endfunction()
 
   makebelieve_add_test(buildcache)
@@ -179,6 +189,11 @@ if(BUILD_TESTING)
   makebelieve_add_test(unmountchannel)
   if(WIN32)
     makebelieve_add_test(tracingenvironment)
+    # These run commands, which load the hook, so relink them when it changes.
+    foreach(name builddirectorytree osbuildprocesstracker processutil shellrunner)
+      set_property(TARGET ${name}_test APPEND PROPERTY
+        LINK_DEPENDS $<TARGET_FILE:makebelievehook>)
+    endforeach()
   endif()
 
   add_executable(consoleinterrupthandler_test consoleinterrupthandler.t.cpp)
@@ -186,7 +201,7 @@ if(BUILD_TESTING)
     makebelieve_core
     GTest::gtest
   )
-  gtest_discover_tests(consoleinterrupthandler_test PROPERTIES TIMEOUT 30)
+  makebelieve_discover_tests(consoleinterrupthandler_test)
 endif()
 
 if(MAKEBELIEVE_BUILD_BENCHMARKS)

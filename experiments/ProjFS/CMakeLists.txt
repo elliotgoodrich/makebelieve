@@ -21,3 +21,7 @@ add_test(NAME projfs_experiment_smoke
     -FilewatchExe "$<TARGET_FILE:filewatch>"
 )
 set_tests_properties(projfs_experiment_smoke PROPERTIES TIMEOUT 45)
+makebelieve_skip_if_not_built(projfs_experiment
+  TESTS projfs_experiment_smoke
+  TARGETS projfs_experiment filewatch
+  FILES "${CMAKE_CURRENT_SOURCE_DIR}/smoke_test.ps1")

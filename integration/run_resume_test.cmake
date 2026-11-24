@@ -10,6 +10,9 @@
 #   MAKEBELIEVE_EXE   the built makebelieve binary
 #   WORK_DIR          scratch directory this script owns exclusively
 
+include("${CMAKE_CURRENT_LIST_DIR}/require_built.cmake")
+require_built("${MAKEBELIEVE_EXE}")
+
 set(SRC "${WORK_DIR}/src")
 set(BUILD_DIR "${WORK_DIR}/out")
 set(MNT "${BUILD_DIR}/mount")

@@ -22,6 +22,14 @@ fi
 FUSE_BIN="$1"
 INOTIFY_WAIT_BIN="$2"
 
+# 77 is "not built": ctest skips on it in trimmed builds and fails otherwise.
+for bin in "$FUSE_BIN" "$INOTIFY_WAIT_BIN"; do
+  if [[ ! -e "$bin" ]]; then
+    echo "SKIP: $bin was not built" >&2
+    exit 77
+  fi
+done
+
 if [[ ! -e /dev/fuse ]]; then
   echo "FAIL: /dev/fuse not accessible in this environment" >&2
   exit 1

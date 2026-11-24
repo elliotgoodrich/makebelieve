@@ -57,3 +57,9 @@ add_test(NAME detours_tracing_experiment_smoke
     -CatfilesScript "${CMAKE_CURRENT_SOURCE_DIR}/../ETW_tracing/catfiles.ps1"
 )
 set_tests_properties(detours_tracing_experiment_smoke PROPERTIES TIMEOUT 30)
+makebelieve_skip_if_not_built(detours_tracing_experiment
+  TESTS detours_tracing_experiment_smoke
+  TARGETS detours_tracing_experiment detours_tracing_hook
+  FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/smoke_test.ps1"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../ETW_tracing/catfiles.ps1")

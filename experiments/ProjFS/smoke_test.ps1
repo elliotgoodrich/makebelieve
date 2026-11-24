@@ -28,6 +28,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# 77 is "not built": ctest skips on it in trimmed builds and fails otherwise.
+foreach ($exe in @($ProjfsExe, $FilewatchExe)) {
+  if (-not (Test-Path -LiteralPath $exe)) {
+    Write-Host "SKIP: $exe was not built"
+    exit 77
+  }
+}
+
 $mnt = Join-Path ([System.IO.Path]::GetTempPath()) ("projfs-mnt-" + [guid]::NewGuid())
 $tmpBase = Join-Path ([System.IO.Path]::GetTempPath()) ("projfs-log-" + [guid]::NewGuid())
 $readLog = "$tmpBase.reads.log"

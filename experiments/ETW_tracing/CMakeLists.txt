@@ -28,3 +28,9 @@ add_test(NAME etw_tracing_experiment_smoke
     -CatfilesScript "${CMAKE_CURRENT_SOURCE_DIR}/catfiles.ps1"
 )
 set_tests_properties(etw_tracing_experiment_smoke PROPERTIES TIMEOUT 30)
+makebelieve_skip_if_not_built(etw_tracing_experiment
+  TESTS etw_tracing_experiment_smoke
+  TARGETS etw_tracing_experiment
+  FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/smoke_test.ps1"
+    "${CMAKE_CURRENT_SOURCE_DIR}/catfiles.ps1")

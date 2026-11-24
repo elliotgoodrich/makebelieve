@@ -10,6 +10,9 @@
 #   FIXTURE_DIR       integration/fixture (build.makebelieve + inputs)
 #   WORK_DIR          scratch directory this script owns exclusively
 
+include("${CMAKE_CURRENT_LIST_DIR}/require_built.cmake")
+require_built("${MAKEBELIEVE_EXE}" "${NOTIFY_PROBE_EXE}")
+
 set(SRC "${WORK_DIR}/src")
 set(BUILD_DIR "${WORK_DIR}/out")
 set(MNT "${BUILD_DIR}/mount")

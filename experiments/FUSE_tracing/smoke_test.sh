@@ -20,6 +20,11 @@ if [[ $# -ne 1 ]]; then
   echo "usage: $0 <fuse_tracing_experiment-binary>" >&2
   exit 2
 fi
+# 77 is "not built": ctest skips on it in trimmed builds and fails otherwise.
+if [[ ! -e "$1" ]]; then
+  echo "SKIP: $1 was not built" >&2
+  exit 77
+fi
 BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 
 if [[ ! -e /dev/fuse ]]; then
