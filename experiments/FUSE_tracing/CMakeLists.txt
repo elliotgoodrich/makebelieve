@@ -3,8 +3,7 @@ if(WIN32)
   return()
 endif()
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
+makebelieve_find_fuse3()
 
 add_executable(fuse_tracing_experiment fuse_tracing.m.cpp)
 target_link_libraries(fuse_tracing_experiment
@@ -21,3 +20,7 @@ add_test(NAME fuse_tracing_experiment_smoke
     "$<TARGET_FILE:fuse_tracing_experiment>"
 )
 set_tests_properties(fuse_tracing_experiment_smoke PROPERTIES TIMEOUT 30)
+makebelieve_skip_if_not_built(fuse_tracing_experiment
+  TESTS fuse_tracing_experiment_smoke
+  TARGETS fuse_tracing_experiment
+  FILES "${CMAKE_CURRENT_SOURCE_DIR}/smoke_test.sh")

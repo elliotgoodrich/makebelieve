@@ -30,6 +30,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# 77 is "not built": ctest skips on it in trimmed builds and fails otherwise.
+# Checked before elevation, so an unbuilt experiment skips on any runner.
+if (-not (Test-Path -LiteralPath $TracingExe)) {
+  Write-Host "SKIP: $TracingExe was not built"
+  exit 77
+}
+
 # Consuming NT Kernel Logger events always needs elevation, regardless of
 # what the traced command itself needs - fail with a clear diagnostic
 # rather than the far more confusing StartTraceW ERROR_ACCESS_DENIED the

@@ -30,6 +30,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# 77 is "not built": ctest skips on it in trimmed builds and fails otherwise.
+if (-not (Test-Path -LiteralPath $TracingExe)) {
+  Write-Host "SKIP: $TracingExe was not built"
+  exit 77
+}
+
 $parent = Join-Path ([System.IO.Path]::GetTempPath()) ("detours-tracing-" + [guid]::NewGuid())
 $workDir = Join-Path $parent "work"
 New-Item -ItemType Directory -Path $workDir | Out-Null

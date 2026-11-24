@@ -17,6 +17,9 @@
 #   BUILD_ALL         optional: mount with `--build=all`, and first check
 #                     that every output gets built without anything opening it
 
+include("${CMAKE_CURRENT_LIST_DIR}/require_built.cmake")
+require_built("${MAKEBELIEVE_EXE}")
+
 set(SRC "${WORK_DIR}/src")
 set(BUILD_DIR "${WORK_DIR}/out")
 set(MNT "${BUILD_DIR}/mount")

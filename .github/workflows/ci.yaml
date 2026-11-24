@@ -68,6 +68,13 @@ jobs:
         -DCMAKE_C_COMPILER=${{ matrix.c }}
         -DCMAKE_CXX_COMPILER=${{ matrix.cpp }}
         -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+        -DMAKEBELIEVE_SKIP_UNBUILT_TESTS=ON
+    - name: Trim the build to what changed
+      uses: elliotgoodrich/trimja-action@20be5f7dcf268daeaca0074b8f38254687dfed00 # v3.0.1
+      with:
+        version: 1.5.1
+        path: build/build.ninja
+        build-configuration: ${{ matrix.compiler }}-${{ matrix.build_type }}
     - name: Build
       run: cmake --build build --config ${{ matrix.build_type }}
     - name: Test

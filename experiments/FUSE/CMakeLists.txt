@@ -3,8 +3,7 @@ if(WIN32)
   return()
 endif()
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
+makebelieve_find_fuse3()
 
 add_executable(fuse_experiment fuse.m.cpp)
 target_link_libraries(fuse_experiment PRIVATE PkgConfig::FUSE3 Threads::Threads)
@@ -22,4 +21,8 @@ add_test(NAME fuse_experiment_smoke
     "$<TARGET_FILE:fuse_experiment>" "$<TARGET_FILE:inotify_wait>"
 )
 set_tests_properties(fuse_experiment_smoke PROPERTIES TIMEOUT 30)
+makebelieve_skip_if_not_built(fuse_experiment
+  TESTS fuse_experiment_smoke
+  TARGETS fuse_experiment inotify_wait
+  FILES "${CMAKE_CURRENT_SOURCE_DIR}/smoke_test.sh")
 

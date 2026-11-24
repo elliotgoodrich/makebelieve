@@ -8,6 +8,10 @@ project(makebelieve LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Unused; makes a compiler update change every compile command for trimja.
+add_compile_definitions(
+  "TRIMJA_TOOLCHAIN=${CMAKE_CXX_COMPILER_ID}-${CMAKE_CXX_COMPILER_VERSION}")
+
 option(ENABLE_CLANG_TIDY "Enable clang-tidy static analysis" OFF)
 if(ENABLE_CLANG_TIDY)
   find_program(CLANG_TIDY_EXE NAMES "clang-tidy")
@@ -19,7 +23,23 @@ endif()
 find_package(Threads REQUIRED)
 
 include(FetchContent)
-FetchContent_Declare(
+
+# Fetch different versions into different directories to trigger trimja correctly.
+function(makebelieve_fetch name)
+  cmake_parse_arguments(PARSE_ARGV 1 ARG "" "URL;URL_HASH" "")
+  if(NOT ARG_URL OR NOT ARG_URL_HASH MATCHES "^[A-Za-z0-9_]+=([0-9a-fA-F]+)$")
+    message(FATAL_ERROR "makebelieve_fetch(${name}) needs URL and URL_HASH")
+  endif()
+  string(SUBSTRING "${CMAKE_MATCH_1}" 0 12 _digest)
+  FetchContent_Declare(${name}
+    URL "${ARG_URL}"
+    URL_HASH "${ARG_URL_HASH}"
+    SOURCE_DIR "${FETCHCONTENT_BASE_DIR}/${name}-${_digest}"
+    ${ARG_UNPARSED_ARGUMENTS}
+  )
+endfunction()
+
+makebelieve_fetch(
   stdexec
   URL https://github.com/NVIDIA/stdexec/archive/5afe072bc89627cf5e0b960ee588ee28259fca33.tar.gz
   URL_HASH SHA256=5a12deff9072068064bdd66c8609afc13fcc9d9dc3af5033bec1f97041a10609
@@ -47,7 +67,7 @@ target_compile_options(stdexec INTERFACE
 # Declared before the warning and sanitizer flags below, so it gets neither: it
 # is not our code, and an uninstrumented C object links into an instrumented
 # binary whichever compiler built it.
-FetchContent_Declare(
+makebelieve_fetch(
   sqlite3
   URL https://www.sqlite.org/2024/sqlite-amalgamation-3460100.zip
   URL_HASH SHA256=77823cb110929c2bcb0f5d48e4833b5c59a8a6e40cdea3936b99e199dbbe5784
@@ -66,7 +86,7 @@ target_link_libraries(sqlite3 INTERFACE Threads::Threads)
 
 # xxHash names the build cache's stored outputs by their content. Header-only;
 # only its header is used, so its CMakeLists never runs.
-FetchContent_Declare(
+makebelieve_fetch(
   xxhash
   URL https://github.com/Cyan4973/xxHash/archive/refs/tags/v0.8.2.tar.gz
   URL_HASH SHA256=baee0c6afd4f03165de7a4e67988d16f0f2b257b51d0e3cb91909302a26a79c4
@@ -79,12 +99,12 @@ target_include_directories(xxhash SYSTEM INTERFACE "${xxhash_SOURCE_DIR}")
 enable_testing()
 
 option(BUILD_TESTING "Build the tests." ON)
+option(MAKEBELIEVE_SKIP_UNBUILT_TESTS "Skip unit tests whose binary wasn't built." OFF)
 if(BUILD_TESTING)
-  FetchContent_Declare(
+  makebelieve_fetch(
     googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG v1.17.0
-    GIT_SHALLOW TRUE
+    URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.tar.gz
+    URL_HASH SHA256=65fab701d9829d38cb77c14acdc431d2108bfdbf8979e40eb8ae567edf10b27c
   )
   # Make GoogleTest link the same dynamic CRT this project builds with
   # (/MDd, /MD). Its default is the static CRT, and mixing the two is a hard
@@ -102,11 +122,10 @@ endif()
 # builds here turn on the sanitizers too.
 option(MAKEBELIEVE_BUILD_BENCHMARKS "Build the benchmarks." OFF)
 if(MAKEBELIEVE_BUILD_BENCHMARKS)
-  FetchContent_Declare(
+  makebelieve_fetch(
     benchmark
-    GIT_REPOSITORY https://github.com/google/benchmark.git
-    GIT_TAG v1.9.1
-    GIT_SHALLOW TRUE
+    URL https://github.com/google/benchmark/archive/refs/tags/v1.9.1.tar.gz
+    URL_HASH SHA256=32131c08ee31eeff2c8968d7e874f3cb648034377dfc32a4c377fa8796d84981
   )
   # Its own tests, and the GoogleTest-based ones, are not ours to run.
   set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
@@ -157,6 +176,33 @@ function(makebelieve_apply_clang_tidy target)
   if(ENABLE_CLANG_TIDY AND CLANG_TIDY_EXE)
     set_target_properties(${target} PROPERTIES CXX_CLANG_TIDY "${CLANG_TIDY_EXE}")
   endif()
+endfunction()
+
+# Skips TESTS whose scripts exit 77 or print "NOT BUILT:" for a missing binary.
+# The stamp makes trimja build all of TARGETS when any TARGETS or FILES change.
+function(makebelieve_skip_if_not_built name)
+  cmake_parse_arguments(PARSE_ARGV 1 ARG "" "" "TESTS;TARGETS;FILES")
+  if(NOT MAKEBELIEVE_SKIP_UNBUILT_TESTS)
+    return()
+  endif()
+  set_tests_properties(${ARG_TESTS} PROPERTIES SKIP_RETURN_CODE 77)
+  foreach(test IN LISTS ARG_TESTS)
+    set_property(TEST ${test} APPEND PROPERTY SKIP_REGULAR_EXPRESSION "NOT BUILT: ")
+  endforeach()
+  set(stamp "${CMAKE_CURRENT_BINARY_DIR}/${name}.stamp")
+  add_custom_command(OUTPUT "${stamp}"
+    COMMAND "${CMAKE_COMMAND}" -E touch "${stamp}"
+    DEPENDS ${ARG_TARGETS} ${ARG_FILES}
+    VERBATIM)
+  add_custom_target(${name}_inputs ALL DEPENDS "${stamp}")
+endfunction()
+
+# Like TRIMJA_TOOLCHAIN, for libfuse3 updates.
+function(makebelieve_find_fuse3)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
+  set_property(TARGET PkgConfig::FUSE3 APPEND PROPERTY
+    INTERFACE_COMPILE_DEFINITIONS "TRIMJA_FUSE3_VERSION=${FUSE3_VERSION}")
 endfunction()
 
 # Vendored Detours, as one shared static-library target (Windows-only). Added
@@ -242,4 +288,21 @@ if(BUILD_TESTING)
       "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/integration/executable-work"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_executable_test.cmake")
   set_tests_properties(makebelieve_executable PROPERTIES TIMEOUT 300)
+
+  set(integration_targets makebelieve notifyprobe makebelieve_hello)
+  if(WIN32)
+    list(APPEND integration_targets makebelievehook)
+  endif()
+  file(GLOB_RECURSE integration_files "${CMAKE_CURRENT_SOURCE_DIR}/integration/*")
+  makebelieve_skip_if_not_built(integration
+    TESTS
+      makebelieve_integration
+      makebelieve_dependencies
+      makebelieve_dependencies_jobs_after_mountpoint
+      makebelieve_dependencies_build_all
+      makebelieve_resume
+      makebelieve_status
+      makebelieve_executable
+    TARGETS ${integration_targets}
+    FILES ${integration_files})
 endif()
