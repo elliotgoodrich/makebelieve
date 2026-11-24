@@ -9,8 +9,8 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Unused; makes a compiler update change every compile command for trimja.
-add_compile_definitions(
-  "TRIMJA_TOOLCHAIN=${CMAKE_CXX_COMPILER_ID}-${CMAKE_CXX_COMPILER_VERSION}")
+string(MAKE_C_IDENTIFIER "${CMAKE_CXX_COMPILER_ID}_${CMAKE_CXX_COMPILER_VERSION}" _toolchain)
+add_compile_definitions("TRIMJA_TOOLCHAIN=${_toolchain}")
 
 option(ENABLE_CLANG_TIDY "Enable clang-tidy static analysis" OFF)
 if(ENABLE_CLANG_TIDY)

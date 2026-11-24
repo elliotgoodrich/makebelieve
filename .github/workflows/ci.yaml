@@ -69,16 +69,21 @@ jobs:
         -DCMAKE_CXX_COMPILER=${{ matrix.cpp }}
         -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
         -DMAKEBELIEVE_SKIP_UNBUILT_TESTS=ON
-    - name: Trim the build to what changed
-      uses: elliotgoodrich/trimja-action@20be5f7dcf268daeaca0074b8f38254687dfed00 # v3.0.1
+    - uses: elliotgoodrich/trimja-action@20be5f7dcf268daeaca0074b8f38254687dfed00 # v3.0.1
       with:
         version: 1.5.1
         path: build/build.ninja
         build-configuration: ${{ matrix.compiler }}-${{ matrix.build_type }}
     - name: Build
       run: cmake --build build --config ${{ matrix.build_type }}
+    # trimja-action adds a relative directory to PATH, which the tests' traced
+    # commands would look up, and record, inside their working directories.
     - name: Test
-      run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
+      shell: pwsh
+      run: |
+        $env:PATH = ($env:PATH -split [IO.Path]::PathSeparator |
+          Where-Object { [IO.Path]::IsPathRooted($_) }) -join [IO.Path]::PathSeparator
+        ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
 
   clang-tidy:
     runs-on: ubuntu-24.04
