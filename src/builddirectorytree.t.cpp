@@ -2517,7 +2517,7 @@ TEST_F(BuildDirectoryTreeTest, AWildcardDeclaresAnOutputPerMatchingSource) {
   source.write_file("src/a.md", "a");
   source.write_file("src/b.md", "b");
   source.write_file("src/c.txt", "c");
-  write_manifest("@/out/*.html = run render src/*.md %out\n");
+  write_manifest("@/out/$n.html = run render src/*{n}.md %out\n");
 
   const BuildDirectoryTree tree(
       source, [](Command command) { return finished(built(command.text)); });
@@ -2536,7 +2536,7 @@ TEST_F(BuildDirectoryTreeTest, AWildcardDeclaresAnOutputPerMatchingSource) {
 // The outputs follow the source files as they come and go, and those that
 // stay keep what was built.
 TEST_F(BuildDirectoryTreeTest, AWildcardFollowsItsSourceFiles) {
-  write_manifest("@/out/*.html = run render src/*.md %out\n");
+  write_manifest("@/out/$n.html = run render src/*{n}.md %out\n");
 
   int runs = 0;
   const BuildDirectoryTree tree(source, counting_with_inputs(runs, {}));
@@ -2560,15 +2560,58 @@ TEST_F(BuildDirectoryTreeTest, AWildcardFollowsItsSourceFiles) {
   EXPECT_FALSE(tree.status("out").has_value());
 }
 
+// Captures can lay source files out differently, making the directories the
+// outputs are in from what they captured. A path no file maps to is not an
+// output, even if it would parse.
+TEST_F(BuildDirectoryTreeTest, APatternLaysOutWhatItCaptured) {
+  source.make_directory("posts");
+  source.write_file("posts/2024-01-02-my-post.md", "post");
+  source.write_file("posts/2024-01-02-x-post.md", "post");
+  write_manifest(
+      "@/$year/$month/$day/$name.html = run pandoc "
+      "posts/*{year}-*{month}-*{day}-*{name}.md -o %out\n");
+
+  const BuildDirectoryTree tree(
+      source, [](Command command) { return finished(built(command.text)); });
+  EXPECT_EQ(read_output(tree, "2024/01/02/my-post.html"),
+            "pandoc posts/2024-01-02-my-post.md -o %out");
+  EXPECT_TRUE(tree.status("2024/01/02/x-post.html").has_value());
+  EXPECT_FALSE(tree.status("2024/01/02-x/post.html").has_value());
+}
+
+// A `**` capture reaches into every directory beneath the literal start of its
+// pattern, following files as they arrive anywhere there.
+TEST_F(BuildDirectoryTreeTest, APatternReachesIntoSubdirectories) {
+  source.make_directory("content");
+  source.make_directory("content/blog");
+  source.write_file("content/blog/intro.md", "intro");
+  source.write_file("content/top.md", "top");
+  write_manifest("@/$dir/index/$name.html = copy content/**{dir}/*{name}.md\n");
+
+  const BuildDirectoryTree tree(
+      source, [](Command command) { return finished(built(command.text)); });
+  EXPECT_EQ(read_output(tree, "blog/index/intro.html"),
+            "content/blog/intro.md");
+  EXPECT_FALSE(tree.status("index").has_value());
+
+  source.make_directory("content/blog/2024");
+  source.write_file("content/blog/2024/new.md", "new");
+  EXPECT_TRUE(tree.status("blog/2024/index/new.html").has_value());
+
+  source.remove("content/blog/2024/new.md");
+  EXPECT_FALSE(tree.status("blog/2024").has_value());
+  EXPECT_TRUE(tree.status("blog/index/intro.html").has_value());
+}
+
 // A wildcard over outputs matches whatever is declared, including what other
 // wildcards declare, and follows it as that changes.
 TEST_F(BuildDirectoryTreeTest, AWildcardMatchesOtherOutputs) {
   source.make_directory("src");
   source.write_file("src/a.txt", "a");
   write_manifest(
-      "@/site/*.html = run pandoc @/gen/*.md -o %out\n"
-      "@/copy/*.html = copy @/site/*.html\n"
-      "@/gen/*.md = capture render src/*.txt\n"
+      "@/site/$n.html = run pandoc @/gen/*{n}.md -o %out\n"
+      "@/copy/$n.html = copy @/site/*{n}.html\n"
+      "@/gen/$n.md = capture render src/*{n}.txt\n"
       "@/gen/other.txt = capture echo other\n");
 
   const BuildDirectoryTree tree(
@@ -2604,7 +2647,7 @@ TEST_F(BuildDirectoryTreeTest, AConflictComesAndGoesWithItsSourceFile) {
   source.make_directory("src");
   source.write_file("src/about.md", "about");
   write_manifest(
-      "@/site/*.html = run pandoc src/*.md -o %out\n"
+      "@/site/$n.html = run pandoc src/*{n}.md -o %out\n"
       "@/site/index.html = run ./gen.sh\n");
 
   std::vector<std::string> commands;
@@ -2617,11 +2660,12 @@ TEST_F(BuildDirectoryTreeTest, AConflictComesAndGoesWithItsSourceFile) {
   EXPECT_EQ(output_size(tree, "site/index.html"), 1U);
   EXPECT_EQ(read_output(tree, "site/about.html"),
             "ran pandoc src/about.md -o %out");
-  EXPECT_EQ(tree.status_report(),
-            "@/site/index.html is claimed by more than one rule:\n"
-            "    build.makebelieve:1: @/site/*.html = run pandoc src/*.md -o "
-            "%out (matching src/index.md)\n"
-            "    build.makebelieve:2: @/site/index.html = run ./gen.sh\n");
+  EXPECT_EQ(
+      tree.status_report(),
+      "@/site/index.html is claimed by more than one rule:\n"
+      "    build.makebelieve:1: @/site/$n.html = run pandoc src/*{n}.md -o "
+      "%out (matching src/index.md)\n"
+      "    build.makebelieve:2: @/site/index.html = run ./gen.sh\n");
   EXPECT_EQ(commands, (std::vector<std::string>{
                           "./gen.sh", "pandoc src/about.md -o %out"}));
 
@@ -2640,8 +2684,8 @@ TEST_F(BuildDirectoryTreeTest, WildcardsConflictOnlyWhereBothProduceAPath) {
   source.write_file("src/c.js", "c");
   source.write_file("src/c.ts", "c");
   write_manifest(
-      "@/src/*.js = copy src/*.js\n"
-      "@/src/*.js = run esbuild src/*.ts --outfile=%out\n");
+      "@/src/$n.js = copy src/*{n}.js\n"
+      "@/src/$n.js = run esbuild src/*{n}.ts --outfile=%out\n");
 
   std::vector<std::string> commands;
   const BuildDirectoryTree tree(source, echoing(commands));
@@ -2651,9 +2695,9 @@ TEST_F(BuildDirectoryTreeTest, WildcardsConflictOnlyWhereBothProduceAPath) {
   EXPECT_EQ(open_error(tree, "src/c.js"), std::errc::io_error);
   EXPECT_EQ(tree.status_report(),
             "@/src/c.js is claimed by more than one rule:\n"
-            "    build.makebelieve:1: @/src/*.js = copy src/*.js (matching "
+            "    build.makebelieve:1: @/src/$n.js = copy src/*{n}.js (matching "
             "src/c.js)\n"
-            "    build.makebelieve:2: @/src/*.js = run esbuild src/*.ts "
+            "    build.makebelieve:2: @/src/$n.js = run esbuild src/*{n}.ts "
             "--outfile=%out (matching src/c.ts)\n");
   EXPECT_EQ(commands.size(), 2U);
 }
@@ -2665,8 +2709,8 @@ TEST_F(BuildDirectoryTreeTest, AWildcardOverOutputsCanConflict) {
   source.write_file("src/a.txt", "a");
   source.write_file("src/index.txt", "index");
   write_manifest(
-      "@/gen/*.md = capture render src/*.txt\n"
-      "@/site/*.html = run pandoc @/gen/*.md -o %out\n"
+      "@/gen/$n.md = capture render src/*{n}.txt\n"
+      "@/site/$n.html = run pandoc @/gen/*{n}.md -o %out\n"
       "@/site/index.html = run ./index.sh\n"
       "@/copy.html = copy @/site/index.html\n");
 
@@ -2675,12 +2719,13 @@ TEST_F(BuildDirectoryTreeTest, AWildcardOverOutputsCanConflict) {
   EXPECT_EQ(read_output(tree, "site/a.html"), "ran pandoc @/gen/a.md -o %out");
   EXPECT_EQ(open_error(tree, "site/index.html"), std::errc::io_error);
   EXPECT_EQ(open_error(tree, "copy.html"), std::errc::io_error);
-  EXPECT_EQ(tree.status_report(),
-            "@/site/index.html is claimed by more than one rule:\n"
-            "    build.makebelieve:2: @/site/*.html = run pandoc @/gen/*.md -o "
-            "%out (matching @/gen/index.md)\n"
-            "    build.makebelieve:3: @/site/index.html = run ./index.sh\n"
-            "@/copy.html failed because @/site/index.html failed\n");
+  EXPECT_EQ(
+      tree.status_report(),
+      "@/site/index.html is claimed by more than one rule:\n"
+      "    build.makebelieve:2: @/site/$n.html = run pandoc @/gen/*{n}.md -o "
+      "%out (matching @/gen/index.md)\n"
+      "    build.makebelieve:3: @/site/index.html = run ./index.sh\n"
+      "@/copy.html failed because @/site/index.html failed\n");
 
   // Resolved, the copy is retried along with it.
   source.remove("src/index.txt");
@@ -2694,7 +2739,7 @@ TEST_F(BuildDirectoryTreeTest, AFileWhereADirectoryIsNeededConflicts) {
   source.make_directory("src");
   source.write_file("src/a.foo", "a");
   write_manifest(
-      "@/out/*.foo = copy src/*.foo\n"
+      "@/out/$n.foo = copy src/*{n}.foo\n"
       "@/out/x.foo/y = run b\n");
 
   std::vector<std::string> commands;
@@ -2707,11 +2752,12 @@ TEST_F(BuildDirectoryTreeTest, AFileWhereADirectoryIsNeededConflicts) {
   ASSERT_TRUE(directory.has_value());
   EXPECT_TRUE(std::holds_alternative<DirectoryInfo>(*directory));
   EXPECT_EQ(read_output(tree, "out/a.foo"), "ran src/a.foo");
-  EXPECT_EQ(tree.status_report(),
-            "@/out/x.foo/y is claimed by more than one rule:\n"
-            "    build.makebelieve:1: @/out/*.foo = copy src/*.foo (matching "
-            "src/x.foo; it makes @/out/x.foo a file)\n"
-            "    build.makebelieve:2: @/out/x.foo/y = run b\n");
+  EXPECT_EQ(
+      tree.status_report(),
+      "@/out/x.foo/y is claimed by more than one rule:\n"
+      "    build.makebelieve:1: @/out/$n.foo = copy src/*{n}.foo (matching "
+      "src/x.foo; it makes @/out/x.foo a file)\n"
+      "    build.makebelieve:2: @/out/x.foo/y = run b\n");
 
   source.remove("src/x.foo");
   EXPECT_EQ(read_output(tree, "out/x.foo/y"), "ran b");
@@ -2723,7 +2769,7 @@ TEST_F(BuildDirectoryTreeTest, AFileWhereADirectoryIsNeededConflicts) {
 TEST_F(BuildDirectoryTreeTest, AConflictRebuildsWhatReadThePath) {
   source.make_directory("src");
   write_manifest(
-      "@/gen/*.h = copy src/*.h\n"
+      "@/gen/$n.h = copy src/*{n}.h\n"
       "@/gen/config.h = run configure %out\n"
       "@/app = run cc %out\n");
 
@@ -2753,7 +2799,7 @@ TEST_F(BuildDirectoryTreeTest, TellsTheBuildFailureHandlerOfEachConflict) {
   source.make_directory("src");
   source.write_file("src/a.md", "a");
   write_manifest(
-      "@/site/*.html = run pandoc src/*.md -o %out\n"
+      "@/site/$n.html = run pandoc src/*{n}.md -o %out\n"
       "@/site/a.html = run ./gen.sh\n"
       "@/site/b.html = copy src/b.html\n"
       "@/site/c.html = copy src/c.html\n");
@@ -2764,24 +2810,25 @@ TEST_F(BuildDirectoryTreeTest, TellsTheBuildFailureHandlerOfEachConflict) {
       [&reports](const std::string& report) { reports.push_back(report); });
   EXPECT_EQ(reports, (std::vector<std::string>{
                          "@/site/a.html is claimed by more than one rule:\n"
-                         "    build.makebelieve:1: @/site/*.html = run pandoc "
-                         "src/*.md -o %out (matching src/a.md)\n"
+                         "    build.makebelieve:1: @/site/$n.html = run pandoc "
+                         "src/*{n}.md -o %out (matching src/a.md)\n"
                          "    build.makebelieve:2: @/site/a.html = run "
                          "./gen.sh\n"}));
 
   // Matched again, but nothing about it changed.
   source.write_file("src/b.md", "b");
   ASSERT_EQ(reports.size(), 2U);
-  EXPECT_EQ(reports[1],
-            "@/site/b.html is claimed by more than one rule:\n"
-            "    build.makebelieve:1: @/site/*.html = run pandoc src/*.md -o "
-            "%out (matching src/b.md)\n"
-            "    build.makebelieve:3: @/site/b.html = copy src/b.html\n");
+  EXPECT_EQ(
+      reports[1],
+      "@/site/b.html is claimed by more than one rule:\n"
+      "    build.makebelieve:1: @/site/$n.html = run pandoc src/*{n}.md -o "
+      "%out (matching src/b.md)\n"
+      "    build.makebelieve:3: @/site/b.html = copy src/b.html\n");
 
   // A third rule claiming it changes what it is claimed by.
   write_manifest(
-      "@/site/*.html = run pandoc src/*.md -o %out\n"
-      "@/site/*.html = copy src/*.md\n"
+      "@/site/$n.html = run pandoc src/*{n}.md -o %out\n"
+      "@/site/$n.html = copy src/*{n}.md\n"
       "@/site/a.html = run ./gen.sh\n"
       "@/site/b.html = copy src/b.html\n"
       "@/site/c.html = copy src/c.html\n");
@@ -2799,7 +2846,7 @@ TEST_F(BuildDirectoryTreeTest, TellsTheBuildFailureHandlerOfEachConflict) {
 TEST_F(BuildDirectoryTreeTest, AConflictStartingAndEndingIsAnnounced) {
   source.make_directory("src");
   write_manifest(
-      "@/site/*.html = run pandoc src/*.md -o %out\n"
+      "@/site/$n.html = run pandoc src/*{n}.md -o %out\n"
       "@/site/index.html = run ./gen.sh\n");
 
   const BuildDirectoryTree tree(source, returning("built"));
@@ -2826,7 +2873,7 @@ TEST_F(BuildDirectoryTreeTest, MaterializingAllLeavesAConflictUnbuilt) {
   source.make_directory("src");
   source.write_file("src/index.md", "index");
   write_manifest(
-      "@/site/*.html = run pandoc src/*.md -o %out\n"
+      "@/site/$n.html = run pandoc src/*{n}.md -o %out\n"
       "@/site/index.html = run ./gen.sh\n"
       "@/other.txt = run other\n");
 
@@ -3392,7 +3439,7 @@ TEST_F(BuildDirectoryTreeCacheTest, OutputPathsLookedAtAreCheckedOnResume) {
 TEST_F(BuildDirectoryTreeCacheTest, AConflictIsNeverServedFromTheCache) {
   source.make_directory("src");
   write_manifest(
-      "@/site/*.html = run pandoc src/*.md -o %out\n"
+      "@/site/$n.html = run pandoc src/*{n}.md -o %out\n"
       "@/site/index.html = run ./gen.sh\n");
   {
     const BuildDirectoryTree tree(source, returning("built"), {}, &*cache);

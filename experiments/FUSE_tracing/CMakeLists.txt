@@ -15,9 +15,10 @@ makebelieve_apply_clang_tidy(fuse_tracing_experiment)
 # scratch directory and checks which files it reports as read, which fails
 # (rather than skipping) if /dev/fuse isn't usable, e.g. on a sandboxed CI
 # runner.
+makebelieve_test_path(fuse_tracing_experiment_path fuse_tracing_experiment)
 add_test(NAME fuse_tracing_experiment_smoke
   COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/smoke_test.sh"
-    "$<TARGET_FILE:fuse_tracing_experiment>"
+    "${fuse_tracing_experiment_path}"
 )
 set_tests_properties(fuse_tracing_experiment_smoke PROPERTIES TIMEOUT 30)
 makebelieve_skip_if_not_built(fuse_tracing_experiment

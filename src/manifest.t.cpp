@@ -5,8 +5,10 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -18,8 +20,9 @@ struct ExpectedRule {
   std::string_view output;
   Action action;
   std::string_view command;
-  std::string_view wildcard_source = {};
-  bool wildcard_over_outputs = false;
+  // For a pattern rule, its source pattern without any `@/`.
+  std::string_view source = {};
+  bool over_outputs = false;
 };
 
 // One parsing case: a manifest, the rules it should yield, the lines it should
@@ -42,10 +45,12 @@ TEST_P(ManifestParse, YieldsExpectedRules) {
     EXPECT_EQ(manifest.rules()[i].output, c.expected[i].output);
     EXPECT_EQ(manifest.rules()[i].action, c.expected[i].action);
     EXPECT_EQ(manifest.rules()[i].command, c.expected[i].command);
-    EXPECT_EQ(manifest.rules()[i].wildcard_source,
-              c.expected[i].wildcard_source);
-    EXPECT_EQ(manifest.rules()[i].wildcard_over_outputs,
-              c.expected[i].wildcard_over_outputs);
+    const makebelieve::Manifest::Pattern* pattern =
+        manifest.rules()[i].pattern.get();
+    EXPECT_EQ(pattern != nullptr ? pattern->source : std::string(),
+              c.expected[i].source);
+    EXPECT_EQ(pattern != nullptr && pattern->over_outputs,
+              c.expected[i].over_outputs);
   }
 
   std::vector<std::size_t> error_lines;
@@ -225,117 +230,149 @@ INSTANTIATE_TEST_SUITE_P(
                   .expected = {{"out/deep/file.txt", Action::Run, "a"},
                                {"out/other.txt", Action::Run, "c"}},
                   .error_lines = {2}},
-        // A `*` in the output makes a wildcard rule, whose sources are those
-        // of the first word of the command to hold a `*`, normalised; the
-        // command itself is kept verbatim, later `*`s and all.
-        ParseCase{.name = "wildcard_run_rule",
-                  .input = "@/out/*.o = run cc -c ./src/*.cpp -o %out # *\n",
-                  .expected = {{"out/*.o", Action::Run,
-                                "cc -c ./src/*.cpp -o %out # *", "src/*.cpp"}}},
-        // A wildcard copy's whole path is its pattern.
-        ParseCase{.name = "wildcard_copy_rule",
-                  .input = "@/*.txt = copy my notes/note-*.md\n",
-                  .expected = {{"*.txt", Action::Copy, "my notes/note-*.md",
-                                "my notes/note-*.md"}}},
-        // Without a `*` in the output, one in the command is the shell's.
-        ParseCase{.name = "a_star_in_a_simple_rules_command_is_not_a_wildcard",
-                  .input = "@/all.txt = capture cat src/*.txt\n",
-                  .expected = {{"all.txt", Action::Capture, "cat src/*.txt"}}},
-        // Both patterns need exactly one `*`, in the file name, and the
-        // sources must be source files the build can watch.
-        ParseCase{.name = "rejects_a_malformed_wildcard",
-                  .input = "@/*/a.o = run cc src/*.cpp\n"
-                           "@/*-*.o = run cc src/*.cpp\n"
-                           "@/*.o = run cc src/main.cpp\n"
-                           "@/*.o = run cc */main.cpp\n"
-                           "@/*.o = run cc src/*-*.cpp\n"
-                           "@/*.o = run cc ../*.cpp\n"
-                           "@/*.o = run cc \"src/*.cpp\"\n"
-                           "@/*.o = run cc @/../gen/*.cpp\n"
-                           "@/*.o = copy @/gen/*/a.o\n"
-                           "@/*.json = tracing\n"
-                           "@/*.txt = status\n",
+        // A capture in the command makes a pattern rule, whose sources are
+        // those of the first word to hold a capture, normalised; the command
+        // is kept verbatim, but for what each capture matched, and a `*` that
+        // is not a capture is the shell's.
+        ParseCase{
+            .name = "pattern_run_rule",
+            .input = "@/out/$name.o = run cc -c ./src/*{name}.cpp -o %out *\n",
+            .expected = {{"out/${name}.o", Action::Run,
+                          "cc -c ./src/${name}.cpp -o %out *",
+                          "src/*{name}.cpp"}}},
+        // A pattern copy's whole path is its pattern.
+        ParseCase{
+            .name = "pattern_copy_rule",
+            .input = "@/$n.txt = copy my notes/note-*{n}.md\n",
+            .expected = {{"${n}.txt", Action::Copy, "my notes/note-${n}.md",
+                          "my notes/note-*{n}.md"}}},
+        // `**` captures, expressions with balanced braces, and `${name}`.
+        ParseCase{.name = "pattern_with_every_kind_of_capture",
+                  .input = "@/$y/${dir}_x/$n.html = run pandoc "
+                           "content/**{dir}/*{y:\\d{4}}-*{n}.md -o %out\n",
+                  .expected = {{"${y}/${dir}_x/${n}.html", Action::Run,
+                                "pandoc content/${dir}/${y}-${n}.md -o %out",
+                                "content/**{dir}/*{y:\\d{4}}-*{n}.md"}}},
+        // Without a capture, a `*` in a command is the shell's, as is one
+        // not followed by `{`, a name and `}` or `:`.
+        ParseCase{
+            .name = "a_star_that_is_not_a_capture_is_the_shells",
+            .input = "@/all.txt = capture cat src/*.txt\n"
+                     "@/b.txt = run cp *{.c,.h} *{a,b} ** dir\n",
+            .expected = {{"all.txt", Action::Capture, "cat src/*.txt"},
+                         {"b.txt", Action::Run, "cp *{.c,.h} *{a,b} ** dir"}}},
+        // The bare `*` wildcard is gone: a `*` in an output path is an
+        // error, whatever the command holds.
+        ParseCase{.name = "rejects_a_star_in_an_output_path",
+                  .input = "@/out/*.o = run cc -c src/*.cpp -o %out\n"
+                           "@/out/*{x}.o = run cc -c src/*{x}.cpp\n"
+                           "@/*.json = tracing\n",
                   .expected = {},
-                  .error_lines = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}},
+                  .error_lines = {1, 2, 3}},
+        // The source pattern must be an unquoted path inside the manifest's
+        // directory, or inside `@/`, keep its captures once normalised, and
+        // hold valid expressions.
+        ParseCase{.name = "rejects_a_malformed_source_pattern",
+                  .input = "@/$x.o = run cc ../*{x}.cpp\n"
+                           "@/$x.o = run cc \"src/*{x}.cpp\"\n"
+                           "@/$x.o = run cc @/../gen/*{x}.cpp\n"
+                           "@/$x.o = run cc src/*{x}/../a.cpp\n"
+                           "@/$x.o = copy src/*{x}/\n"
+                           "@/$x.o = run cc src/*{x:[}.cpp\n"
+                           "@/$x.o = run cc src/*{x:\\d{4}.cpp\n",
+                  .expected = {},
+                  .error_lines = {1, 2, 3, 4, 5, 6, 7}},
+        // Captures go only in the source pattern, each name once, used in
+        // the output's path, and not set as well.
+        ParseCase{
+            .name = "rejects_misplaced_or_unused_captures",
+            .input = "@/$x.o = run cc src/*{x}.cpp -o out/*{y}\n"  // 1
+                     "@/$x.o = run cc src/*{x}-*{x}.cpp\n"         // 2
+                     "@/a.o = run cc src/*{x}.cpp\n"               // 3
+                     "@/$x.o = run cc src/*{x}.cpp\n"              // 4
+                     "    x = 1\n"
+                     "@/$x/$y.o = run cc src/$x/*{y}.cpp\n"  // 6: `$x` unset
+                     "@/$y.o = run cc src/*{y}.cpp $x\n"
+                     "@/$z.o = run cc src/*{y}.cpp\n",  // 8
+            .expected = {{"${y}.o", Action::Run, "cc src/${y}.cpp $x",
+                          "src/*{y}.cpp"}},
+            .error_lines = {1, 2, 3, 4, 6, 8}},
+        // Every `$name` in a path must be captured or set, rule or none, and
+        // an output that uses no rule may set variables for its own line.
+        ParseCase{.name = "rejects_an_unset_variable_in_a_path",
+                  .input = "@/$x.o = run cc src/main.cpp\n"
+                           "@/${HOME}/a = run a\n"
+                           "@/$lang/index.html = run pandoc -M lang=$lang -o "
+                           "%out\n"
+                           "    lang = en\n",
+                  .expected = {{"en/index.html", Action::Run,
+                                "pandoc -M lang=en -o %out"}},
+                  .error_lines = {1, 2}},
         // Rules that could produce the same path, depending on the source
         // files there are, are accepted: only the paths they both come to
         // produce fail, which is the build's concern, not the manifest's.
-        ParseCase{.name = "accepts_outputs_a_wildcard_could_also_produce",
-                  .input = "@/out/*.foo = copy src/*.txt\n"
+        ParseCase{.name = "accepts_outputs_a_pattern_could_also_produce",
+                  .input = "@/out/$n.foo = copy src/*{n}.txt\n"
                            "@/out/a.foo = run a\n"
-                           "@/out/lib*.foo = copy src/*.txt\n"
-                           "@/out/*.x.foo = copy src/*.txt\n"
+                           "@/out/lib$n.foo = copy src/*{n}.txt\n"
                            "@/out/x.foo/y = run b\n",
-                  .expected =
-                      {{"out/*.foo", Action::Copy, "src/*.txt", "src/*.txt"},
-                       {"out/a.foo", Action::Run, "a"},
-                       {"out/lib*.foo", Action::Copy, "src/*.txt", "src/*.txt"},
-                       {"out/*.x.foo", Action::Copy, "src/*.txt", "src/*.txt"},
-                       {"out/x.foo/y", Action::Run, "b"}}},
-        // In either order, and a wildcard may produce a file where another
-        // output needs a directory.
+                  .expected = {{"out/${n}.foo", Action::Copy, "src/${n}.txt",
+                                "src/*{n}.txt"},
+                               {"out/a.foo", Action::Run, "a"},
+                               {"out/lib${n}.foo", Action::Copy, "src/${n}.txt",
+                                "src/*{n}.txt"},
+                               {"out/x.foo/y", Action::Run, "b"}}},
+        // Even two patterns with the same output.
         ParseCase{
-            .name = "accepts_a_wildcard_that_could_produce_a_declared_output",
-            .input = "@/out/a.foo = run a\n"
-                     "@/out/*.foo = copy src/*.txt\n"
-                     "@/gen/x.d/file = run b\n"
-                     "@/gen/*.d = copy src/*.c\n"
-                     "@/main.o/*.x = copy src/*.c\n"
-                     "@/*.o = copy src/*.c\n",
-            .expected = {{"out/a.foo", Action::Run, "a"},
-                         {"out/*.foo", Action::Copy, "src/*.txt", "src/*.txt"},
-                         {"gen/x.d/file", Action::Run, "b"},
-                         {"gen/*.d", Action::Copy, "src/*.c", "src/*.c"},
-                         {"main.o/*.x", Action::Copy, "src/*.c", "src/*.c"},
-                         {"*.o", Action::Copy, "src/*.c", "src/*.c"}}},
-        // Even two wildcards with the same output pattern.
-        ParseCase{
-            .name = "accepts_wildcards_sharing_an_output_pattern",
-            .input = "@/src/*.js = copy src/*.js\n"
-                     "@/src/*.js = run esbuild src/*.ts --outfile=%out\n"
-                     "@/pkg/*.py = copy pkg/*.py\n"
-                     "@/pkg/*_pb2.py = run protoc pkg/*.proto\n",
-            .expected = {{"src/*.js", Action::Copy, "src/*.js", "src/*.js"},
-                         {"src/*.js", Action::Run,
-                          "esbuild src/*.ts --outfile=%out", "src/*.ts"},
-                         {"pkg/*.py", Action::Copy, "pkg/*.py", "pkg/*.py"},
-                         {"pkg/*_pb2.py", Action::Run, "protoc pkg/*.proto",
-                          "pkg/*.proto"}}},
-        // But a wildcard still cannot need a directory where a simple rule
+            .name = "accepts_patterns_sharing_an_output",
+            .input = "@/src/$n.js = copy src/*{n}.js\n"
+                     "@/src/$n.js = run esbuild src/*{n}.ts --outfile=%out\n",
+            .expected =
+                {{"src/${n}.js", Action::Copy, "src/${n}.js", "src/*{n}.js"},
+                 {"src/${n}.js", Action::Run,
+                  "esbuild src/${n}.ts --outfile=%out", "src/*{n}.ts"}}},
+        // But a pattern still cannot need a directory where a simple rule
         // declares a file.
-        ParseCase{.name = "rejects_a_wildcard_inside_a_declared_output",
+        ParseCase{.name = "rejects_a_pattern_inside_a_declared_output",
                   .input = "@/out = run a\n"
-                           "@/out/*.o = copy src/*.c\n",
+                           "@/out/$n.o = copy src/*{n}.c\n",
                   .expected = {{"out", Action::Run, "a"}},
                   .error_lines = {2}},
         // A source pattern under `@/` matches outputs instead of source
         // files, whatever declares them, and is kept without its `@/`.
         ParseCase{
-            .name = "wildcard_over_outputs",
-            .input = "@/gen/*.md = capture render src/*.txt\n"
-                     "@/html/*.html = run pandoc @/./gen/*.md -o %out\n"
-                     "@/site/*.md = copy @/gen/*.md\n",
-            .expected =
-                {{"gen/*.md", Action::Capture, "render src/*.txt", "src/*.txt"},
-                 {"html/*.html", Action::Run, "pandoc @/./gen/*.md -o %out",
-                  "gen/*.md", true},
-                 {"site/*.md", Action::Copy, "@/gen/*.md", "gen/*.md", true}}},
-        // A wildcard that could match what it produces - itself, or through
+            .name = "pattern_over_outputs",
+            .input = "@/gen/$n.md = capture render src/*{n}.txt\n"
+                     "@/html/$n.html = run pandoc @/./gen/*{n}.md -o %out\n"
+                     "@/site/$n.md = copy @/gen/*{n}.md\n",
+            .expected = {{"gen/${n}.md", Action::Capture, "render src/${n}.txt",
+                          "src/*{n}.txt"},
+                         {"html/${n}.html", Action::Run,
+                          "pandoc @/./gen/${n}.md -o %out", "gen/*{n}.md",
+                          true},
+                         {"site/${n}.md", Action::Copy, "@/gen/${n}.md",
+                          "gen/*{n}.md", true}}},
+        // A pattern that could match what it produces - itself, or through
         // others - would declare outputs without end.
-        ParseCase{
-            .name = "rejects_wildcards_that_feed_themselves",
-            .input = "@/gen/*.md.md = copy @/gen/*.md\n"
-                     "@/a/*.x = copy @/b/*.y\n"
-                     "@/b/lib*.y = copy @/c/*.z\n"
-                     "@/c/*.z = copy @/a/*.x\n"
-                     "@/d/*.x = copy @/a/*.x\n"
-                     "@/e/*.md = copy @/e/sub/*.md\n"
-                     "@/f/*.html = copy @/f/*.md\n",
-            .expected =
-                {{"d/*.x", Action::Copy, "@/a/*.x", "a/*.x", true},
-                 {"e/*.md", Action::Copy, "@/e/sub/*.md", "e/sub/*.md", true},
-                 {"f/*.html", Action::Copy, "@/f/*.md", "f/*.md", true}},
-            .error_lines = {1, 2, 3, 4}},
+        ParseCase{.name = "rejects_patterns_that_feed_themselves",
+                  .input = "@/gen/$n.md.md = copy @/gen/*{n}.md\n"
+                           "@/a/$n.x = copy @/b/*{n}.y\n"
+                           "@/b/lib$n.y = copy @/c/*{n}.z\n"
+                           "@/c/$n.z = copy @/a/*{n}.x\n"
+                           "@/d/$n.x = copy @/a/*{n}.x\n"
+                           "@/e/$n.md = copy @/e/sub/*{n}.md\n"
+                           "@/f/$n.html = copy @/f/*{n}.md\n"
+                           "@/g/x/$n.md = copy @/g/**{n}.md\n"
+                           "@/h/$n.txt = copy @/h/**{n}.md\n",
+                  .expected = {{"d/${n}.x", Action::Copy, "@/a/${n}.x",
+                                "a/*{n}.x", true},
+                               {"e/${n}.md", Action::Copy, "@/e/sub/${n}.md",
+                                "e/sub/*{n}.md", true},
+                               {"f/${n}.html", Action::Copy, "@/f/${n}.md",
+                                "f/*{n}.md", true},
+                               {"h/${n}.txt", Action::Copy,
+                                "@/h/${n}.md", "h/**{n}.md", true}},
+                  .error_lines = {1, 2, 3, 4, 8}},
         // An output assigned a `!rule` declared above it takes the rule's
         // action and its body, with `%in` replaced by the rest of the line
         // and each variable by the value set under the output or, failing
@@ -364,18 +401,44 @@ INSTANTIATE_TEST_SUITE_P(
                                 "git describe --tags"},
                                {"a.txt", Action::Copy, "pub/a.txt"}},
                   .error_lines = {6}},
-        // The rule is expanded before the output is looked at, so a wildcard
-        // finds its sources in what `%in` became.
-        ParseCase{.name = "uses_a_rule_for_a_wildcard",
-                  .input = "!cc = run cc -c %in -o %out\n"
-                           "@/out/*.o = !cc src/*.cpp\n",
-                  .expected = {{"out/*.o", Action::Run,
-                                "cc -c src/*.cpp -o %out", "src/*.cpp"}}},
-        // `$$` is a `$` for the shell, as is one before anything that cannot
-        // start a name. A variable may be set to nothing, and its name ends
-        // where the next `$` begins.
+        // The rule is expanded before the output is looked at, so a pattern
+        // finds its sources in what `%in` became, and a capture gives a
+        // variable of the rule with no default its value - or overrides one.
+        ParseCase{.name = "uses_a_rule_for_a_pattern",
+                  .input = "!cc = run cc $flags -c %in -o $name.o\n"
+                           "@/out/$name.o = !cc src/*{name}.cpp\n"
+                           "    flags = -O2\n"
+                           "!pandoc = run pandoc %in -M lang=$lang\n"
+                           "    lang = en\n"
+                           "@/$lang/$n.html = !pandoc posts/*{n}.*{lang}.md\n",
+                  .expected = {{"out/${name}.o", Action::Run,
+                                "cc -O2 -c src/${name}.cpp -o ${name}.o",
+                                "src/*{name}.cpp"},
+                               {"${lang}/${n}.html", Action::Run,
+                                "pandoc posts/${n}.${lang}.md -M lang=${lang}",
+                                "posts/*{n}.*{lang}.md"}}},
+        // A capture may come from the rule's own body.
+        ParseCase{.name = "takes_a_capture_from_a_rules_body",
+                  .input = "!page = run pandoc content/**{path}.md -o %out\n"
+                           "@/$path.html = !page\n",
+                  .expected = {{"${path}.html", Action::Run,
+                                "pandoc content/${path}.md -o %out",
+                                "content/**{path}.md"}}},
+        // A rule's default is for its body: naming it on an output's line is
+        // an error unless the output sets it.
+        ParseCase{.name = "rejects_naming_a_rules_default_on_its_line",
+                  .input = "!cc = run cc $flags %in\n"
+                           "    flags = -O2\n"
+                           "@/a.o = !cc a.cpp $flags\n"
+                           "@/b.o = !cc b.cpp $flags\n"
+                           "    flags = -g\n",
+                  .expected = {{"b.o", Action::Run, "cc -g b.cpp -g"}},
+                  .error_lines = {3}},
+        // `$$` is a `$` for the shell, so `$${z}` is the shell's `${z}`, as
+        // is a `$` before anything that cannot start a name. A variable may be
+        // set to nothing, and its name ends where the next `$` begins.
         ParseCase{.name = "leaves_other_dollars_for_the_shell",
-                  .input = "!r = run echo $$HOME $(date) $1 $x$y ${z} 100$\n"
+                  .input = "!r = run echo $$HOME $(date) $1 $x$y $${z} 100$\n"
                            "\tx = a\n"
                            "\ty =\n"
                            "@/o.txt = !r\n",
@@ -385,8 +448,8 @@ INSTANTIATE_TEST_SUITE_P(
         ParseCase{.name = "does_not_expand_what_it_substitutes",
                   .input = "!r = run tool $a %in\n"
                            "  a = $b %in\n"
-                           "@/o.txt = !r $a.txt\n",
-                  .expected = {{"o.txt", Action::Run, "tool $b %in $a.txt"}}},
+                           "@/o.txt = !r $c.txt\n",
+                  .expected = {{"o.txt", Action::Run, "tool $b %in $c.txt"}}},
         // Any run of spaces and tabs indents a line, however long or mixed.
         ParseCase{.name = "takes_any_indentation",
                   .input = "!r = run tool $a $b $c $d\n"
@@ -406,13 +469,25 @@ INSTANTIATE_TEST_SUITE_P(
                            "  b = 2\n"
                            "@/o.txt = !r\n",
                   .expected = {{"o.txt", Action::Run, "tool 1 2"}}},
-        // Outside a rule's body nothing is expanded: `$` and `%in` in an
-        // output's own command are the shell's.
-        ParseCase{.name = "expands_nothing_outside_a_rule",
-                  .input = "!r = run tool $a\n"
-                           "  a = 1\n"
-                           "@/o.txt = run echo $a %in > %out\n",
-                  .expected = {{"o.txt", Action::Run, "echo $a %in > %out"}}},
+        // An output that sets and captures nothing expands nothing on its
+        // own line: `$`, `$$` and `%in` in its command are the shell's.
+        ParseCase{
+            .name = "expands_nothing_on_a_line_that_sets_nothing",
+            .input = "!r = run tool $a\n"
+                     "  a = 1\n"
+                     "@/o.txt = run echo $a $$a %in > %out\n",
+            .expected = {{"o.txt", Action::Run, "echo $a $$a %in > %out"}}},
+        // One that sets or captures something expands only those names, and
+        // `$$`, leaving the rest to the shell.
+        ParseCase{.name = "expands_only_what_a_line_sets_or_captures",
+                  .input = "@/$x.txt = run echo $$HOME $HOME ${x}_draft $y "
+                           "src/*{x}.md\n"
+                           "@/o.txt = run echo $$a $b ${a}_c\n"
+                           "    a = 1\n",
+                  .expected = {{"${x}.txt", Action::Run,
+                                "echo $HOME $HOME ${x}_draft $y src/${x}.md",
+                                "src/*{x}.md"},
+                               {"o.txt", Action::Run, "echo $a $b 1_c"}}},
         ParseCase{
             .name = "rejects_misused_rules",
             .input = "@/a = !cc a.cpp\n"  // 1: declared only below
@@ -431,7 +506,7 @@ INSTANTIATE_TEST_SUITE_P(
                      "  flags = 2\n"  // 14: set twice
                      "  nonsense\n"   // 15: not `name = value`
                      "@/f = run f\n"
-                     "  flags = 1\n"  // 17: under no rule
+                     "  flags = 1\n"  // 17: not used on its line
                      "!n = capture date\n"
                      "@/g = !n arg\n"  // 19: no `%in` to take it
                      "!u = run $a\n"
@@ -439,8 +514,7 @@ INSTANTIATE_TEST_SUITE_P(
                      "@/h = !u\n"  // 22: so `!u` was not declared
                      "@/i = !cc i.cpp\n"
                      "  flags = -O1\n",
-            .expected = {{"f", Action::Run, "f"},
-                         {"i", Action::Run, "cc -O1 i.cpp"}},
+            .expected = {{"i", Action::Run, "cc -O1 i.cpp"}},
             .error_lines = {1, 3, 4, 5, 6, 7, 8, 11, 14, 15, 17, 19, 21, 22}},
         // An indented line belongs to the line above it, so one with nothing
         // above it belongs nowhere.
@@ -457,31 +531,202 @@ INSTANTIATE_TEST_SUITE_P(
       return std::string(info.param.name);
     });
 
-// A wildcard rule stands for one simple rule per matching source name, with
-// whatever the `*` matched put into the output and every `*` of the command.
-TEST(ManifestInstantiate, SubstitutesTheStem) {
+// Each mistake with captures and variables is explained, so whoever wrote
+// it can tell what to do instead.
+TEST(ManifestParse, ExplainsEachMistake) {
+  const std::vector<std::pair<std::string_view, std::string_view>> cases = {
+      {"@/out/*.o = run cc -c src/*.cpp -o %out\n",
+       "capture part of its source pattern with `*{name}` and use it in the "
+       "path as `$name`"},
+      {"@/$x.o = run cc src/*{x}.cpp -o *{y}\n", "outside its source pattern"},
+      {"@/$x.o = run cc src/*{x}-*{x}.cpp\n", "captures `$x` twice"},
+      {"@/a.o = run cc src/*{x}.cpp\n", "captures `$x` but never uses it"},
+      {"@/$x.o = run cc src/*{x}.cpp\n    x = 1\n",
+       "both captures and sets `$x`"},
+      {"@/$x.o = run cc src/main.cpp\n", "neither captures nor sets"},
+      {"!cc = run cc $flags %in\n    flags = -O2\n@/a.o = !cc a.cpp $flags\n",
+       "for the rule's body alone"},
+      {"!cc = run cc $flags %in\n@/a.o = !cc a.cpp\n", "has no default"},
+      {"@/o.txt = run echo\n    x = 1\n", "which its line never uses"},
+      {"@/$x.o = run cc \"src/*{x}.cpp\"\n", "must be an unquoted path"},
+      {"@/$x.o = run cc src/*{x:[}.cpp\n", "not a valid ECMAScript"},
+      {"@/$x.o = run cc src/*{x:\\d{4}.cpp\n", "has no `}` to end it"},
+      {"@/$y.o = copy src/$y/*{y}.c\n",
+       "uses a variable it captures in its source pattern"},
+      {"@/gen/$n.md.md = copy @/gen/*{n}.md\n", "would never end"},
+  };
+  for (const auto& [input, message] : cases) {
+    const makebelieve::Manifest manifest = makebelieve::Manifest::parse(input);
+    ASSERT_EQ(manifest.errors().size(), 1U) << input;
+    EXPECT_TRUE(manifest.errors()[0].message.contains(message))
+        << input << manifest.errors()[0].message;
+    EXPECT_TRUE(manifest.rules().empty()) << input;
+  }
+}
+
+// The rule @a manifest's only rule stands for given @a path, or nullopt.
+std::optional<makebelieve::Manifest::Rule> instantiate(
+    std::string_view manifest,
+    std::string_view path) {
+  const makebelieve::Manifest parsed = makebelieve::Manifest::parse(manifest);
+  EXPECT_TRUE(parsed.errors().empty()) << manifest;
+  EXPECT_EQ(parsed.rules().size(), 1U) << manifest;
+  if (parsed.rules().size() != 1U) {
+    return std::nullopt;
+  }
+  EXPECT_TRUE(parsed.rules()[0].is_pattern());
+  return makebelieve::Manifest::instantiate(parsed.rules()[0], path);
+}
+
+using Made = std::pair<std::string, std::string>;
+
+// The output and command @a manifest's only rule makes of @a path, or empty
+// strings if it does not match.
+Made made(std::string_view manifest, std::string_view path) {
+  const auto rule = instantiate(manifest, path);
+  if (!rule.has_value()) {
+    return {};
+  }
+  EXPECT_FALSE(rule->is_pattern());
+  return {rule->output.generic_string(), rule->command};
+}
+
+// A pattern rule stands for one simple rule per matching path, with what each
+// capture matched put into the output and the command.
+TEST(ManifestInstantiate, SubstitutesEachCapture) {
   const makebelieve::Manifest manifest = makebelieve::Manifest::parse(
       "# objects\n"
-      "@/out/lib*.o = run cc -c src/*.cpp -MF *.d -o %out\n");
+      "@/out/lib$name.o = run cc -c src/*{name}.cpp -MF $name.d -o %out\n");
   ASSERT_EQ(manifest.rules().size(), 1U);
   const makebelieve::Manifest::Rule& rule = manifest.rules()[0];
-  ASSERT_TRUE(rule.is_wildcard());
+  ASSERT_TRUE(rule.is_pattern());
   EXPECT_EQ(rule.line, 2U);
+  EXPECT_EQ(rule.text,
+            "@/out/lib$name.o = run cc -c src/*{name}.cpp -MF $name.d -o "
+            "%out");
+  EXPECT_EQ(rule.pattern->directory, std::filesystem::path("src"));
+  EXPECT_FALSE(rule.pattern->recursive);
 
-  const auto matched = makebelieve::Manifest::instantiate(rule, "main.cpp");
+  const auto matched = makebelieve::Manifest::instantiate(rule, "src/main.cpp");
   ASSERT_TRUE(matched.has_value());
   EXPECT_EQ(matched->output, std::filesystem::path("out") / "libmain.o");
   EXPECT_EQ(matched->action, Action::Run);
   EXPECT_EQ(matched->command, "cc -c src/main.cpp -MF main.d -o %out");
-  EXPECT_FALSE(matched->is_wildcard());
-  // It keeps the line of the rule it stands for.
+  EXPECT_FALSE(matched->is_pattern());
+  // It keeps the line, and the text, of the rule it stands for.
   EXPECT_EQ(matched->line, 2U);
+  EXPECT_EQ(matched->text, rule.text);
 
-  // The `*` matches at least one character, and the whole name must match.
-  EXPECT_FALSE(makebelieve::Manifest::instantiate(rule, ".cpp").has_value());
-  EXPECT_FALSE(makebelieve::Manifest::instantiate(rule, "main.c").has_value());
-  EXPECT_FALSE(
-      makebelieve::Manifest::instantiate(rule, "main.cpp.bak").has_value());
+  // A capture matches at least one character, never a `/`, and the whole
+  // path must match.
+  for (const std::string_view path :
+       {"src/.cpp", "src/main.c", "src/main.cpp.bak", "src/a/b.cpp", "main.cpp",
+        "x/src/main.cpp"}) {
+    EXPECT_FALSE(makebelieve::Manifest::instantiate(rule, path).has_value())
+        << path;
+  }
+}
+
+// Captures can lay a path out differently, each taking as little as it can
+// from the left.
+TEST(ManifestInstantiate, LaysOutADatedPost) {
+  constexpr std::string_view manifest =
+      "@/$year/$month/$day/$name.html = run pandoc "
+      "posts/*{year}-*{month}-*{day}-*{name}.md -o %out\n";
+  EXPECT_EQ(made(manifest, "posts/2024-01-02-my-post.md"),
+            (Made{"2024/01/02/my-post.html",
+                  "pandoc posts/2024-01-02-my-post.md -o %out"}));
+  EXPECT_EQ(made(manifest, "posts/about-us-page-v2.md"),
+            (Made{"about/us/page/v2.html",
+                  "pandoc posts/about-us-page-v2.md -o %out"}));
+  EXPECT_EQ(made(manifest, "posts/about-us.md"), Made{});
+}
+
+// An expression captures only what it matches in full; a path no split
+// matches is skipped.
+TEST(ManifestInstantiate, HoldsCapturesToTheirExpressions) {
+  constexpr std::string_view manifest =
+      "@/$year/$month/$day/$name.html = run pandoc "
+      "posts/*{year:\\d{4}}-*{month:\\d\\d}-*{day:\\d\\d}-*{name}.md -o "
+      "%out\n";
+  EXPECT_EQ(made(manifest, "posts/2024-01-02-my-post.md"),
+            (Made{"2024/01/02/my-post.html",
+                  "pandoc posts/2024-01-02-my-post.md -o %out"}));
+  EXPECT_EQ(made(manifest, "posts/about-us-page-v2.md"), Made{});
+  EXPECT_EQ(made(manifest, "posts/24-01-02-x.md"), Made{});
+}
+
+// `**` reaches into subdirectories, and `*` never holds a `/`, so a path can
+// be taken apart into its directory and its file name.
+TEST(ManifestInstantiate, TakesADirectoryAndAFileName) {
+  constexpr std::string_view split =
+      "@/$dir/index/$name.html = copy content/**{dir}/*{name}.md\n";
+  EXPECT_EQ(made(split, "content/a/b/c.md"),
+            (Made{"a/b/index/c.html", "content/a/b/c.md"}));
+  EXPECT_EQ(made(split, "content/a/c.md"),
+            (Made{"a/index/c.html", "content/a/c.md"}));
+  EXPECT_EQ(made(split, "content/c.md"), Made{});
+
+  constexpr std::string_view whole =
+      "@/$path.html = run pandoc content/**{path}.md -o %out\n";
+  EXPECT_EQ(made(whole, "content/blog/2024/intro.md"),
+            (Made{"blog/2024/intro.html",
+                  "pandoc content/blog/2024/intro.md -o %out"}));
+
+  for (const std::string_view manifest : {split, whole}) {
+    const makebelieve::Manifest parsed = makebelieve::Manifest::parse(manifest);
+    ASSERT_EQ(parsed.rules().size(), 1U);
+    EXPECT_EQ(parsed.rules()[0].pattern->directory,
+              std::filesystem::path("content"));
+    EXPECT_TRUE(parsed.rules()[0].pattern->recursive);
+  }
+}
+
+// An expression's own quantifiers decide how much it takes, but a `*{}` never
+// holds a `/` whatever its expression allows, and a back reference counts
+// within its own expression.
+TEST(ManifestInstantiate, LetsAnExpressionDecideHowMuchItTakes) {
+  EXPECT_EQ(made("@/$a/$b = copy src/**{a:.+}-**{b}\n", "src/x-y-z"),
+            (Made{"x-y/z", "src/x-y-z"}));
+  EXPECT_EQ(made("@/$a/$b = copy src/**{a}-**{b}\n", "src/x-y-z"),
+            (Made{"x/y-z", "src/x-y-z"}));
+  EXPECT_EQ(made("@/$x.txt = copy src/*{x:.+}.md\n", "src/a/b.md"), Made{});
+  EXPECT_EQ(made("@/$x.txt = copy src/*{x:[\\s\\S]+}.md\n", "src/a/b.md"),
+            Made{});
+  EXPECT_EQ(made("@/$x.txt = copy src/*{x:.+}.md\n", "src/a.b.md"),
+            (Made{"a.b.txt", "src/a.b.md"}));
+  constexpr std::string_view repeated =
+      "@/$d/$x.txt = copy src/*{d:(\\w)\\1}-*{x:(\\w)\\1}.txt\n";
+  EXPECT_EQ(made(repeated, "src/aa-bb.txt"),
+            (Made{"aa/bb.txt", "src/aa-bb.txt"}));
+  EXPECT_EQ(made(repeated, "src/aa-bc.txt"), Made{});
+  EXPECT_EQ(made(repeated, "src/ab-bb.txt"), Made{});
+}
+
+// Captures go into a rule's body, and literal text in the pattern matches
+// only itself.
+TEST(ManifestInstantiate, FillsARulesBody) {
+  constexpr std::string_view manifest =
+      "!post = run pandoc -M date=$year-$month-$day %in -o %out\n"
+      "@/$year/$month/$day/$name.html = !post "
+      "posts/*{year}-*{month}-*{day}-*{name}.md\n";
+  EXPECT_EQ(made(manifest, "posts/2024-01-02-my-post.md"),
+            (Made{"2024/01/02/my-post.html",
+                  "pandoc -M date=2024-01-02 posts/2024-01-02-my-post.md -o "
+                  "%out"}));
+  EXPECT_EQ(made("@/$x = copy a.b(c)/*{x}\n", "a.b(c)/d"),
+            (Made{"d", "a.b(c)/d"}));
+  EXPECT_EQ(made("@/$x = copy a.b(c)/*{x}\n", "aXb(c)/d"), Made{});
+}
+
+// A pattern over outputs matches paths beneath `@/`, and its command keeps
+// the `@/` that names the output.
+TEST(ManifestInstantiate, MatchesOutputs) {
+  EXPECT_EQ(
+      made("@/site/$n.html = run pandoc @/gen/*{n}.md -o %out\n", "gen/a.md"),
+      (Made{"site/a.html", "pandoc @/gen/a.md -o %out"}));
+  EXPECT_EQ(made("@/site/$n.md = copy @/gen/*{n}.md\n", "gen/a.md"),
+            (Made{"site/a.md", "@/gen/a.md"}));
 }
 
 }  // namespace

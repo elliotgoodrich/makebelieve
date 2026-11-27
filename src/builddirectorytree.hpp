@@ -63,7 +63,7 @@ class BuildCoordinator;
 /// rejects, is not applied: the current rules stay in force until it is fixed.
 ///
 /// A path that more than one rule produces - given the source files and
-/// outputs their wildcards match right now - or that one rule would make a
+/// outputs their patterns match right now - or that one rule would make a
 /// file while another makes something inside it, is a conflict: it is shown
 /// with its placeholder, nothing builds it, and opening it fails with
 /// `std::errc::io_error`, until all but one of those rules stop producing it.
@@ -191,7 +191,7 @@ class BuildDirectoryTree : public DirectoryTree {
   /// From now on treats every declared output as already opened: starts
   /// building each that is not up to date, so it is in place before anyone
   /// opens it, and does the same for every output declared later - by a
-  /// changed manifest, or a file a wildcard comes to match - and rebuilds any
+  /// changed manifest, or a file a pattern comes to match - and rebuilds any
   /// whose inputs change, as it would an output that had been opened. A
   /// `tracing` or `status` output is left alone, as opening one is what
   /// brings it up to date. Returns
@@ -210,7 +210,7 @@ class BuildDirectoryTree : public DirectoryTree {
   /// - each path claimed by more than one rule, as
   ///   `@/<path> is claimed by more than one rule:` followed by one indented
   ///   `build.makebelieve:LINE: <rule>` line per claim, in line order, ending
-  ///   in ` (matching <source>)` for a wildcard - its `@/` kept for an
+  ///   in ` (matching <source>)` for a pattern - its `@/` kept for an
   ///   output - and saying `it makes @/<directory> a file` for a rule that
   ///   would make one of the path's directories a file;
   /// - each build under way, as `@/<output> building: <command>`, or

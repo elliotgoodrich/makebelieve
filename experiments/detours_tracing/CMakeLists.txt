@@ -50,10 +50,11 @@ makebelieve_apply_clang_tidy(detours_tracing_experiment)
 # mirroring ../FUSE_tracing/smoke_test.sh. Reuses ../ETW_tracing's
 # catfiles.ps1 rather than a second copy - it's a plain script file, not
 # a CMake target, so it's referenced by path.
+makebelieve_test_path(detours_tracing_experiment_path detours_tracing_experiment)
 add_test(NAME detours_tracing_experiment_smoke
   COMMAND powershell -NoProfile -ExecutionPolicy Bypass
     -File "${CMAKE_CURRENT_SOURCE_DIR}/smoke_test.ps1"
-    -TracingExe "$<TARGET_FILE:detours_tracing_experiment>"
+    -TracingExe "${detours_tracing_experiment_path}"
     -CatfilesScript "${CMAKE_CURRENT_SOURCE_DIR}/../ETW_tracing/catfiles.ps1"
 )
 set_tests_properties(detours_tracing_experiment_smoke PROPERTIES TIMEOUT 30)

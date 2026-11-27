@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -318,14 +319,14 @@ struct Claim {
   std::size_t line = 0;
   std::string rule;
 
-  // The source file - or `@/` and the output - a wildcard matched to claim
+  // The source file - or `@/` and the output - a pattern matched to claim
   // the path. Empty for a simple rule.
   std::filesystem::path matched;
 
   [[nodiscard]] friend bool operator==(const Claim&, const Claim&) = default;
 };
 
-// What a manifest's rules declare, given the files their wildcards match.
+// What a manifest's rules declare, given the files their patterns match.
 struct Expansion {
   // Each path exactly one rule claims, mapped to the command that builds it.
   std::map<std::filesystem::path, Command> commands;
@@ -335,20 +336,35 @@ struct Expansion {
   std::map<std::filesystem::path, std::vector<Claim>> conflicts;
 };
 
-// @a rule as its manifest line spells it.
-std::string to_string(const Manifest::Rule& rule) {
-  std::string text(k_generated_prefix);
-  text += rule.output.generic_string();
-  text += " = ";
-  text += to_string(rule.action);
-  if (!rule.command.empty()) {
-    text += ' ';
-    text += rule.command;
+// Calls @a visit with the path of each file beneath @a directory of
+// @a source - only those directly in it unless @a recursive - relative to
+// @a source's root. A directory that is missing or cannot be listed holds
+// nothing.
+void for_each_file(const DirectoryTree& source,
+                   const std::filesystem::path& directory,
+                   bool recursive,
+                   std::invocable<const std::filesystem::path&> auto&& visit) {
+  std::vector<std::filesystem::path> pending = {directory};
+  while (!pending.empty()) {
+    const std::filesystem::path listed = std::move(pending.back());
+    pending.pop_back();
+    const auto entries = source.ls(listed);
+    if (!entries.has_value()) {
+      continue;
+    }
+    for (const TreeEntry& entry : *entries) {
+      std::filesystem::path path =
+          listed.empty() ? entry.name : listed / entry.name;
+      if (std::holds_alternative<FileInfo>(entry.info)) {
+        visit(path);
+      } else if (recursive) {
+        pending.push_back(std::move(path));
+      }
+    }
   }
-  return text;
 }
 
-// Finds every path @a rules claim, a wildcard rule claiming one for every file
+// Finds every path @a rules claim, a pattern rule claiming one for every file
 // in @a source its pattern matches right now and every output it matches.
 // Two rules may claim the same path, or one may claim a path as a file where
 // another claims something inside it: each such path is a conflict, and every
@@ -364,53 +380,46 @@ Expansion expand_rules(const DirectoryTree& source,
                                  .action = simple.action,
                                  .text = simple.command},
               .line = rule.line,
-              .rule = to_string(rule),
+              .rule = rule.text,
               .matched = std::move(matched)});
   };
   for (const Manifest::Rule& rule : rules) {
-    if (!rule.is_wildcard()) {
+    if (!rule.is_pattern()) {
       claim(rule, rule, {});
       continue;
     }
-    if (rule.wildcard_over_outputs) {
+    if (rule.pattern->over_outputs) {
       continue;  // below, once there are outputs to match
     }
-    // A directory that is missing or cannot be listed matches nothing.
-    const auto entries = source.ls(rule.wildcard_source.parent_path());
-    if (!entries.has_value()) {
-      continue;
-    }
-    for (const TreeEntry& entry : *entries) {
-      if (!std::holds_alternative<FileInfo>(entry.info)) {
-        continue;
-      }
-      if (const std::optional<Manifest::Rule> matched =
-              Manifest::instantiate(rule, entry.name.generic_string())) {
-        claim(rule, *matched, rule.wildcard_source.parent_path() / entry.name);
-      }
-    }
+    for_each_file(
+        source, rule.pattern->directory, rule.pattern->recursive,
+        [&](const std::filesystem::path& path) {
+          if (const std::optional<Manifest::Rule> matched =
+                  Manifest::instantiate(rule, path.generic_string())) {
+            claim(rule, *matched, path);
+          }
+        });
   }
 
-  // A wildcard over outputs matches every path claimed so far, which may be
+  // A pattern over outputs matches every path claimed so far, which may be
   // what lets another match, so go round until nothing is added - matching
-  // each path once per rule. The manifest rejects wildcards that could feed
+  // each path once per rule. The manifest rejects patterns that could feed
   // themselves, so this ends.
   std::set<std::pair<std::size_t, std::filesystem::path>> tried;
   for (bool added = true; added;) {
     added = false;
     for (std::size_t index = 0; index < rules.size(); ++index) {
       const Manifest::Rule& rule = rules[index];
-      if (!rule.wildcard_over_outputs) {
+      if (!rule.is_pattern() || !rule.pattern->over_outputs) {
         continue;
       }
       std::vector<std::pair<Manifest::Rule, std::filesystem::path>> matches;
       for (const auto& [output, others] : claims) {
-        if (output.parent_path() != rule.wildcard_source.parent_path() ||
-            !tried.emplace(index, output).second) {
+        if (!tried.emplace(index, output).second) {
           continue;
         }
-        if (std::optional<Manifest::Rule> matched = Manifest::instantiate(
-                rule, output.filename().generic_string())) {
+        if (std::optional<Manifest::Rule> matched =
+                Manifest::instantiate(rule, output.generic_string())) {
           matches.emplace_back(std::move(*matched), output);
         }
       }
@@ -488,13 +497,16 @@ class BuildDirectoryTree::Impl {
   std::mutex m_mutex;
 
   // The rules of the manifest as last accepted, and every directory whose list
-  // of children decides which files their wildcards match. Touched only by the
+  // of children decides which files their patterns match. Touched only by the
   // constructor and the source-change callback, so unguarded.
   std::vector<Manifest::Rule> m_rules;
-  std::set<std::filesystem::path> m_wildcard_directories;
+  std::set<std::filesystem::path> m_pattern_directories;
+  // Of those, each that a pattern lists every directory beneath, so a change
+  // to any of them may change what it matches.
+  std::set<std::filesystem::path> m_recursive_directories;
 
   // Every declared output mapped to the command that (re)builds it, following
-  // the manifest and the files its wildcards match as they change.
+  // the manifest and the files its patterns match as they change.
   std::map<std::filesystem::path, Command> m_commands;
 
   // Every path more than one rule claims right now, as expand_rules() found
@@ -1598,7 +1610,7 @@ class BuildDirectoryTree::Impl {
 
   // Appends that @a output is claimed by more than one rule, as a report gives
   // it: a line naming it, followed by each of @a claims, indented, as
-  // `build.makebelieve:LINE: <rule>`, then what a wildcard matched and, for a
+  // `build.makebelieve:LINE: <rule>`, then what a pattern matched and, for a
   // rule that would make a directory of @a output a file, which.
   static void append_conflict(std::string& report,
                               const std::filesystem::path& output,
@@ -2217,23 +2229,34 @@ class BuildDirectoryTree::Impl {
     }
   }
 
-  // Whether @a diff changes which files a wildcard could match: the entries
+  // Whether @a diff changes which files a pattern could match: the entries
   // of a directory it matches in or one on the way there, or that directory
   // coming or going, alone or beneath something that did.
-  [[nodiscard]] bool changes_wildcard_directory(
+  [[nodiscard]] bool changes_pattern_directory(
       const DirectoryTreeDiff& diff) const {
     const auto named = [&](const std::filesystem::path& path) {
-      return m_wildcard_directories.contains(
+      return m_pattern_directories.contains(
           FileSystemUtil::path_key(path.lexically_normal()));
     };
     const auto holds_one = [&](const std::filesystem::path& path) {
       const std::filesystem::path key =
           FileSystemUtil::path_key(path.lexically_normal());
-      const auto it = m_wildcard_directories.lower_bound(key);
-      return it != m_wildcard_directories.end() && is_within(*it, key);
+      const auto it = m_pattern_directories.lower_bound(key);
+      return it != m_pattern_directories.end() && is_within(*it, key);
+    };
+    // Anything beneath a directory a pattern lists recursively.
+    const auto beneath_one = [&](const std::filesystem::path& path) {
+      const std::filesystem::path key =
+          FileSystemUtil::path_key(path.lexically_normal());
+      return std::ranges::any_of(m_recursive_directories,
+                                 [&](const std::filesystem::path& top) {
+                                   return is_within(key, top);
+                                 });
     };
     return std::ranges::any_of(diff.changed_listings, named) ||
-           std::ranges::any_of(diff.changed_subtrees, holds_one);
+           std::ranges::any_of(diff.changed_subtrees, holds_one) ||
+           std::ranges::any_of(diff.changed_listings, beneath_one) ||
+           std::ranges::any_of(diff.changed_subtrees, beneath_one);
   }
 
   // Adds to @a inputs, those @a output's build read, the outputs it opened,
@@ -2276,15 +2299,20 @@ class BuildDirectoryTree::Impl {
   // Takes @a rules as the manifest's and declares the outputs they stand for.
   void set_rules(std::vector<Manifest::Rule> rules) {
     m_rules = std::move(rules);
-    m_wildcard_directories.clear();
+    m_pattern_directories.clear();
+    m_recursive_directories.clear();
     for (const Manifest::Rule& rule : m_rules) {
-      if (!rule.is_wildcard()) {
+      if (!rule.is_pattern() || rule.pattern->over_outputs) {
         continue;
+      }
+      if (rule.pattern->recursive) {
+        m_recursive_directories.insert(
+            FileSystemUtil::path_key(rule.pattern->directory));
       }
       // Its ancestors too, down to the root: the directory itself may be the
       // thing that comes or goes.
-      std::filesystem::path directory = rule.wildcard_source.parent_path();
-      while (m_wildcard_directories.insert(FileSystemUtil::path_key(directory))
+      std::filesystem::path directory = rule.pattern->directory;
+      while (m_pattern_directories.insert(FileSystemUtil::path_key(directory))
                  .second &&
              !directory.empty()) {
         directory = directory.parent_path();
@@ -2502,7 +2530,7 @@ class BuildDirectoryTree::Impl {
     invalidate(std::move(changed));
   }
 
-  // Reloads the manifest if it may have changed, or matches its wildcards
+  // Reloads the manifest if it may have changed, or matches its patterns
   // again if the files they match may have, then collects the outputs
   // depending on whatever changed and invalidates each. Invalidation runs
   // outside the lock, since it may start an eager rebuild.
@@ -2514,7 +2542,7 @@ class BuildDirectoryTree::Impl {
     if (diff.everything_dirty ||
         diff.changes(std::filesystem::path(k_manifest_name))) {
       reload_manifest();
-    } else if (changes_wildcard_directory(diff)) {
+    } else if (changes_pattern_directory(diff)) {
       apply_rules(expand_rules(m_source, m_rules));
     }
 
