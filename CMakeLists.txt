@@ -197,6 +197,31 @@ function(makebelieve_skip_if_not_built name)
   add_custom_target(${name}_inputs ALL DEPENDS "${stamp}")
 endfunction()
 
+# Sets VAR to where TARGET's executable is built, for passing to a test that
+# makebelieve_skip_if_not_built skips. CMake 4.5 makes ctest refuse to start a
+# test whose command names a target that wasn't built, before its script can
+# skip, so with MAKEBELIEVE_SKIP_UNBUILT_TESTS the path is spelled out rather
+# than given as $<TARGET_FILE:...>.
+function(makebelieve_test_path var target)
+  if(NOT MAKEBELIEVE_SKIP_UNBUILT_TESTS)
+    set(${var} "$<TARGET_FILE:${target}>" PARENT_SCOPE)
+    return()
+  endif()
+  foreach(property RUNTIME_OUTPUT_DIRECTORY OUTPUT_NAME SUFFIX)
+    get_target_property(value ${target} ${property})
+    if(value)
+      message(FATAL_ERROR
+        "makebelieve_test_path(${target}) can't follow its ${property}")
+    endif()
+  endforeach()
+  get_target_property(directory ${target} BINARY_DIR)
+  get_property(multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+  if(multi_config)
+    string(APPEND directory "/$<CONFIG>")
+  endif()
+  set(${var} "${directory}/${target}${CMAKE_EXECUTABLE_SUFFIX}" PARENT_SCOPE)
+endfunction()
+
 # Like TRIMJA_TOOLCHAIN, for libfuse3 updates.
 function(makebelieve_find_fuse3)
   find_package(PkgConfig REQUIRED)
@@ -223,11 +248,13 @@ if(BUILD_TESTING)
   add_subdirectory(experiments/ETW_tracing)
   add_subdirectory(experiments/detours_tracing)
 
+  makebelieve_test_path(makebelieve_path makebelieve)
+  makebelieve_test_path(notifyprobe_path notifyprobe)
   # End integration test
   add_test(NAME makebelieve_integration
     COMMAND "${CMAKE_COMMAND}"
-      "-DMAKEBELIEVE_EXE=$<TARGET_FILE:makebelieve>"
-      "-DNOTIFY_PROBE_EXE=$<TARGET_FILE:notifyprobe>"
+      "-DMAKEBELIEVE_EXE=${makebelieve_path}"
+      "-DNOTIFY_PROBE_EXE=${notifyprobe_path}"
       "-DFIXTURE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/integration/fixture"
       "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/integration/work"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_integration_test.cmake")
@@ -238,14 +265,14 @@ if(BUILD_TESTING)
   # Builds that open each other's outputs through the mount
   add_test(NAME makebelieve_dependencies
     COMMAND "${CMAKE_COMMAND}"
-      "-DMAKEBELIEVE_EXE=$<TARGET_FILE:makebelieve>"
+      "-DMAKEBELIEVE_EXE=${makebelieve_path}"
       "-DFIXTURE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/integration/dependencies"
       "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/integration/dependencies-work"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_dependency_test.cmake")
   set_tests_properties(makebelieve_dependencies PROPERTIES TIMEOUT 300)
   add_test(NAME makebelieve_dependencies_jobs_after_mountpoint
     COMMAND "${CMAKE_COMMAND}"
-      "-DMAKEBELIEVE_EXE=$<TARGET_FILE:makebelieve>"
+      "-DMAKEBELIEVE_EXE=${makebelieve_path}"
       "-DFIXTURE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/integration/dependencies"
       "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/integration/dependencies-jobs-after-work"
       -DJOBS_AFTER_MOUNTPOINT=ON
@@ -253,7 +280,7 @@ if(BUILD_TESTING)
   set_tests_properties(makebelieve_dependencies_jobs_after_mountpoint PROPERTIES TIMEOUT 300)
   add_test(NAME makebelieve_dependencies_build_all
     COMMAND "${CMAKE_COMMAND}"
-      "-DMAKEBELIEVE_EXE=$<TARGET_FILE:makebelieve>"
+      "-DMAKEBELIEVE_EXE=${makebelieve_path}"
       "-DFIXTURE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/integration/dependencies"
       "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/integration/dependencies-build-all-work"
       -DBUILD_ALL=ON
@@ -263,7 +290,7 @@ if(BUILD_TESTING)
   # Builds kept from one run to the next
   add_test(NAME makebelieve_resume
     COMMAND "${CMAKE_COMMAND}"
-      "-DMAKEBELIEVE_EXE=$<TARGET_FILE:makebelieve>"
+      "-DMAKEBELIEVE_EXE=${makebelieve_path}"
       "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/integration/resume-work"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_resume_test.cmake")
   set_tests_properties(makebelieve_resume PROPERTIES TIMEOUT 300)
@@ -271,7 +298,7 @@ if(BUILD_TESTING)
   # Why builds fail, told without watching the mount
   add_test(NAME makebelieve_status
     COMMAND "${CMAKE_COMMAND}"
-      "-DMAKEBELIEVE_EXE=$<TARGET_FILE:makebelieve>"
+      "-DMAKEBELIEVE_EXE=${makebelieve_path}"
       "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/integration/status-work"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/run_status_test.cmake")
   set_tests_properties(makebelieve_status PROPERTIES TIMEOUT 300)
@@ -279,10 +306,11 @@ if(BUILD_TESTING)
   # Outputs run as programs rather than read
   add_executable(makebelieve_hello integration/executable/hello.m.cpp)
   makebelieve_apply_clang_tidy(makebelieve_hello)
+  makebelieve_test_path(makebelieve_hello_path makebelieve_hello)
   add_test(NAME makebelieve_executable
     COMMAND "${CMAKE_COMMAND}"
-      "-DMAKEBELIEVE_EXE=$<TARGET_FILE:makebelieve>"
-      "-DHELLO_EXE=$<TARGET_FILE:makebelieve_hello>"
+      "-DMAKEBELIEVE_EXE=${makebelieve_path}"
+      "-DHELLO_EXE=${makebelieve_hello_path}"
       "-DREPLACEMENT_EXE=${CMAKE_COMMAND}"
       "-DFIXTURE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/integration/executable"
       "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/integration/executable-work"

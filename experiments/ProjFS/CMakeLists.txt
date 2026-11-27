@@ -14,11 +14,13 @@ makebelieve_apply_clang_tidy(filewatch)
 
 # Black-box test: mounts the real projfs_experiment binary and drives it
 # through smoke_test.ps1.
+makebelieve_test_path(projfs_experiment_path projfs_experiment)
+makebelieve_test_path(filewatch_path filewatch)
 add_test(NAME projfs_experiment_smoke
   COMMAND powershell -NoProfile -ExecutionPolicy Bypass
     -File "${CMAKE_CURRENT_SOURCE_DIR}/smoke_test.ps1"
-    -ProjfsExe "$<TARGET_FILE:projfs_experiment>"
-    -FilewatchExe "$<TARGET_FILE:filewatch>"
+    -ProjfsExe "${projfs_experiment_path}"
+    -FilewatchExe "${filewatch_path}"
 )
 set_tests_properties(projfs_experiment_smoke PROPERTIES TIMEOUT 45)
 makebelieve_skip_if_not_built(projfs_experiment

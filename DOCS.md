@@ -217,26 +217,46 @@ An output below the rule uses it by name, in place of an action:
 `%in` in the rule becomes whatever follows the rule's name, and each
 `$variable` its value, so these are `run clang++ -O2 -c foo.cpp -o %out`
 and `run clang++ -O0 -g -c bar.cpp -o %out`. From there the output is
-treated as if it had been written out in full, so an output with a `*`
-takes its sources from the expanded command (see
+treated as if it had been written out in full, so an output with a
+capture takes its sources from the expanded command (see
 [Directory Expansion](#directory-expansion)):
 
 ```mb
-@/out/*.o = !cc src/*.cpp
+@/out/$name.o = !cc src/*{name}.cpp
 ```
 
 The indented `variable = value` lines under a rule give its variables
 default values, and those under an output set them for that output. A
-variable with no default must be set by every output using the rule. A
+variable with no default must be set, or captured (see
+[Directory Expansion](#directory-expansion)), by every output using the rule. A
 value runs to the end of its line and may be empty. Setting a variable
-the rule does not name is an error, as is giving something for `%in` to
-a rule without one, or nothing to a rule with one.
+that neither the rule nor the output's own line names is an error, as is
+giving something for `%in` to a rule without one, or nothing to a rule
+with one.
 
-A name is letters, digits and `_`, not starting with a digit. In a rule,
-`$$` is a single `$`, and a `$` before anything that cannot start a
-name, as in `$(date)`, `${HOME}` or `$1`, is left for the shell. What a variable or
-`%in` is replaced with is not expanded again. Nothing is expanded
-outside a rule: in an output's own command, `$HOME` is the shell's.
+An output that uses no rule may set variables too, for its own line:
+
+```mb
+@/$lang/index.html = run pandoc -M lang=$lang index.md -o %out
+    lang = en
+```
+
+A variable is used as `$name`, or as `${name}` where what follows would
+otherwise run on into the name, as in `${name}_draft`. A name is
+letters, digits and `_`, not starting with a digit. `$$` is a single
+`$`, and a `$` before anything else that cannot start a name, as in
+`$(date)` or `$1`, is left for the shell. What a variable or `%in` is
+replaced with is not expanded again, and a value in a path is taken as
+it is, `/` included.
+
+In a rule, every `$name` and `${name}` is one of its variables, so a
+shell `${HOME}` in a rule is written `$${HOME}`. An output's own line -
+its path, and its command or the argument it gives a rule - expands only
+the variables it sets and the names it captures, before any rule is
+expanded. Anything else on it is the shell's: `$HOME` stays `$HOME`, and
+an output that sets and captures nothing expands nothing, `$$` included.
+A rule's defaults are for its body alone, so naming one on the line of
+an output that does not set it is an error.
 
 A rule must be declared above the outputs that use it, and only once.
 
@@ -250,53 +270,131 @@ indented: every other line starts at the left margin.
 
 ## Directory Expansion
 
-A `*` in an output creates one output per matching source file:
+A capture in a command creates one output per matching source file.
+`*{name}` captures part of each matching file's path, and the output
+uses what it captured as the variable `$name`:
 
 ```mb
-@/out/*.o = run clang++ -c src/*.cpp -o %out
-@/site/*.md = copy notes/*.md
+@/out/$name.o = run clang++ -c src/*{name}.cpp -o %out
+@/site/$name.md = copy notes/*{name}.md
 ```
 
-The source files are those matching the first word of the command with a
-`*` in it - for `copy`, the path. With `src/main.cpp` present the first
-rule declares `@/out/main.o`, built by that command with every `*`
-replaced by `main`. Outputs appear and disappear as matching files do.
+The source files are those matching the source pattern: the first word
+with a capture in it, once any rule is expanded - for `copy`, the path.
+With `src/main.cpp` present the first rule declares `@/out/main.o`,
+built by `run clang++ -c src/main.cpp -o %out`. Outputs, and the
+directories they are in, appear and disappear as matching files do.
 
-Each pattern takes a single `*`, in the file name, which matches one or
-more characters. The source pattern is an unquoted path inside the
-manifest's directory. What the `*` matched goes into the command as it
-is, so a file name with spaces or shell metacharacters in it needs the
-command to quote the `*`.
+Captures can take a path apart and lay it out differently:
 
-Without a `*` in the output, a `*` in a command is left for the shell.
+```mb
+@/$year/$month/$day/$name.html = run pandoc posts/*{year}-*{month}-*{day}-*{name}.md -o %out
+```
+
+With `posts/2024-01-02-my-post.md` present, this declares
+`@/2024/01/02/my-post.html`.
+
+The source pattern is an unquoted path inside the manifest's directory,
+and captures go nowhere else: a capture elsewhere is an error. Each name
+is captured once and used as `$name` (or `${name}`) wherever its value
+is wanted - the output's path, its command, or the body of the rule it
+uses:
+
+```mb
+!post = run pandoc -M date=$year-$month-$day %in -o %out
+
+@/$year/$month/$day/$name.html = !post posts/*{year}-*{month}-*{day}-*{name}.md
+```
+
+A capture sets its variable for that file, so it gives a rule's variable
+with no default its value, and an output may not also set a variable it
+captures. Every capture must be used in the output's path, so no two
+files make the same output, and every `$name` in the path must be one
+the output captures or sets. What a capture matched goes into the
+command as it is, so a file name with spaces or shell metacharacters in
+it needs the command to quote where it goes.
+
+A `*` that is not a capture - one not followed by `{`, a name and then
+`}` or `:`, as in `-I inc/*` or `cp *{.c,.h} dir` - is left for the
+shell.
+
+### Matching
+
+`*{name}` matches one or more characters, never `/`. `**{name}`
+matches one or more characters, `/` included, so a pattern can reach
+into subdirectories:
+
+```mb
+@/$path.html = run pandoc content/**{path}.md -o %out
+@/$dir/index/$name.html = copy content/**{dir}/*{name}.md
+```
+
+The first lays out `content/blog/2024/intro.md` as
+`@/blog/2024/intro.html`. A pattern with a `**` capture, or a capture
+before its last `/`, lists every directory beneath the part before its
+first capture, so a file added anywhere beneath `content/` declares its
+output.
+
+Where a path can be split more than one way, each capture takes as
+little as it can, from the left. In `2024-01-02-my-post.md`, `year`,
+`month` and `day` take one piece each and `name` takes `my-post`. In
+`content/a/b/c.md`, the second pattern above gives `dir` as `a/b` and
+`name` as `c`, as `name` cannot hold a `/`.
+
+`*{name:regex}` and `**{name:regex}` capture only text the regular
+expression matches in full. It is an ECMAScript regular expression, as
+in JavaScript, and may hold balanced braces. A file that no split
+matches is skipped:
+
+```mb
+@/$year/$month/$day/$name.html = run pandoc posts/*{year:\d{4}}-*{month:\d\d}-*{day:\d\d}-*{name}.md -o %out
+```
+
+Without them, `posts/about-us-page-v2.md` would become
+`@/about/us/page/v2.html`; with them it declares nothing. A
+`*{name:regex}` still never holds a `/`, whatever the expression allows.
+
+Precisely, a path is matched as by the first match of one regular
+expression built from the pattern, left to right: its text matched
+literally, `*{name}` as `([^/]+?)`, `**{name}` as `(.+?)`, and a
+constraint as its own expression in a group. An expression's own
+quantifiers decide how much it takes, so `**{dir:.+}` takes as much as
+it can.
+
+A path is an output only if a file maps to it. Opening
+`@/2024/01/02-x/post.html` finds nothing, even with
+`posts/2024-01-02-x-post.md` present, as that file is
+`@/2024/01/02/x-post.html`.
+
+### Outputs as Sources
 
 A source pattern under `@/` matches other outputs instead, whichever rule
 declares them:
 
 ```mb
-@/gen/*.md = capture python render.py src/*.txt
-@/site/*.html = run pandoc @/gen/*.md -o %out
+@/gen/$name.md = capture python render.py src/*{name}.txt
+@/site/$name.html = run pandoc @/gen/*{name}.md -o %out
 ```
 
 Generated and hand-written files can share a directory, and rules may
 overlap:
 
 ```mb
-@/pkg/*.py = copy pkg/*.py
-@/pkg/*_pb2.py = run ./gen_pb2.sh pkg/*.proto %out
+@/pkg/$name.py = copy pkg/*{name}.py
+@/pkg/${name}_pb2.py = run ./gen_pb2.sh pkg/*{name}.proto %out
 ```
 
 A path that two rules actually produce, given the files that exist, is a
 conflict. It still appears, but nothing builds it and opening it fails
 with an I/O error (`EIO`, or `STATUS_IO_DEVICE_ERROR` on Windows), like a
 failed build. No rule takes precedence - not even a rule naming the path
-outright over a wildcard - and every other path is unaffected. A
+outright over a pattern - and every other path is unaffected. A
 `status` output (see [Generated Files](#generated-files)) names the path,
 both rules and the files they matched:
 
 ```text
 @/site/index.html is claimed by more than one rule:
-    build.makebelieve:1: @/site/*.html = run pandoc src/*.md -o %out (matching src/index.md)
+    build.makebelieve:1: @/site/$name.html = run pandoc src/*{name}.md -o %out (matching src/index.md)
     build.makebelieve:2: @/site/index.html = run ./gen.sh
 ```
 
@@ -305,15 +403,19 @@ above, `@/site/index.html` builds until `src/index.md` is created, fails
 while it exists, and builds again once it is removed. Whatever read the
 path is rebuilt when it becomes a conflict or stops being one, as it is
 for any other change. A rule that would make a file of a directory that
-another rule's output is in, such as `@/out/*.foo` matching `x.foo` beside
-`@/out/x.foo/y`, conflicts with every output in that directory.
+another rule's output is in, such as `@/out/$name.foo` making
+`@/out/x.foo` beside `@/out/x.foo/y`, conflicts with every output in
+that directory.
 
 The manifest itself is still rejected when two rules name the same path
 outright, or when a rule names a path inside another rule's output.
 
-Nor may a wildcard over outputs be able to produce something its own
-pattern matches, directly or through other wildcards, since its outputs
-would never end - `@/gen/*.md.md = copy @/gen/*.md`.
+Nor may a pattern over outputs be able to produce something it matches
+itself, directly or through other patterns, since its outputs would
+never end - `@/gen/$name.md.md = copy @/gen/*{name}.md`. This is
+decided from the patterns' shapes alone, each capture standing for any
+text it could hold, so a pattern is rejected even if its captures'
+expressions would keep it from matching what it produces.
 
 ## Serving
 
@@ -355,7 +457,7 @@ again if the rules claiming it change:
 
 ```text
 makebelieve: @/site/index.html is claimed by more than one rule:
-    build.makebelieve:1: @/site/*.html = run pandoc src/*.md -o %out (matching src/index.md)
+    build.makebelieve:1: @/site/$name.html = run pandoc src/*{name}.md -o %out (matching src/index.md)
     build.makebelieve:2: @/site/index.html = run ./gen.sh
 ```
 

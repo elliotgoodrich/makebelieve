@@ -16,9 +16,11 @@ makebelieve_apply_clang_tidy(inotify_wait)
 # Black-box test: mounts the real fuse_experiment binary and drives it
 # through smoke_test.sh, which fails (rather than skipping) if /dev/fuse
 # isn't usable, e.g. on a sandboxed CI runner.
+makebelieve_test_path(fuse_experiment_path fuse_experiment)
+makebelieve_test_path(inotify_wait_path inotify_wait)
 add_test(NAME fuse_experiment_smoke
   COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/smoke_test.sh"
-    "$<TARGET_FILE:fuse_experiment>" "$<TARGET_FILE:inotify_wait>"
+    "${fuse_experiment_path}" "${inotify_wait_path}"
 )
 set_tests_properties(fuse_experiment_smoke PROPERTIES TIMEOUT 30)
 makebelieve_skip_if_not_built(fuse_experiment
