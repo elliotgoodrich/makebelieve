@@ -1050,6 +1050,16 @@ class TracingSession {
       if (received == -EINTR) {
         continue;
       }
+      // The mount going away aborts the connection, and a read that took a
+      // request off the queue just as it did fails with ECONNABORTED rather
+      // than the ENODEV libfuse turns into 0. That request was ended by the
+      // abort, with no reply wanted, and the connection takes no more - so,
+      // like ENODEV, it is the session ending. (Only that race gives it here:
+      // the ECONNABORTED a fusectl abort can give needs FUSE_ABORT_ERROR,
+      // which libfuse never asks for.)
+      if (received == -ECONNABORTED) {
+        return Serving::ended;
+      }
       if (received < 0) {
         return std::unexpected(
             std::error_code(-received, std::system_category()));
